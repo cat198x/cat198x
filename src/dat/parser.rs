@@ -133,22 +133,21 @@ fn parse_game(
     loop {
         match reader.read_event_into(&mut buf) {
             Ok(Event::Start(e)) => {
-                current_tag = Some(String::from_utf8_lossy(e.name().as_ref()).to_string());
+                // `<rom>…</rom>` and `<device_ref>…</device_ref>` carry all the
+                // data we need on the start tag, so handle them like their
+                // self-closing form — otherwise non-self-closing elements are
+                // silently dropped (a game then looks ROM-less, i.e. "complete").
+                // Other start tags (e.g. <description>) set current_tag so the
+                // following Text event is captured.
+                if handle_game_child(&e, &mut game)? {
+                    current_tag = None;
+                } else {
+                    current_tag = Some(String::from_utf8_lossy(e.name().as_ref()).to_string());
+                }
             }
-            Ok(Event::Empty(e)) => match e.name().as_ref() {
-                b"rom" => {
-                    let rom = parse_rom_attrs(&e)?;
-                    game.roms.push(rom);
-                }
-                b"device_ref" => {
-                    for attr in e.attributes().flatten() {
-                        if attr.key.as_ref() == b"name" {
-                            game.devices.push(attr.unescape_value()?.to_string());
-                        }
-                    }
-                }
-                _ => {}
-            },
+            Ok(Event::Empty(e)) => {
+                handle_game_child(&e, &mut game)?;
+            }
             Ok(Event::Text(e)) => {
                 if let Some(ref tag) = current_tag {
                     let text = e.unescape()?.to_string();
@@ -175,7 +174,32 @@ fn parse_game(
     Ok(game)
 }
 
-/// Parse ROM attributes from an empty <rom /> element
+/// Handle a `<game>`/`<machine>` child that carries all its data on the start
+/// tag — `<rom>` and `<device_ref>`. Works for both the self-closing
+/// (`Event::Empty`) and non-self-closing (`Event::Start`) forms. Returns true
+/// if the element was a recognised child and has been consumed.
+fn handle_game_child(
+    e: &quick_xml::events::BytesStart,
+    game: &mut DatGameEntry,
+) -> Result<bool> {
+    match e.name().as_ref() {
+        b"rom" => {
+            game.roms.push(parse_rom_attrs(e)?);
+            Ok(true)
+        }
+        b"device_ref" => {
+            for attr in e.attributes().flatten() {
+                if attr.key.as_ref() == b"name" {
+                    game.devices.push(attr.unescape_value()?.to_string());
+                }
+            }
+            Ok(true)
+        }
+        _ => Ok(false),
+    }
+}
+
+/// Parse ROM attributes from a `<rom>` element (self-closing or not)
 fn parse_rom_attrs(e: &quick_xml::events::BytesStart) -> Result<DatRomEntry> {
     let mut rom = DatRomEntry {
         name: String::new(),
@@ -236,6 +260,32 @@ mod tests {
         assert_eq!(games[0].roms[0].name, "Super Mario Bros. (World).nes");
         assert_eq!(games[0].roms[0].size, 40976);
         assert_eq!(games[0].roms[0].crc32, Some("3337EC46".to_string()));
+    }
+
+    #[test]
+    fn test_parse_non_self_closing_rom() {
+        // `<rom>…</rom>` (not self-closing) must still be captured — MAME and
+        // some tools emit this form. It was previously dropped silently, making
+        // the game look ROM-less and therefore falsely "complete".
+        let xml = r#"<?xml version="1.0"?>
+<datafile>
+  <header><name>Test</name></header>
+  <game name="game1">
+    <description>Game One</description>
+    <rom name="a.rom" size="1024" sha1="ABC123"></rom>
+    <rom name="b.rom" size="2048" crc="DEADBEEF"/>
+  </game>
+</datafile>"#;
+
+        let (_, games) = parse_dat(xml).unwrap();
+        assert_eq!(games.len(), 1);
+        // Both the non-self-closing and the self-closing rom are captured.
+        assert_eq!(games[0].roms.len(), 2);
+        assert_eq!(games[0].roms[0].name, "a.rom");
+        assert_eq!(games[0].roms[0].sha1, Some("ABC123".to_string()));
+        assert_eq!(games[0].roms[1].name, "b.rom");
+        // Sibling text elements still parse correctly alongside the change.
+        assert_eq!(games[0].description, Some("Game One".to_string()));
     }
 
     #[test]
