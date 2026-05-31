@@ -69,6 +69,12 @@ fn add_dat(path: &PathBuf, collection_name: Option<&str>, data_dir: Option<PathB
     let db = open_database(data_dir)?;
     let conn = db.conn();
 
+    // Wrap the whole import (collection, version, node, games, ROMs) in one
+    // transaction: a mid-import failure rolls back cleanly instead of leaving
+    // orphaned partial rows, and the per-row inserts commit once rather than
+    // once each (a large speed-up on big DATs such as MAME).
+    let tx = conn.unchecked_transaction()?;
+
     // Get or create collection
     let collection = match collections::get_collection_by_name(conn, &coll_name)? {
         Some(c) => {
@@ -128,6 +134,8 @@ fn add_dat(path: &PathBuf, collection_name: Option<&str>, data_dir: Option<PathB
             rom_count += 1;
         }
     }
+
+    tx.commit()?;
 
     println!();
     println!("Imported {} games with {} ROMs", game_count, rom_count);
@@ -590,6 +598,11 @@ fn upgrade_dat(
         coll_name, old_version_str, new_version
     );
 
+    // Wrap the version add + node + games/ROMs in one transaction so a failed
+    // upgrade rolls back instead of half-replacing the active version, and the
+    // per-row inserts commit once rather than once each.
+    let tx = conn.unchecked_transaction()?;
+
     // Add the new version (this automatically activates it and deactivates the old one)
     let path_str = abs_path.to_string_lossy();
     let version_id = collections::add_version(conn, collection.id, &new_version, &path_str, true)?;
@@ -629,6 +642,8 @@ fn upgrade_dat(
             rom_count += 1;
         }
     }
+
+    tx.commit()?;
 
     println!();
     println!("Imported {} games with {} ROMs", game_count, rom_count);

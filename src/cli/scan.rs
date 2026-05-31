@@ -289,6 +289,11 @@ fn scan_source(
 
     let mut headers_skipped = 0;
 
+    // One transaction for the whole write-back phase: a DB error part-way
+    // through rolls back rather than leaving the catalogue half-updated, and
+    // the many per-file upserts commit once instead of once each.
+    let tx = conn.unchecked_transaction()?;
+
     for result in results {
         match result {
             ScanResult::LooseFile { relative_path, hashes, header_skipped } => {
@@ -348,6 +353,8 @@ fn scan_source(
 
     // Update source last_scanned
     files::update_source_scanned(conn, source.id)?;
+
+    tx.commit()?;
 
     if headers_skipped > 0 {
         println!(
