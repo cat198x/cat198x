@@ -1,0 +1,83 @@
+[package]
+name = "romshelf"
+version = "0.1.0"
+edition = "2024"
+description = "A cross-platform CLI for managing retro gaming ROM collections"
+license = "MIT"
+repository = "https://github.com/romshelf/romshelf"
+keywords = ["rom", "retro", "gaming", "dat", "mame"]
+categories = ["command-line-utilities", "games"]
+
+[dependencies]
+# CLI framework
+clap = { version = "4", features = ["derive", "env"] }
+clap_complete = "4"
+
+# Database
+rusqlite = { version = "0.31", features = ["bundled"] }
+
+# XML parsing (streaming for large DAT files)
+quick-xml = "0.31"
+
+# Hashing
+sha1 = "0.10"
+sha2 = "0.10"
+md-5 = "0.10"
+crc32fast = "1.4"
+
+# Archive support
+zip = "0.6"
+sevenz-rust = "0.5"
+
+# File system
+walkdir = "2"
+
+# Parallel processing
+rayon = "1.10"
+
+# Progress indication
+indicatif = "0.17"
+
+# Error handling
+thiserror = "1"
+anyhow = "1"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+
+# DateTime handling
+chrono = "0.4"
+
+# Signal handling
+ctrlc = "3.4"
+
+# Self-update from GitHub releases
+self_update = { version = "0.41", features = ["archive-tar", "archive-zip", "compression-flate2", "compression-zip-deflate"] }
+
+# HTTP client for DAT fetching
+reqwest = { version = "0.12", features = ["blocking"] }
+
+# Torrent file creation and verification
+lava_torrent = "0.11"
+
+# Platform-appropriate directories
+directories = "5"
+
+# Temp directory for archive extraction
+tempfile = "3"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Platform-specific
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.52", features = ["Win32_Storage_FileSystem"] }
+
+[dev-dependencies]
+tempfile = "3"

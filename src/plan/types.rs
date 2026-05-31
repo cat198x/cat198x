@@ -1,0 +1,304 @@
+//! Plan types for ROM operations
+
+use serde::{Deserialize, Serialize};
+
+/// A complete plan for reorganising ROMs
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Plan {
+    /// State hash - invalidates plan if state changes
+    pub state_hash: String,
+    /// When the plan was generated
+    pub created_at: String,
+    /// Operations to execute
+    pub operations: Vec<Operation>,
+    /// Summary statistics
+    pub summary: PlanSummary,
+}
+
+/// Summary of planned operations
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PlanSummary {
+    pub copy_count: usize,
+    pub move_count: usize,
+    pub repack_count: usize,
+    pub delete_count: usize,
+    #[serde(default)]
+    pub quarantine_count: usize,
+    pub already_correct: usize,
+    pub missing: usize,
+    /// Total bytes to copy/move
+    pub total_bytes: u64,
+}
+
+/// A single operation in the plan
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Operation {
+    /// Unique ID for this operation
+    pub id: u64,
+    /// Operation status
+    pub status: OperationStatus,
+    /// The operation details
+    pub kind: OperationKind,
+}
+
+/// Status of an operation
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum OperationStatus {
+    Pending,
+    InProgress,
+    Completed,
+    Failed,
+    Skipped,
+}
+
+/// The type of operation to perform
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "lowercase")]
+pub enum OperationKind {
+    /// Copy a file from source to destination
+    Copy {
+        source: SourceRef,
+        dest: String,
+        size: u64,
+    },
+    /// Move a file (copy + delete source)
+    Move {
+        source: SourceRef,
+        dest: String,
+        size: u64,
+    },
+    /// Repack files into an archive
+    Repack {
+        sources: Vec<SourceRef>,
+        dest: String,
+        format: String,
+    },
+    /// Delete a file
+    Delete {
+        path: String,
+    },
+    /// Move a file to quarantine (instead of deleting)
+    Quarantine {
+        path: String,
+        sha1: String,
+        size: u64,
+        reason: String,
+        collection: Option<String>,
+    },
+}
+
+/// Reference to a source file
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SourceRef {
+    /// Full path to the file or archive
+    pub path: String,
+    /// Path within archive (None for loose files)
+    pub archive_path: Option<String>,
+    /// SHA1 hash of the content
+    pub sha1: String,
+}
+
+impl Plan {
+    /// Create a new empty plan with the given state hash
+    pub fn new(state_hash: String) -> Self {
+        let now = chrono_lite_now();
+        Self {
+            state_hash,
+            created_at: now,
+            operations: Vec::new(),
+            summary: PlanSummary::default(),
+        }
+    }
+
+    /// Add a copy operation
+    pub fn add_copy(&mut self, source: SourceRef, dest: String, size: u64) {
+        let id = self.operations.len() as u64;
+        self.operations.push(Operation {
+            id,
+            status: OperationStatus::Pending,
+            kind: OperationKind::Copy { source, dest, size },
+        });
+        self.summary.copy_count += 1;
+        self.summary.total_bytes += size;
+    }
+
+    /// Add a quarantine operation
+    pub fn add_quarantine(
+        &mut self,
+        path: String,
+        sha1: String,
+        size: u64,
+        reason: String,
+        collection: Option<String>,
+    ) {
+        let id = self.operations.len() as u64;
+        self.operations.push(Operation {
+            id,
+            status: OperationStatus::Pending,
+            kind: OperationKind::Quarantine {
+                path,
+                sha1,
+                size,
+                reason,
+                collection,
+            },
+        });
+        self.summary.quarantine_count += 1;
+    }
+
+    /// Check if the plan has any operations
+    pub fn is_empty(&self) -> bool {
+        self.operations.is_empty()
+    }
+
+    /// Get the number of operations
+    pub fn operation_count(&self) -> usize {
+        self.operations.len()
+    }
+}
+
+/// Generate a timestamp string in SQLite datetime format (YYYY-MM-DD HH:MM:SS)
+fn chrono_lite_now() -> String {
+    use chrono::{Local, Timelike, Datelike};
+    let now = Local::now();
+    format!(
+        "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+        now.year(),
+        now.month(),
+        now.day(),
+        now.hour(),
+        now.minute(),
+        now.second()
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_plan_new() {
+        let plan = Plan::new("abc123".to_string());
+        assert_eq!(plan.state_hash, "abc123");
+        assert!(plan.is_empty());
+        assert_eq!(plan.operation_count(), 0);
+    }
+
+    #[test]
+    fn test_plan_add_copy() {
+        let mut plan = Plan::new("test".to_string());
+
+        plan.add_copy(
+            SourceRef {
+                path: "/source/game.rom".to_string(),
+                archive_path: None,
+                sha1: "ABC123".to_string(),
+            },
+            "/dest/game.rom".to_string(),
+            1024,
+        );
+
+        assert!(!plan.is_empty());
+        assert_eq!(plan.operation_count(), 1);
+        assert_eq!(plan.summary.copy_count, 1);
+        assert_eq!(plan.summary.total_bytes, 1024);
+    }
+
+    #[test]
+    fn test_plan_serialize() {
+        let mut plan = Plan::new("hash123".to_string());
+        plan.add_copy(
+            SourceRef {
+                path: "/src/rom.nes".to_string(),
+                archive_path: None,
+                sha1: "SHA1HASH".to_string(),
+            },
+            "/dest/rom.nes".to_string(),
+            2048,
+        );
+
+        let json = serde_json::to_string_pretty(&plan).unwrap();
+        assert!(json.contains("\"state_hash\": \"hash123\""));
+        assert!(json.contains("\"type\": \"copy\""));
+        assert!(json.contains("\"/src/rom.nes\""));
+    }
+
+    #[test]
+    fn test_plan_deserialize() {
+        let json = r#"{
+            "state_hash": "test123",
+            "created_at": "2024-01-01 00:00:00",
+            "operations": [
+                {
+                    "id": 0,
+                    "status": "pending",
+                    "kind": {
+                        "type": "copy",
+                        "source": {
+                            "path": "/src/file.rom",
+                            "archive_path": null,
+                            "sha1": "DEADBEEF"
+                        },
+                        "dest": "/dest/file.rom",
+                        "size": 1000
+                    }
+                }
+            ],
+            "summary": {
+                "copy_count": 1,
+                "move_count": 0,
+                "repack_count": 0,
+                "delete_count": 0,
+                "already_correct": 0,
+                "missing": 0,
+                "total_bytes": 1000
+            }
+        }"#;
+
+        let plan: Plan = serde_json::from_str(json).unwrap();
+        assert_eq!(plan.state_hash, "test123");
+        assert_eq!(plan.operations.len(), 1);
+        assert_eq!(plan.summary.copy_count, 1);
+    }
+
+    #[test]
+    fn test_operation_kind_copy() {
+        let kind = OperationKind::Copy {
+            source: SourceRef {
+                path: "/src".to_string(),
+                archive_path: None,
+                sha1: "hash".to_string(),
+            },
+            dest: "/dest".to_string(),
+            size: 100,
+        };
+
+        let json = serde_json::to_string(&kind).unwrap();
+        assert!(json.contains("\"type\":\"copy\""));
+    }
+
+    #[test]
+    fn test_operation_kind_repack() {
+        let kind = OperationKind::Repack {
+            sources: vec![
+                SourceRef {
+                    path: "/src/a.rom".to_string(),
+                    archive_path: None,
+                    sha1: "hash1".to_string(),
+                },
+                SourceRef {
+                    path: "/src/b.rom".to_string(),
+                    archive_path: None,
+                    sha1: "hash2".to_string(),
+                },
+            ],
+            dest: "/dest/game.zip".to_string(),
+            format: "zip".to_string(),
+        };
+
+        let json = serde_json::to_string(&kind).unwrap();
+        assert!(json.contains("\"type\":\"repack\""));
+        assert!(json.contains("\"sources\""));
+    }
+}

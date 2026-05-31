@@ -1,0 +1,413 @@
+//! Quarantine command implementations
+//!
+//! The quarantine is a holding area for files that are no longer needed
+//! at their current location but shouldn't be immediately deleted.
+
+use anyhow::{Context, Result};
+use std::fs;
+use std::io::{self, Write};
+use std::path::PathBuf;
+
+use crate::db::quarantine as db_quarantine;
+use crate::QuarantineCommands;
+
+use super::{get_data_dir, open_database};
+
+/// Run the quarantine command
+pub fn run(cmd: QuarantineCommands, data_dir: Option<PathBuf>) -> Result<()> {
+    match cmd {
+        QuarantineCommands::Status {
+            collection,
+            detailed,
+        } => run_status(collection, detailed, data_dir),
+        QuarantineCommands::Prune { collection, yes } => run_prune(collection, yes, data_dir),
+        QuarantineCommands::Restore {
+            collection,
+            target,
+            yes,
+        } => run_restore(collection, target, yes, data_dir),
+    }
+}
+
+/// Show quarantine status and contents
+fn run_status(
+    collection: Option<String>,
+    detailed: bool,
+    data_dir: Option<PathBuf>,
+) -> Result<()> {
+    let db = open_database(data_dir.clone())?;
+    let conn = db.conn();
+
+    let entries = if let Some(ref pattern) = collection {
+        db_quarantine::list_entries_by_collection(conn, pattern)?
+    } else {
+        db_quarantine::list_entries(conn)?
+    };
+
+    if entries.is_empty() {
+        println!("Quarantine is empty.");
+        return Ok(());
+    }
+
+    let total_size = db_quarantine::total_size(conn)?;
+    let count = entries.len();
+
+    println!("Quarantine: {} files, {}", count, format_bytes(total_size as u64));
+    println!();
+
+    // Show summary by collection
+    let by_collection = db_quarantine::summary_by_collection(conn)?;
+    if by_collection.len() > 1 || by_collection.iter().any(|(c, _, _)| c.is_some()) {
+        println!("By collection:");
+        for (coll, cnt, size) in &by_collection {
+            let name = coll.as_deref().unwrap_or("(unknown)");
+            println!("  {} ··· {} files, {}", name, cnt, format_bytes(*size as u64));
+        }
+        println!();
+    }
+
+    // Show summary by reason
+    let by_reason = db_quarantine::summary_by_reason(conn)?;
+    println!("By reason:");
+    for (reason, cnt, size) in &by_reason {
+        println!(
+            "  {} ··· {} files, {}",
+            reason.description(),
+            cnt,
+            format_bytes(*size as u64)
+        );
+    }
+
+    if detailed {
+        println!();
+        println!("Files:");
+        for entry in &entries {
+            println!(
+                "  {} ({}) - {}",
+                truncate_path(&entry.original_path, 50),
+                format_bytes(entry.size as u64),
+                entry.reason.description()
+            );
+        }
+    }
+
+    println!();
+    println!("Use 'romshelf quarantine prune' to permanently delete.");
+    println!("Use 'romshelf quarantine restore' to move back to sources.");
+
+    Ok(())
+}
+
+/// Permanently delete quarantined files
+fn run_prune(collection: Option<String>, yes: bool, data_dir: Option<PathBuf>) -> Result<()> {
+    let db = open_database(data_dir.clone())?;
+    let conn = db.conn();
+    let data_dir_path = get_data_dir(data_dir)?;
+    let quarantine_dir = data_dir_path.join("quarantine");
+
+    let entries = if let Some(ref pattern) = collection {
+        db_quarantine::list_entries_by_collection(conn, pattern)?
+    } else {
+        db_quarantine::list_entries(conn)?
+    };
+
+    if entries.is_empty() {
+        println!("No files to prune.");
+        return Ok(());
+    }
+
+    let total_size: i64 = entries.iter().map(|e| e.size).sum();
+
+    println!(
+        "Will permanently delete {} files ({})",
+        entries.len(),
+        format_bytes(total_size as u64)
+    );
+
+    if !yes {
+        print!("Continue? [y/N] ");
+        io::stdout().flush()?;
+
+        let mut input = String::new();
+        io::stdin().read_line(&mut input)?;
+
+        if !input.trim().eq_ignore_ascii_case("y") {
+            println!("Aborted.");
+            return Ok(());
+        }
+    }
+
+    let mut deleted = 0;
+    let mut errors = 0;
+
+    for entry in &entries {
+        let file_path = quarantine_dir.join(&entry.quarantine_path);
+
+        // Delete the file
+        if file_path.exists() {
+            if let Err(e) = fs::remove_file(&file_path) {
+                eprintln!("Failed to delete {}: {}", file_path.display(), e);
+                errors += 1;
+                continue;
+            }
+        }
+
+        // Remove from database
+        if let Err(e) = db_quarantine::remove_entry(conn, entry.id) {
+            eprintln!("Failed to remove database entry: {}", e);
+            errors += 1;
+            continue;
+        }
+
+        deleted += 1;
+    }
+
+    println!();
+    println!(
+        "Pruned {} files, {} errors",
+        deleted,
+        errors
+    );
+
+    Ok(())
+}
+
+/// Restore quarantined files back to a source directory
+fn run_restore(
+    collection: Option<String>,
+    target: Option<PathBuf>,
+    yes: bool,
+    data_dir: Option<PathBuf>,
+) -> Result<()> {
+    let db = open_database(data_dir.clone())?;
+    let conn = db.conn();
+    let data_dir_path = get_data_dir(data_dir)?;
+    let quarantine_dir = data_dir_path.join("quarantine");
+
+    let entries = if let Some(ref pattern) = collection {
+        db_quarantine::list_entries_by_collection(conn, pattern)?
+    } else {
+        db_quarantine::list_entries(conn)?
+    };
+
+    if entries.is_empty() {
+        println!("No files to restore.");
+        return Ok(());
+    }
+
+    // Determine target directory
+    let target_dir = match target {
+        Some(t) => t,
+        None => {
+            // Try to get first source directory
+            let sources = crate::db::files::list_sources(conn)?;
+            if sources.is_empty() {
+                anyhow::bail!(
+                    "No target directory specified and no sources registered.\n\
+                     Use --target <path> to specify where to restore files."
+                );
+            }
+            PathBuf::from(&sources[0].path)
+        }
+    };
+
+    if !target_dir.exists() {
+        anyhow::bail!("Target directory does not exist: {}", target_dir.display());
+    }
+
+    let total_size: i64 = entries.iter().map(|e| e.size).sum();
+
+    println!(
+        "Will restore {} files ({}) to {}",
+        entries.len(),
+        format_bytes(total_size as u64),
+        target_dir.display()
+    );
+
+    if !yes {
+        print!("Continue? [y/N] ");
+        io::stdout().flush()?;
+
+        let mut input = String::new();
+        io::stdin().read_line(&mut input)?;
+
+        if !input.trim().eq_ignore_ascii_case("y") {
+            println!("Aborted.");
+            return Ok(());
+        }
+    }
+
+    let mut restored = 0;
+    let mut errors = 0;
+
+    for entry in &entries {
+        let source_path = quarantine_dir.join(&entry.quarantine_path);
+
+        // Use original filename for restoration
+        let filename = std::path::Path::new(&entry.original_path)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or(&entry.quarantine_path);
+
+        let dest_path = target_dir.join(filename);
+
+        // Check for conflicts
+        if dest_path.exists() {
+            eprintln!(
+                "Skipping {} - file already exists at destination",
+                filename
+            );
+            errors += 1;
+            continue;
+        }
+
+        // Move the file
+        if source_path.exists() {
+            if let Err(e) = fs::rename(&source_path, &dest_path) {
+                // If rename fails (cross-device), try copy + delete
+                if let Err(e2) = fs::copy(&source_path, &dest_path) {
+                    eprintln!("Failed to restore {}: {} / {}", filename, e, e2);
+                    errors += 1;
+                    continue;
+                }
+                if let Err(e) = fs::remove_file(&source_path) {
+                    eprintln!("Warning: Failed to remove source after copy: {}", e);
+                }
+            }
+        } else {
+            eprintln!(
+                "Skipping {} - quarantine file not found",
+                entry.quarantine_path
+            );
+            errors += 1;
+            continue;
+        }
+
+        // Remove from database
+        if let Err(e) = db_quarantine::remove_entry(conn, entry.id) {
+            eprintln!("Warning: Failed to remove database entry: {}", e);
+        }
+
+        restored += 1;
+    }
+
+    println!();
+    println!(
+        "Restored {} files to {}, {} errors",
+        restored,
+        target_dir.display(),
+        errors
+    );
+
+    // Remind user to rescan
+    if restored > 0 {
+        println!();
+        println!("Run 'romshelf scan' to update the file catalog.");
+    }
+
+    Ok(())
+}
+
+/// Move a file to quarantine
+///
+/// This is called from the apply workflow when a file needs to be quarantined.
+pub fn move_to_quarantine(
+    file_path: &str,
+    sha1: &str,
+    size: i64,
+    reason: db_quarantine::QuarantineReason,
+    collection_name: Option<&str>,
+    data_dir: Option<PathBuf>,
+) -> Result<()> {
+    let data_dir_path = get_data_dir(data_dir.clone())?;
+    let quarantine_dir = data_dir_path.join("quarantine");
+
+    // Create quarantine directory if it doesn't exist
+    fs::create_dir_all(&quarantine_dir).context("Failed to create quarantine directory")?;
+
+    // Generate quarantine filename: sha1_originalname
+    let original_filename = std::path::Path::new(file_path)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("unknown");
+
+    let quarantine_filename = format!("{}_{}", &sha1[..8], original_filename);
+    let quarantine_path = quarantine_dir.join(&quarantine_filename);
+
+    // Move the file
+    let source = std::path::Path::new(file_path);
+    if source.exists() {
+        fs::rename(source, &quarantine_path).or_else(|_| {
+            // If rename fails (cross-device), copy + delete
+            fs::copy(source, &quarantine_path)?;
+            fs::remove_file(source)?;
+            Ok::<_, anyhow::Error>(())
+        })?;
+    } else {
+        anyhow::bail!("File not found: {}", file_path);
+    }
+
+    // Record in database
+    let db = open_database(data_dir)?;
+    db_quarantine::add_entry(
+        db.conn(),
+        sha1,
+        file_path,
+        &quarantine_filename,
+        size,
+        reason,
+        collection_name,
+    )?;
+
+    Ok(())
+}
+
+/// Format bytes as human-readable string
+fn format_bytes(bytes: u64) -> String {
+    const KB: u64 = 1024;
+    const MB: u64 = KB * 1024;
+    const GB: u64 = MB * 1024;
+
+    if bytes >= GB {
+        format!("{:.2} GB", bytes as f64 / GB as f64)
+    } else if bytes >= MB {
+        format!("{:.2} MB", bytes as f64 / MB as f64)
+    } else if bytes >= KB {
+        format!("{:.2} KB", bytes as f64 / KB as f64)
+    } else {
+        format!("{} bytes", bytes)
+    }
+}
+
+/// Truncate a path for display
+fn truncate_path(path: &str, max_len: usize) -> String {
+    if path.len() <= max_len {
+        path.to_string()
+    } else {
+        format!("...{}", &path[path.len() - max_len + 3..])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_format_bytes() {
+        assert_eq!(format_bytes(0), "0 bytes");
+        assert_eq!(format_bytes(512), "512 bytes");
+        assert_eq!(format_bytes(1024), "1.00 KB");
+        assert_eq!(format_bytes(1536), "1.50 KB");
+        assert_eq!(format_bytes(1048576), "1.00 MB");
+        assert_eq!(format_bytes(1073741824), "1.00 GB");
+    }
+
+    #[test]
+    fn test_truncate_path() {
+        assert_eq!(truncate_path("/short/path", 50), "/short/path");
+        let long = "/very/long/path/that/exceeds/the/maximum/length/allowed";
+        let truncated = truncate_path(long, 30);
+        assert!(truncated.starts_with("..."));
+        assert_eq!(truncated.len(), 30);
+    }
+}

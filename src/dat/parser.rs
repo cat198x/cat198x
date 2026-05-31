@@ -1,0 +1,514 @@
+//! Logiqx XML DAT parser
+//!
+//! Uses quick-xml for streaming parsing, which is essential for large
+//! DAT files like MAME (50MB+).
+
+use anyhow::{Context, Result};
+use quick_xml::events::Event;
+use quick_xml::reader::Reader;
+use std::path::Path;
+
+use super::types::*;
+
+/// Parse a DAT file and return header + games
+pub fn parse_dat_file(path: &Path) -> Result<(DatHeader, Vec<DatGameEntry>)> {
+    let contents = std::fs::read_to_string(path)
+        .with_context(|| format!("Failed to read DAT file: {:?}", path))?;
+
+    parse_dat(&contents)
+}
+
+/// Parse DAT content from a string
+pub fn parse_dat(xml: &str) -> Result<(DatHeader, Vec<DatGameEntry>)> {
+    let mut reader = Reader::from_str(xml);
+    reader.trim_text(true);
+
+    let mut header = DatHeader::default();
+    let mut games = Vec::new();
+    let mut buf = Vec::new();
+
+    loop {
+        match reader.read_event_into(&mut buf) {
+            Ok(Event::Start(e)) => match e.name().as_ref() {
+                b"header" => {
+                    header = parse_header(&mut reader)?;
+                }
+                b"game" | b"machine" => {
+                    let game = parse_game(&mut reader, &e)?;
+                    games.push(game);
+                }
+                _ => {}
+            },
+            Ok(Event::Eof) => break,
+            Err(e) => {
+                return Err(anyhow::anyhow!(
+                    "Error parsing XML at position {}: {:?}",
+                    reader.buffer_position(),
+                    e
+                ))
+            }
+            _ => {}
+        }
+        buf.clear();
+    }
+
+    Ok((header, games))
+}
+
+/// Parse the <header> element
+fn parse_header(reader: &mut Reader<&[u8]>) -> Result<DatHeader> {
+    let mut header = DatHeader::default();
+    let mut buf = Vec::new();
+    let mut current_tag: Option<String> = None;
+
+    loop {
+        match reader.read_event_into(&mut buf) {
+            Ok(Event::Start(e)) => {
+                current_tag = Some(String::from_utf8_lossy(e.name().as_ref()).to_string());
+            }
+            Ok(Event::Text(e)) => {
+                if let Some(ref tag) = current_tag {
+                    let text = e.unescape()?.to_string();
+                    match tag.as_str() {
+                        "name" => header.name = text,
+                        "description" => header.description = Some(text),
+                        "version" => header.version = Some(text),
+                        "author" => header.author = Some(text),
+                        "homepage" => header.homepage = Some(text),
+                        "url" => header.url = Some(text),
+                        "category" => header.category = Some(text),
+                        _ => {}
+                    }
+                }
+            }
+            Ok(Event::End(e)) => {
+                if e.name().as_ref() == b"header" {
+                    break;
+                }
+                current_tag = None;
+            }
+            Ok(Event::Eof) => break,
+            Err(e) => return Err(e.into()),
+            _ => {}
+        }
+        buf.clear();
+    }
+
+    Ok(header)
+}
+
+/// Parse a <game> or <machine> element
+fn parse_game(
+    reader: &mut Reader<&[u8]>,
+    start: &quick_xml::events::BytesStart,
+) -> Result<DatGameEntry> {
+    let mut game = DatGameEntry {
+        name: String::new(),
+        description: None,
+        clone_of: None,
+        rom_of: None,
+        is_bios: false,
+        is_device: false,
+        is_mechanical: false,
+        roms: Vec::new(),
+        devices: Vec::new(),
+    };
+
+    // Parse attributes
+    for attr in start.attributes().flatten() {
+        match attr.key.as_ref() {
+            b"name" => game.name = attr.unescape_value()?.to_string(),
+            b"cloneof" => game.clone_of = Some(attr.unescape_value()?.to_string()),
+            b"romof" => game.rom_of = Some(attr.unescape_value()?.to_string()),
+            b"isbios" => game.is_bios = attr.value.as_ref() == b"yes",
+            b"isdevice" => game.is_device = attr.value.as_ref() == b"yes",
+            b"ismechanical" => game.is_mechanical = attr.value.as_ref() == b"yes",
+            _ => {}
+        }
+    }
+
+    let mut buf = Vec::new();
+    let mut current_tag: Option<String> = None;
+
+    loop {
+        match reader.read_event_into(&mut buf) {
+            Ok(Event::Start(e)) => {
+                current_tag = Some(String::from_utf8_lossy(e.name().as_ref()).to_string());
+            }
+            Ok(Event::Empty(e)) => match e.name().as_ref() {
+                b"rom" => {
+                    let rom = parse_rom_attrs(&e)?;
+                    game.roms.push(rom);
+                }
+                b"device_ref" => {
+                    for attr in e.attributes().flatten() {
+                        if attr.key.as_ref() == b"name" {
+                            game.devices.push(attr.unescape_value()?.to_string());
+                        }
+                    }
+                }
+                _ => {}
+            },
+            Ok(Event::Text(e)) => {
+                if let Some(ref tag) = current_tag {
+                    let text = e.unescape()?.to_string();
+                    if tag == "description" {
+                        game.description = Some(text);
+                    }
+                }
+            }
+            Ok(Event::End(e)) => {
+                let name = e.name();
+                let tag = name.as_ref();
+                if tag == b"game" || tag == b"machine" {
+                    break;
+                }
+                current_tag = None;
+            }
+            Ok(Event::Eof) => break,
+            Err(e) => return Err(e.into()),
+            _ => {}
+        }
+        buf.clear();
+    }
+
+    Ok(game)
+}
+
+/// Parse ROM attributes from an empty <rom /> element
+fn parse_rom_attrs(e: &quick_xml::events::BytesStart) -> Result<DatRomEntry> {
+    let mut rom = DatRomEntry {
+        name: String::new(),
+        size: 0,
+        crc32: None,
+        md5: None,
+        sha1: None,
+        status: RomStatus::Good,
+        merge: None,
+    };
+
+    for attr in e.attributes().flatten() {
+        match attr.key.as_ref() {
+            b"name" => rom.name = attr.unescape_value()?.to_string(),
+            b"size" => rom.size = attr.unescape_value()?.parse().unwrap_or(0),
+            b"crc" => rom.crc32 = Some(attr.unescape_value()?.to_uppercase()),
+            b"md5" => rom.md5 = Some(attr.unescape_value()?.to_uppercase()),
+            b"sha1" => rom.sha1 = Some(attr.unescape_value()?.to_uppercase()),
+            b"status" => rom.status = RomStatus::parse(&attr.unescape_value()?),
+            b"merge" => rom.merge = Some(attr.unescape_value()?.to_string()),
+            _ => {}
+        }
+    }
+
+    Ok(rom)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_simple_dat() {
+        let xml = r#"<?xml version="1.0"?>
+<!DOCTYPE datafile PUBLIC "-//Logiqx//DTD ROM Management Datafile//EN" "http://www.logiqx.com/Dats/datafile.dtd">
+<datafile>
+  <header>
+    <name>Nintendo - Nintendo Entertainment System</name>
+    <description>Nintendo - Nintendo Entertainment System</description>
+    <version>20231215-091234</version>
+    <author>No-Intro</author>
+  </header>
+  <game name="Super Mario Bros. (World)">
+    <description>Super Mario Bros. (World)</description>
+    <rom name="Super Mario Bros. (World).nes" size="40976" crc="3337EC46" md5="811B027EAF99C2DEF7B933C5208636DE" sha1="FACEE9C577A5262DBE33AC4930BB0B58C8C037F7"/>
+  </game>
+</datafile>"#;
+
+        let (header, games) = parse_dat(xml).unwrap();
+
+        assert_eq!(header.name, "Nintendo - Nintendo Entertainment System");
+        assert_eq!(header.version, Some("20231215-091234".to_string()));
+        assert_eq!(header.author, Some("No-Intro".to_string()));
+
+        assert_eq!(games.len(), 1);
+        assert_eq!(games[0].name, "Super Mario Bros. (World)");
+        assert_eq!(games[0].roms.len(), 1);
+        assert_eq!(games[0].roms[0].name, "Super Mario Bros. (World).nes");
+        assert_eq!(games[0].roms[0].size, 40976);
+        assert_eq!(games[0].roms[0].crc32, Some("3337EC46".to_string()));
+    }
+
+    #[test]
+    fn test_detect_source_type() {
+        let header = DatHeader {
+            name: "Nintendo - NES".to_string(),
+            author: Some("No-Intro".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(DatSourceType::detect(&header), DatSourceType::NoIntro);
+
+        let header = DatHeader {
+            name: "MAME 0.261".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(DatSourceType::detect(&header), DatSourceType::Mame);
+    }
+
+    #[test]
+    fn test_parse_mame_machine_element() {
+        // MAME uses <machine> instead of <game>
+        let xml = r#"<?xml version="1.0"?>
+<datafile>
+  <header>
+    <name>MAME 0.261</name>
+    <version>0.261</version>
+  </header>
+  <machine name="pacman" sourcefile="pacman/pacman.cpp">
+    <description>Pac-Man (Midway)</description>
+    <rom name="pacman.6e" size="4096" crc="c1e6ab10" sha1="e87e059c5be45753f7e9f33dff851f16d6751181"/>
+    <rom name="pacman.6f" size="4096" crc="1a6fb2d4" sha1="674d3a7f00d8be5e38b1fdc208ebef5a92d38329"/>
+  </machine>
+</datafile>"#;
+
+        let (header, games) = parse_dat(xml).unwrap();
+
+        assert_eq!(header.name, "MAME 0.261");
+        assert_eq!(games.len(), 1);
+        assert_eq!(games[0].name, "pacman");
+        assert_eq!(games[0].roms.len(), 2);
+    }
+
+    #[test]
+    fn test_parse_clone_relationship() {
+        let xml = r#"<?xml version="1.0"?>
+<datafile>
+  <header><name>Test</name></header>
+  <game name="pacman">
+    <description>Pac-Man</description>
+    <rom name="pacman.rom" size="1000" sha1="ABC123"/>
+  </game>
+  <game name="puckman" cloneof="pacman" romof="pacman">
+    <description>Puck Man (Japan)</description>
+    <rom name="puckman.rom" size="1000" sha1="DEF456"/>
+  </game>
+</datafile>"#;
+
+        let (_, games) = parse_dat(xml).unwrap();
+
+        assert_eq!(games.len(), 2);
+
+        // Parent
+        assert_eq!(games[0].name, "pacman");
+        assert!(games[0].clone_of.is_none());
+
+        // Clone
+        assert_eq!(games[1].name, "puckman");
+        assert_eq!(games[1].clone_of, Some("pacman".to_string()));
+        assert_eq!(games[1].rom_of, Some("pacman".to_string()));
+    }
+
+    #[test]
+    fn test_parse_bios_and_device_flags() {
+        let xml = r#"<?xml version="1.0"?>
+<datafile>
+  <header><name>MAME</name></header>
+  <machine name="neogeo" isbios="yes">
+    <description>Neo-Geo</description>
+    <rom name="neogeo.rom" size="524288" sha1="ABC"/>
+  </machine>
+  <machine name="neogeo_cart" isdevice="yes">
+    <description>Neo-Geo Cartridge Slot</description>
+  </machine>
+  <machine name="pinball" ismechanical="yes">
+    <description>Pinball Machine</description>
+  </machine>
+</datafile>"#;
+
+        let (_, games) = parse_dat(xml).unwrap();
+
+        assert_eq!(games.len(), 3);
+        assert!(games[0].is_bios);
+        assert!(!games[0].is_device);
+
+        assert!(games[1].is_device);
+        assert!(!games[1].is_bios);
+
+        assert!(games[2].is_mechanical);
+    }
+
+    #[test]
+    fn test_parse_rom_status() {
+        let xml = r#"<?xml version="1.0"?>
+<datafile>
+  <header><name>Test</name></header>
+  <game name="test">
+    <rom name="good.rom" size="100" sha1="A" status="good"/>
+    <rom name="bad.rom" size="100" sha1="B" status="baddump"/>
+    <rom name="no.rom" size="100" status="nodump"/>
+  </game>
+</datafile>"#;
+
+        let (_, games) = parse_dat(xml).unwrap();
+
+        assert_eq!(games[0].roms.len(), 3);
+        assert_eq!(games[0].roms[0].status, RomStatus::Good);
+        assert_eq!(games[0].roms[1].status, RomStatus::BadDump);
+        assert_eq!(games[0].roms[2].status, RomStatus::NoDump);
+    }
+
+    #[test]
+    fn test_parse_rom_merge_attribute() {
+        let xml = r#"<?xml version="1.0"?>
+<datafile>
+  <header><name>MAME</name></header>
+  <game name="puckman" cloneof="pacman">
+    <rom name="pacman.6e" merge="pacman.6e" size="4096" crc="c1e6ab10"/>
+    <rom name="prg1" size="2048" crc="abcd1234"/>
+  </game>
+</datafile>"#;
+
+        let (_, games) = parse_dat(xml).unwrap();
+
+        assert_eq!(games[0].roms[0].merge, Some("pacman.6e".to_string()));
+        assert!(games[0].roms[1].merge.is_none());
+    }
+
+    #[test]
+    fn test_parse_multiple_games() {
+        let xml = r#"<?xml version="1.0"?>
+<datafile>
+  <header><name>Nintendo - NES</name></header>
+  <game name="Zelda"><rom name="zelda.nes" size="1000" sha1="A"/></game>
+  <game name="Mario"><rom name="mario.nes" size="2000" sha1="B"/></game>
+  <game name="Metroid"><rom name="metroid.nes" size="3000" sha1="C"/></game>
+</datafile>"#;
+
+        let (_, games) = parse_dat(xml).unwrap();
+
+        assert_eq!(games.len(), 3);
+        assert_eq!(games[0].name, "Zelda");
+        assert_eq!(games[1].name, "Mario");
+        assert_eq!(games[2].name, "Metroid");
+    }
+
+    #[test]
+    fn test_parse_game_with_multiple_roms() {
+        let xml = r#"<?xml version="1.0"?>
+<datafile>
+  <header><name>Test</name></header>
+  <game name="multi_rom_game">
+    <description>Game with multiple ROMs</description>
+    <rom name="prg0" size="16384" sha1="A"/>
+    <rom name="prg1" size="16384" sha1="B"/>
+    <rom name="chr0" size="8192" sha1="C"/>
+  </game>
+</datafile>"#;
+
+        let (_, games) = parse_dat(xml).unwrap();
+
+        assert_eq!(games[0].roms.len(), 3);
+        assert_eq!(games[0].roms[0].name, "prg0");
+        assert_eq!(games[0].roms[1].name, "prg1");
+        assert_eq!(games[0].roms[2].name, "chr0");
+    }
+
+    #[test]
+    fn test_parse_empty_header_fields() {
+        let xml = r#"<?xml version="1.0"?>
+<datafile>
+  <header>
+    <name>Minimal DAT</name>
+  </header>
+</datafile>"#;
+
+        let (header, games) = parse_dat(xml).unwrap();
+
+        assert_eq!(header.name, "Minimal DAT");
+        assert!(header.version.is_none());
+        assert!(header.author.is_none());
+        assert!(header.description.is_none());
+        assert_eq!(games.len(), 0);
+    }
+
+    #[test]
+    fn test_parse_hash_case_normalization() {
+        // Hashes should be uppercase
+        let xml = r#"<?xml version="1.0"?>
+<datafile>
+  <header><name>Test</name></header>
+  <game name="test">
+    <rom name="test.rom" size="100" crc="abcd1234" md5="deadbeef" sha1="cafebabe"/>
+  </game>
+</datafile>"#;
+
+        let (_, games) = parse_dat(xml).unwrap();
+
+        assert_eq!(games[0].roms[0].crc32, Some("ABCD1234".to_string()));
+        assert_eq!(games[0].roms[0].md5, Some("DEADBEEF".to_string()));
+        assert_eq!(games[0].roms[0].sha1, Some("CAFEBABE".to_string()));
+    }
+
+    #[test]
+    fn test_detect_all_source_types() {
+        // No-Intro
+        let h = DatHeader { author: Some("No-Intro".to_string()), ..Default::default() };
+        assert_eq!(DatSourceType::detect(&h), DatSourceType::NoIntro);
+
+        // Redump
+        let h = DatHeader { author: Some("redump.org".to_string()), ..Default::default() };
+        assert_eq!(DatSourceType::detect(&h), DatSourceType::Redump);
+
+        // TOSEC - by name
+        let h = DatHeader { name: "TOSEC - Commodore Amiga".to_string(), ..Default::default() };
+        assert_eq!(DatSourceType::detect(&h), DatSourceType::Tosec);
+
+        // TOSEC - by homepage (real TOSEC DATs use this)
+        let h = DatHeader {
+            name: "Nintendo Famicom - Games".to_string(),
+            homepage: Some("TOSEC".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(DatSourceType::detect(&h), DatSourceType::Tosec);
+
+        // TOSEC - by category
+        let h = DatHeader {
+            name: "Commodore Amiga - Games".to_string(),
+            category: Some("TOSEC".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(DatSourceType::detect(&h), DatSourceType::Tosec);
+
+        // MAME
+        let h = DatHeader { name: "MAME".to_string(), ..Default::default() };
+        assert_eq!(DatSourceType::detect(&h), DatSourceType::Mame);
+
+        // Custom/Unknown
+        let h = DatHeader { name: "My Custom DAT".to_string(), ..Default::default() };
+        assert_eq!(DatSourceType::detect(&h), DatSourceType::Custom);
+    }
+
+    #[test]
+    fn test_rom_status_from_str() {
+        assert_eq!(RomStatus::parse("good"), RomStatus::Good);
+        assert_eq!(RomStatus::parse("baddump"), RomStatus::BadDump);
+        assert_eq!(RomStatus::parse("nodump"), RomStatus::NoDump);
+        assert_eq!(RomStatus::parse("BADDUMP"), RomStatus::BadDump);
+        assert_eq!(RomStatus::parse("unknown"), RomStatus::Good); // default
+    }
+
+    #[test]
+    fn test_rom_status_as_str() {
+        assert_eq!(RomStatus::Good.as_str(), "good");
+        assert_eq!(RomStatus::BadDump.as_str(), "baddump");
+        assert_eq!(RomStatus::NoDump.as_str(), "nodump");
+    }
+
+    #[test]
+    fn test_dat_source_type_as_str() {
+        assert_eq!(DatSourceType::NoIntro.as_str(), "nointro");
+        assert_eq!(DatSourceType::Redump.as_str(), "redump");
+        assert_eq!(DatSourceType::Tosec.as_str(), "tosec");
+        assert_eq!(DatSourceType::Mame.as_str(), "mame");
+        assert_eq!(DatSourceType::Custom.as_str(), "custom");
+    }
+}
