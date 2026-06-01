@@ -1,4 +1,4 @@
-//! Self-update command - update ROMShelf to the latest version
+//! Self-update command - update Cat198x to the latest version
 
 use anyhow::{Context, Result};
 
@@ -6,14 +6,14 @@ use anyhow::{Context, Result};
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// GitHub repository owner
-const REPO_OWNER: &str = "romshelf";
+const REPO_OWNER: &str = "cat198x";
 
 /// GitHub repository name
-const REPO_NAME: &str = "romshelf";
+const REPO_NAME: &str = "cat198x";
 
 /// Check for updates and optionally install them
 pub fn run(check_only: bool, force: bool) -> Result<()> {
-    println!("ROMShelf v{}", VERSION);
+    println!("Cat198x v{}", VERSION);
     println!();
 
     if check_only {
@@ -30,7 +30,7 @@ fn check_for_update() -> Result<()> {
     let status = self_update::backends::github::Update::configure()
         .repo_owner(REPO_OWNER)
         .repo_name(REPO_NAME)
-        .bin_name("romshelf")
+        .bin_name("cat198x")
         .current_version(VERSION)
         .build()
         .context("Failed to configure update checker")?
@@ -43,7 +43,7 @@ fn check_for_update() -> Result<()> {
         println!("New version available: v{}", latest_version);
         println!("Current version: v{}", VERSION);
         println!();
-        println!("Run 'romshelf update' to install the update.");
+        println!("Run 'cat198x update' to install the update.");
 
         // Show release notes if available
         if let Some(body) = &status.body
@@ -75,7 +75,7 @@ fn perform_update(force: bool) -> Result<()> {
     update_builder
         .repo_owner(REPO_OWNER)
         .repo_name(REPO_NAME)
-        .bin_name("romshelf")
+        .bin_name("cat198x")
         .show_download_progress(true)
         .current_version(VERSION);
 
@@ -123,7 +123,7 @@ fn perform_update(force: bool) -> Result<()> {
         self_update::Status::Updated(v) => {
             println!("Successfully updated to v{}", v);
             println!();
-            println!("Restart romshelf to use the new version.");
+            println!("Restart cat198x to use the new version.");
         }
     }
 
@@ -167,7 +167,7 @@ fn get_target_triple() -> Option<String> {
         return None;
     };
 
-    // Common naming: romshelf-x86_64-linux, romshelf-aarch64-darwin, etc.
+    // Common naming: cat198x-x86_64-linux, cat198x-aarch64-darwin, etc.
     Some(format!("{}-{}", arch, os))
 }
 

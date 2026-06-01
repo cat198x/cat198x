@@ -1,4 +1,4 @@
--- ROMShelf Schema v1
+-- Cat198x Schema v1
 
 -- Schema version tracking
 CREATE TABLE schema_version (
@@ -131,7 +131,7 @@ CREATE TABLE quarantine (
     id INTEGER PRIMARY KEY,
     sha1 TEXT NOT NULL,
     original_path TEXT NOT NULL,           -- Where the file was before quarantine
-    quarantine_path TEXT NOT NULL,         -- Path within .romshelf/quarantine/
+    quarantine_path TEXT NOT NULL,         -- Path within .cat198x/quarantine/
     size INTEGER NOT NULL,
     reason TEXT NOT NULL,                  -- 'set_removed', 'content_changed', 'path_changed'
     collection_name TEXT,                  -- Which collection this was for (if known)

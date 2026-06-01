@@ -27,7 +27,7 @@ pub fn run(
         println!("No collections imported yet.");
         println!();
         println!("Import a DAT file with:");
-        println!("  romshelf dat add <path>");
+        println!("  cat198x dat add <path>");
         return Ok(());
     }
 

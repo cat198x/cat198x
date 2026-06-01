@@ -1,4 +1,4 @@
-//! ROMShelf - A cross-platform CLI for managing retro gaming ROM collections
+//! Cat198x - A cross-platform CLI for managing retro gaming ROM collections
 //!
 //! This library provides the core functionality for managing ROM collections,
 //! including DAT file parsing, file scanning, and database operations.

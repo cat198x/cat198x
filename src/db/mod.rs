@@ -1,4 +1,4 @@
-//! Database operations for ROMShelf
+//! Database operations for Cat198x
 
 mod schema;
 pub mod collections;

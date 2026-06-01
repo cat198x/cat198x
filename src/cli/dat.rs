@@ -141,7 +141,7 @@ fn add_dat(path: &PathBuf, collection_name: Option<&str>, data_dir: Option<PathB
     println!("Imported {} games with {} ROMs", game_count, rom_count);
     println!("Version '{}' is now active", version);
     println!();
-    println!("Run 'romshelf scan' to match files against this DAT.");
+    println!("Run 'cat198x scan' to match files against this DAT.");
 
     Ok(())
 }
@@ -228,7 +228,7 @@ fn remove_dat(target: &str, all_versions: bool, data_dir: Option<PathBuf>) -> Re
             }
         } else {
             anyhow::bail!(
-                "Collection '{}' not found.\n\nUse 'romshelf dat list' to see available collections.\nTo remove a specific version, use: romshelf dat remove \"Collection Name:version\"",
+                "Collection '{}' not found.\n\nUse 'cat198x dat list' to see available collections.\nTo remove a specific version, use: cat198x dat remove \"Collection Name:version\"",
                 target
             );
         }
@@ -247,7 +247,7 @@ fn list_dats(all: bool, data_dir: Option<PathBuf>) -> Result<()> {
         println!("No DATs imported yet.");
         println!();
         println!("Import a DAT file with:");
-        println!("  romshelf dat add <path>");
+        println!("  cat198x dat add <path>");
         return Ok(());
     }
 
@@ -287,7 +287,7 @@ fn list_dats(all: bool, data_dir: Option<PathBuf>) -> Result<()> {
 
     if !all {
         println!();
-        println!("Use 'romshelf dat list --all' to see all versions.");
+        println!("Use 'cat198x dat list --all' to see all versions.");
     }
 
     Ok(())
@@ -550,8 +550,8 @@ fn upgrade_dat(
         .ok_or_else(|| {
             anyhow::anyhow!(
                 "Collection '{}' not found.\n\n\
-                 Use 'romshelf dat add' to create a new collection,\n\
-                 or 'romshelf dat upgrade --collection <name>' to specify an existing collection.",
+                 Use 'cat198x dat add' to create a new collection,\n\
+                 or 'cat198x dat upgrade --collection <name>' to specify an existing collection.",
                 coll_name
             )
         })?;
@@ -576,7 +576,7 @@ fn upgrade_dat(
             );
         } else {
             anyhow::bail!(
-                "Version '{}' already exists for '{}'. Use 'romshelf dat activate' to switch to it.",
+                "Version '{}' already exists for '{}'. Use 'cat198x dat activate' to switch to it.",
                 new_version,
                 coll_name
             );
@@ -656,7 +656,7 @@ fn upgrade_dat(
             "Previous version '{}' has been deactivated but not removed.",
             old_version_str
         );
-        println!("Use 'romshelf dat diff {}' to see what changed.", coll_name);
+        println!("Use 'cat198x dat diff {}' to see what changed.", coll_name);
     }
 
     Ok(())

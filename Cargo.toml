@@ -1,10 +1,10 @@
 [package]
-name = "romshelf"
+name = "cat198x"
 version = "0.1.0"
 edition = "2024"
 description = "A cross-platform CLI for managing retro gaming ROM collections"
 license = "MIT"
-repository = "https://github.com/romshelf/romshelf"
+repository = "https://github.com/cat198x/cat198x"
 keywords = ["rom", "retro", "gaming", "dat", "mame"]
 categories = ["command-line-utilities", "games"]
 

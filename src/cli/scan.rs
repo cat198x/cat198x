@@ -69,7 +69,7 @@ pub fn run(source: Option<Vec<String>>, full: bool, data_dir: Option<PathBuf>) -
         println!("No sources to scan.");
         println!();
         println!("Add a source directory with:");
-        println!("  romshelf source add <path>");
+        println!("  cat198x source add <path>");
         return Ok(());
     }
 

@@ -20,7 +20,7 @@ pub fn run(dry_run: bool, skip_space_check: bool, data_dir: Option<std::path::Pa
     let (mut plan, plan_path) = match load_latest_plan(data_dir.clone())? {
         Some(p) => p,
         None => {
-            println!("No plan found. Run 'romshelf plan' first to generate a plan.");
+            println!("No plan found. Run 'cat198x plan' first to generate a plan.");
             return Ok(());
         }
     };
@@ -32,7 +32,7 @@ pub fn run(dry_run: bool, skip_space_check: bool, data_dir: Option<std::path::Pa
     if current_hash != plan.state_hash {
         println!("Plan is stale! The database state has changed since the plan was generated.");
         println!();
-        println!("Run 'romshelf plan' to generate a new plan.");
+        println!("Run 'cat198x plan' to generate a new plan.");
         return Ok(());
     }
 
@@ -312,7 +312,7 @@ pub fn run(dry_run: bool, skip_space_check: bool, data_dir: Option<std::path::Pa
 
     if error_count > 0 {
         println!();
-        println!("Some operations failed. Run 'romshelf apply' again to retry.");
+        println!("Some operations failed. Run 'cat198x apply' again to retry.");
     }
 
     Ok(())
@@ -538,7 +538,7 @@ pub fn run_rollback(dry_run: bool, continue_rollback: bool, data_dir: Option<std
 
     if error_count > 0 {
         println!();
-        println!("Some rollback operations failed. Run 'romshelf apply --rollback --continue' to retry.");
+        println!("Some rollback operations failed. Run 'cat198x apply --rollback --continue' to retry.");
     }
 
     Ok(())

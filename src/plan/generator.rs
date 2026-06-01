@@ -57,7 +57,7 @@ pub fn generate_plan_filtered(conn: &Connection, dat_filter: Option<&str>) -> Re
         println!("No collections configured with destination paths.");
         println!();
         println!("Configure a destination with:");
-        println!("  romshelf config set <collection> dest_path <path>");
+        println!("  cat198x config set <collection> dest_path <path>");
         return Ok(plan);
     }
 

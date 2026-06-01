@@ -1,10 +1,10 @@
-//! Error types for ROMShelf
+//! Error types for Cat198x
 
 use thiserror::Error;
 
-/// Main error type for ROMShelf operations
+/// Main error type for Cat198x operations
 #[derive(Error, Debug)]
-pub enum RomShelfError {
+pub enum Cat198xError {
     #[error("Database error: {0}")]
     Database(#[from] rusqlite::Error),
 
@@ -23,7 +23,7 @@ pub enum RomShelfError {
     #[error("Collection not found: {0}")]
     CollectionNotFound(String),
 
-    #[error("ROMShelf not initialized. Run 'romshelf init' first.")]
+    #[error("Cat198x not initialized. Run 'cat198x init' first.")]
     NotInitialized,
 
     #[error("{0}")]

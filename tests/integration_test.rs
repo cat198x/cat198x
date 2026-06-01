@@ -1,4 +1,4 @@
-//! Integration tests for ROMShelf CLI workflow
+//! Integration tests for Cat198x CLI workflow
 //!
 //! These tests exercise the full Phase 1 workflow:
 //! init → dat add → source add → scan → status
@@ -8,10 +8,10 @@ use std::path::PathBuf;
 use tempfile::TempDir;
 
 // Import the library crate
-use romshelf::cli;
-use romshelf::db::Database;
+use cat198x::cli;
+use cat198x::db::Database;
 
-/// Helper to create a test environment with initialized ROMShelf
+/// Helper to create a test environment with initialized Cat198x
 struct TestEnv {
     temp_dir: TempDir,
     data_dir: PathBuf,
@@ -105,7 +105,7 @@ fn test_full_workflow_init_to_status() {
     // Step 2: Add a DAT file
     let dat_path = create_test_dat(env.temp_dir.path(), "Test Collection");
 
-    use romshelf::DatCommands;
+    use cat198x::DatCommands;
     cli::dat::run(
         DatCommands::Add {
             path: dat_path,
@@ -118,12 +118,12 @@ fn test_full_workflow_init_to_status() {
     // Verify collection was created
     let db = env.db();
     let conn = db.conn();
-    let collections = romshelf::db::collections::list_collections(conn).unwrap();
+    let collections = cat198x::db::collections::list_collections(conn).unwrap();
     assert_eq!(collections.len(), 1);
     assert_eq!(collections[0].name, "Test Collection");
 
     // Step 3: Add source directory
-    use romshelf::SourceCommands;
+    use cat198x::SourceCommands;
     cli::source::run(
         SourceCommands::Add {
             path: env.roms_dir.clone(),
@@ -133,7 +133,7 @@ fn test_full_workflow_init_to_status() {
     .expect("Source add failed");
 
     // Verify source was registered
-    let sources = romshelf::db::files::list_sources(conn).unwrap();
+    let sources = cat198x::db::files::list_sources(conn).unwrap();
     assert_eq!(sources.len(), 1);
 
     // Step 4: Create some ROM files and scan
@@ -143,7 +143,7 @@ fn test_full_workflow_init_to_status() {
     cli::scan::run(None, false, env.data_dir_opt()).expect("Scan failed");
 
     // Verify file was indexed
-    let file_count = romshelf::db::files::count_files_in_source(conn, sources[0].id).unwrap();
+    let file_count = cat198x::db::files::count_files_in_source(conn, sources[0].id).unwrap();
     assert_eq!(file_count, 1);
 
     // Step 5: Check status
@@ -158,7 +158,7 @@ fn test_dat_import_creates_correct_structure() {
 
     let dat_path = create_test_dat(env.temp_dir.path(), "Nintendo - NES");
 
-    use romshelf::DatCommands;
+    use cat198x::DatCommands;
     cli::dat::run(
         DatCommands::Add {
             path: dat_path,
@@ -172,19 +172,19 @@ fn test_dat_import_creates_correct_structure() {
     let conn = db.conn();
 
     // Check collection
-    let coll = romshelf::db::collections::get_collection_by_name(conn, "Nintendo - NES")
+    let coll = cat198x::db::collections::get_collection_by_name(conn, "Nintendo - NES")
         .unwrap()
         .expect("Collection not found");
 
     // Check version
-    let version = romshelf::db::collections::get_active_version(conn, coll.id)
+    let version = cat198x::db::collections::get_active_version(conn, coll.id)
         .unwrap()
         .expect("No active version");
     assert_eq!(version.version, "20231215");
     assert!(version.is_active);
 
     // Check game and ROM counts
-    let (games, roms) = romshelf::db::dats::count_games_and_roms(conn, version.id).unwrap();
+    let (games, roms) = cat198x::db::dats::count_games_and_roms(conn, version.id).unwrap();
     assert_eq!(games, 2);
     assert_eq!(roms, 2);
 }
@@ -194,7 +194,7 @@ fn test_source_add_detects_case_sensitivity() {
     let env = TestEnv::new();
     env.init();
 
-    use romshelf::SourceCommands;
+    use cat198x::SourceCommands;
     cli::source::run(
         SourceCommands::Add {
             path: env.roms_dir.clone(),
@@ -206,7 +206,7 @@ fn test_source_add_detects_case_sensitivity() {
     let db = env.db();
     let conn = db.conn();
 
-    let sources = romshelf::db::files::list_sources(conn).unwrap();
+    let sources = cat198x::db::files::list_sources(conn).unwrap();
     assert_eq!(sources.len(), 1);
 
     // Case sensitivity depends on the filesystem, but it should be detected
@@ -219,7 +219,7 @@ fn test_source_add_prevents_duplicates() {
     let env = TestEnv::new();
     env.init();
 
-    use romshelf::SourceCommands;
+    use cat198x::SourceCommands;
 
     // Add source first time
     cli::source::run(
@@ -242,7 +242,7 @@ fn test_source_add_prevents_duplicates() {
     let db = env.db();
     let conn = db.conn();
 
-    let sources = romshelf::db::files::list_sources(conn).unwrap();
+    let sources = cat198x::db::files::list_sources(conn).unwrap();
     assert_eq!(sources.len(), 1, "Should not create duplicate source");
 }
 
@@ -251,7 +251,7 @@ fn test_source_remove() {
     let env = TestEnv::new();
     env.init();
 
-    use romshelf::SourceCommands;
+    use cat198x::SourceCommands;
 
     // Add source
     cli::source::run(
@@ -274,7 +274,7 @@ fn test_source_remove() {
     let db = env.db();
     let conn = db.conn();
 
-    let sources = romshelf::db::files::list_sources(conn).unwrap();
+    let sources = cat198x::db::files::list_sources(conn).unwrap();
     assert_eq!(sources.len(), 0, "Source should be removed");
 
     // Verify the directory still exists on disk
@@ -292,7 +292,7 @@ fn test_scan_indexes_loose_files() {
     create_test_rom(&env.roms_dir, "game3.sfc", b"SNES ROM");
 
     // Add source
-    use romshelf::SourceCommands;
+    use cat198x::SourceCommands;
     cli::source::run(
         SourceCommands::Add {
             path: env.roms_dir.clone(),
@@ -307,8 +307,8 @@ fn test_scan_indexes_loose_files() {
     let db = env.db();
     let conn = db.conn();
 
-    let sources = romshelf::db::files::list_sources(conn).unwrap();
-    let file_count = romshelf::db::files::count_files_in_source(conn, sources[0].id).unwrap();
+    let sources = cat198x::db::files::list_sources(conn).unwrap();
+    let file_count = cat198x::db::files::count_files_in_source(conn, sources[0].id).unwrap();
 
     assert_eq!(file_count, 3, "Should index all 3 files");
 }
@@ -320,7 +320,7 @@ fn test_scan_updates_last_scanned() {
 
     create_test_rom(&env.roms_dir, "test.rom", b"test");
 
-    use romshelf::SourceCommands;
+    use cat198x::SourceCommands;
     cli::source::run(
         SourceCommands::Add {
             path: env.roms_dir.clone(),
@@ -333,14 +333,14 @@ fn test_scan_updates_last_scanned() {
     let conn = db.conn();
 
     // Check last_scanned is None before scan
-    let sources = romshelf::db::files::list_sources(conn).unwrap();
+    let sources = cat198x::db::files::list_sources(conn).unwrap();
     assert!(sources[0].last_scanned.is_none());
 
     // Scan
     cli::scan::run(None, false, env.data_dir_opt()).unwrap();
 
     // Check last_scanned is updated
-    let sources = romshelf::db::files::list_sources(conn).unwrap();
+    let sources = cat198x::db::files::list_sources(conn).unwrap();
     assert!(sources[0].last_scanned.is_some());
 }
 
@@ -353,7 +353,7 @@ fn test_dat_list_shows_collections() {
     let dat1 = create_test_dat(env.temp_dir.path(), "Collection A");
     let dat2 = create_test_dat(env.temp_dir.path(), "Collection B");
 
-    use romshelf::DatCommands;
+    use cat198x::DatCommands;
     cli::dat::run(
         DatCommands::Add {
             path: dat1,
@@ -375,7 +375,7 @@ fn test_dat_list_shows_collections() {
     let db = env.db();
     let conn = db.conn();
 
-    let collections = romshelf::db::collections::list_collections(conn).unwrap();
+    let collections = cat198x::db::collections::list_collections(conn).unwrap();
     assert_eq!(collections.len(), 2);
 
     // Verify names (should be sorted)
@@ -420,7 +420,7 @@ fn test_dat_activate_version() {
     )
     .unwrap();
 
-    use romshelf::DatCommands;
+    use cat198x::DatCommands;
 
     // Import v1
     cli::dat::run(
@@ -446,10 +446,10 @@ fn test_dat_activate_version() {
     let conn = db.conn();
 
     // Check v2 is active
-    let coll = romshelf::db::collections::get_collection_by_name(conn, "Test Collection")
+    let coll = cat198x::db::collections::get_collection_by_name(conn, "Test Collection")
         .unwrap()
         .unwrap();
-    let active = romshelf::db::collections::get_active_version(conn, coll.id)
+    let active = cat198x::db::collections::get_active_version(conn, coll.id)
         .unwrap()
         .unwrap();
     assert_eq!(active.version, "v2.0");
@@ -465,7 +465,7 @@ fn test_dat_activate_version() {
     .unwrap();
 
     // Check v1 is now active
-    let active = romshelf::db::collections::get_active_version(conn, coll.id)
+    let active = cat198x::db::collections::get_active_version(conn, coll.id)
         .unwrap()
         .unwrap();
     assert_eq!(active.version, "v1.0");
@@ -516,7 +516,7 @@ fn test_file_hashing_correctness() {
     // Create file with known content - empty file has well-known hashes
     create_test_rom(&env.roms_dir, "empty.rom", b"");
 
-    use romshelf::SourceCommands;
+    use cat198x::SourceCommands;
     cli::source::run(
         SourceCommands::Add {
             path: env.roms_dir.clone(),
@@ -531,7 +531,7 @@ fn test_file_hashing_correctness() {
     let conn = db.conn();
 
     // Query for the file with known empty hash
-    let file = romshelf::db::files::get_file_by_sha1(
+    let file = cat198x::db::files::get_file_by_sha1(
         conn,
         "DA39A3EE5E6B4B0D3255BFEF95601890AFD80709",
     )
@@ -581,7 +581,7 @@ fn test_clrmamepro_dat_import() {
     // Create ClrMamePro format DAT
     let dat_path = create_clrmamepro_dat(env.temp_dir.path(), "CMP Collection");
 
-    use romshelf::DatCommands;
+    use cat198x::DatCommands;
     cli::dat::run(
         DatCommands::Add {
             path: dat_path,
@@ -595,18 +595,18 @@ fn test_clrmamepro_dat_import() {
     let conn = db.conn();
 
     // Check collection was created
-    let coll = romshelf::db::collections::get_collection_by_name(conn, "CMP Collection")
+    let coll = cat198x::db::collections::get_collection_by_name(conn, "CMP Collection")
         .unwrap()
         .expect("Collection not found");
 
     // Check version
-    let version = romshelf::db::collections::get_active_version(conn, coll.id)
+    let version = cat198x::db::collections::get_active_version(conn, coll.id)
         .unwrap()
         .expect("No active version");
     assert_eq!(version.version, "20231215");
 
     // Check game and ROM counts
-    let (games, roms) = romshelf::db::dats::count_games_and_roms(conn, version.id).unwrap();
+    let (games, roms) = cat198x::db::dats::count_games_and_roms(conn, version.id).unwrap();
     assert_eq!(games, 2);
     assert_eq!(roms, 2);
 }
@@ -619,7 +619,7 @@ fn test_plan_generation() {
     // Create DAT
     let dat_path = create_test_dat(env.temp_dir.path(), "Plan Test");
 
-    use romshelf::DatCommands;
+    use cat198x::DatCommands;
     cli::dat::run(
         DatCommands::Add {
             path: dat_path,
@@ -633,7 +633,7 @@ fn test_plan_generation() {
     // The test DAT uses SHA1 DA39A3EE5E6B4B0D3255BFEF95601890AFD80709 (empty file)
     create_test_rom(&env.roms_dir, "game1.rom", b"");
 
-    use romshelf::SourceCommands;
+    use cat198x::SourceCommands;
     cli::source::run(
         SourceCommands::Add {
             path: env.roms_dir.clone(),
@@ -668,7 +668,7 @@ fn test_incremental_scan_skips_unchanged() {
     // Create test file
     create_test_rom(&env.roms_dir, "test.rom", b"original");
 
-    use romshelf::SourceCommands;
+    use cat198x::SourceCommands;
     cli::source::run(
         SourceCommands::Add {
             path: env.roms_dir.clone(),
@@ -683,7 +683,7 @@ fn test_incremental_scan_skips_unchanged() {
     let db = env.db();
     let conn = db.conn();
 
-    let sources = romshelf::db::files::list_sources(conn).unwrap();
+    let sources = cat198x::db::files::list_sources(conn).unwrap();
     let first_scanned = sources[0].last_scanned.clone();
     assert!(first_scanned.is_some());
 
@@ -694,12 +694,12 @@ fn test_incremental_scan_skips_unchanged() {
     cli::scan::run(None, false, env.data_dir_opt()).unwrap();
 
     // last_scanned should be updated even if no files changed
-    let sources = romshelf::db::files::list_sources(conn).unwrap();
+    let sources = cat198x::db::files::list_sources(conn).unwrap();
     let second_scanned = sources[0].last_scanned.clone();
     assert!(second_scanned.is_some());
 
     // File count should still be 1
-    let file_count = romshelf::db::files::count_files_in_source(conn, sources[0].id).unwrap();
+    let file_count = cat198x::db::files::count_files_in_source(conn, sources[0].id).unwrap();
     assert_eq!(file_count, 1);
 }
 
@@ -737,13 +737,13 @@ fn test_plan_apply_rollback_cycle() {
     // Create a test file with known content
     // "hello" has SHA1 = AAF4C61DDCC5E8A2DABEDE0F3B482CD9AEA9434D
     let test_content = b"hello";
-    let sha1_hash = romshelf::util::hex_upper(sha1::Sha1::digest(test_content));
+    let sha1_hash = cat198x::util::hex_upper(sha1::Sha1::digest(test_content));
 
     // Create DAT that expects this exact SHA1
     let dat_path = create_matching_dat(env.temp_dir.path(), "Apply Test", &sha1_hash);
 
     // Import DAT
-    use romshelf::DatCommands;
+    use cat198x::DatCommands;
     cli::dat::run(
         DatCommands::Add {
             path: dat_path,
@@ -757,7 +757,7 @@ fn test_plan_apply_rollback_cycle() {
     create_test_rom(&env.roms_dir, "source.rom", test_content);
 
     // Add source directory
-    use romshelf::SourceCommands;
+    use cat198x::SourceCommands;
     cli::source::run(
         SourceCommands::Add {
             path: env.roms_dir.clone(),
@@ -775,7 +775,7 @@ fn test_plan_apply_rollback_cycle() {
 
     // Configure destination path for the collection
     let db = env.db();
-    romshelf::db::config::set_dest_path(db.conn(), "Apply Test", dest_dir.to_str().unwrap())
+    cat198x::db::config::set_dest_path(db.conn(), "Apply Test", dest_dir.to_str().unwrap())
         .expect("Failed to set dest_path");
     drop(db);
 
@@ -858,13 +858,13 @@ fn test_apply_from_zip_archive() {
 
     // Create test content with known hash
     let test_content = b"archived rom data";
-    let sha1_hash = romshelf::util::hex_upper(sha1::Sha1::digest(test_content));
+    let sha1_hash = cat198x::util::hex_upper(sha1::Sha1::digest(test_content));
 
     // Create DAT expecting this hash
     let dat_path = create_matching_dat(env.temp_dir.path(), "Archive Test", &sha1_hash);
 
     // Import DAT
-    use romshelf::DatCommands;
+    use cat198x::DatCommands;
     cli::dat::run(
         DatCommands::Add {
             path: dat_path,
@@ -878,7 +878,7 @@ fn test_apply_from_zip_archive() {
     create_test_zip(&env.roms_dir, "games.zip", "inner_rom.bin", test_content);
 
     // Add source and scan
-    use romshelf::SourceCommands;
+    use cat198x::SourceCommands;
     cli::source::run(
         SourceCommands::Add {
             path: env.roms_dir.clone(),
@@ -891,7 +891,7 @@ fn test_apply_from_zip_archive() {
 
     // Verify the file inside the archive was indexed
     let db = env.db();
-    let file = romshelf::db::files::get_file_by_sha1(db.conn(), &sha1_hash)
+    let file = cat198x::db::files::get_file_by_sha1(db.conn(), &sha1_hash)
         .expect("Query failed");
     assert!(file.is_some(), "File from archive should be indexed");
     drop(db);
@@ -901,7 +901,7 @@ fn test_apply_from_zip_archive() {
     fs::create_dir_all(&dest_dir).expect("Failed to create dest dir");
 
     let db = env.db();
-    romshelf::db::config::set_dest_path(db.conn(), "Archive Test", dest_dir.to_str().unwrap())
+    cat198x::db::config::set_dest_path(db.conn(), "Archive Test", dest_dir.to_str().unwrap())
         .expect("Failed to set dest_path");
     drop(db);
 
@@ -935,10 +935,10 @@ fn test_stale_plan_detection() {
 
     // Create initial setup
     let test_content = b"hello";
-    let sha1_hash = romshelf::util::hex_upper(sha1::Sha1::digest(test_content));
+    let sha1_hash = cat198x::util::hex_upper(sha1::Sha1::digest(test_content));
     let dat_path = create_matching_dat(env.temp_dir.path(), "Stale Test", &sha1_hash);
 
-    use romshelf::DatCommands;
+    use cat198x::DatCommands;
     cli::dat::run(
         DatCommands::Add {
             path: dat_path,
@@ -950,7 +950,7 @@ fn test_stale_plan_detection() {
 
     create_test_rom(&env.roms_dir, "test.rom", test_content);
 
-    use romshelf::SourceCommands;
+    use cat198x::SourceCommands;
     cli::source::run(
         SourceCommands::Add {
             path: env.roms_dir.clone(),
@@ -965,7 +965,7 @@ fn test_stale_plan_detection() {
     fs::create_dir_all(&dest_dir).unwrap();
 
     let db = env.db();
-    romshelf::db::config::set_dest_path(db.conn(), "Stale Test", dest_dir.to_str().unwrap())
+    cat198x::db::config::set_dest_path(db.conn(), "Stale Test", dest_dir.to_str().unwrap())
         .unwrap();
     drop(db);
 
@@ -1042,7 +1042,7 @@ fn test_multi_file_plan_apply() {
     let roms: Vec<(&str, String)> = contents
         .iter()
         .map(|(content, name)| {
-            let hash = romshelf::util::hex_upper(sha1::Sha1::digest(*content));
+            let hash = cat198x::util::hex_upper(sha1::Sha1::digest(*content));
             (*name, hash)
         })
         .collect();
@@ -1051,7 +1051,7 @@ fn test_multi_file_plan_apply() {
     let dat_path = create_multi_rom_dat(env.temp_dir.path(), "Multi Test", &roms_for_dat);
 
     // Import DAT
-    use romshelf::DatCommands;
+    use cat198x::DatCommands;
     cli::dat::run(
         DatCommands::Add {
             path: dat_path,
@@ -1067,7 +1067,7 @@ fn test_multi_file_plan_apply() {
     }
 
     // Add source and scan
-    use romshelf::SourceCommands;
+    use cat198x::SourceCommands;
     cli::source::run(
         SourceCommands::Add {
             path: env.roms_dir.clone(),
@@ -1083,7 +1083,7 @@ fn test_multi_file_plan_apply() {
     fs::create_dir_all(&dest_dir).unwrap();
 
     let db = env.db();
-    romshelf::db::config::set_dest_path(db.conn(), "Multi Test", dest_dir.to_str().unwrap())
+    cat198x::db::config::set_dest_path(db.conn(), "Multi Test", dest_dir.to_str().unwrap())
         .unwrap();
     drop(db);
 
@@ -1136,10 +1136,10 @@ fn test_apply_skips_already_correct_files() {
     env.init();
 
     let test_content = b"existing content";
-    let sha1_hash = romshelf::util::hex_upper(sha1::Sha1::digest(test_content));
+    let sha1_hash = cat198x::util::hex_upper(sha1::Sha1::digest(test_content));
     let dat_path = create_matching_dat(env.temp_dir.path(), "Skip Test", &sha1_hash);
 
-    use romshelf::DatCommands;
+    use cat198x::DatCommands;
     cli::dat::run(
         DatCommands::Add {
             path: dat_path,
@@ -1151,7 +1151,7 @@ fn test_apply_skips_already_correct_files() {
 
     create_test_rom(&env.roms_dir, "source.rom", test_content);
 
-    use romshelf::SourceCommands;
+    use cat198x::SourceCommands;
     cli::source::run(
         SourceCommands::Add {
             path: env.roms_dir.clone(),
@@ -1171,7 +1171,7 @@ fn test_apply_skips_already_correct_files() {
     fs::write(&dest_file, test_content).unwrap();
 
     let db = env.db();
-    romshelf::db::config::set_dest_path(db.conn(), "Skip Test", dest_dir.to_str().unwrap())
+    cat198x::db::config::set_dest_path(db.conn(), "Skip Test", dest_dir.to_str().unwrap())
         .unwrap();
     drop(db);
 
@@ -1247,7 +1247,7 @@ fn test_dat_remove_active_version() {
 
     // Import both versions
     cli::dat::run(
-        romshelf::DatCommands::Add {
+        cat198x::DatCommands::Add {
             path: dat_v1_path,
             collection: Some("Remove Test".to_string()),
         },
@@ -1256,7 +1256,7 @@ fn test_dat_remove_active_version() {
     .unwrap();
 
     cli::dat::run(
-        romshelf::DatCommands::Add {
+        cat198x::DatCommands::Add {
             path: dat_v2_path,
             collection: Some("Remove Test".to_string()),
         },
@@ -1266,12 +1266,12 @@ fn test_dat_remove_active_version() {
 
     // Verify we have 2 versions and v2 is active
     let db = env.db();
-    let coll = romshelf::db::collections::get_collection_by_name(db.conn(), "Remove Test")
+    let coll = cat198x::db::collections::get_collection_by_name(db.conn(), "Remove Test")
         .unwrap()
         .unwrap();
-    let versions = romshelf::db::collections::list_versions(db.conn(), coll.id).unwrap();
+    let versions = cat198x::db::collections::list_versions(db.conn(), coll.id).unwrap();
     assert_eq!(versions.len(), 2);
-    let active = romshelf::db::collections::get_active_version(db.conn(), coll.id)
+    let active = cat198x::db::collections::get_active_version(db.conn(), coll.id)
         .unwrap()
         .unwrap();
     assert_eq!(active.version, "20240201");
@@ -1279,7 +1279,7 @@ fn test_dat_remove_active_version() {
 
     // Remove the active version (v2)
     cli::dat::run(
-        romshelf::DatCommands::Remove {
+        cat198x::DatCommands::Remove {
             target: "Remove Test".to_string(),
             all_versions: false,
         },
@@ -1289,11 +1289,11 @@ fn test_dat_remove_active_version() {
 
     // Verify v1 is now active and v2 is gone
     let db = env.db();
-    let versions = romshelf::db::collections::list_versions(db.conn(), coll.id).unwrap();
+    let versions = cat198x::db::collections::list_versions(db.conn(), coll.id).unwrap();
     assert_eq!(versions.len(), 1, "Should have 1 version remaining");
     assert_eq!(versions[0].version, "20240101");
 
-    let active = romshelf::db::collections::get_active_version(db.conn(), coll.id)
+    let active = cat198x::db::collections::get_active_version(db.conn(), coll.id)
         .unwrap()
         .unwrap();
     assert_eq!(active.version, "20240101", "v1 should now be active");
@@ -1310,7 +1310,7 @@ fn test_dat_remove_all_versions() {
     let dat_v2_path = create_versioned_dat(env.temp_dir.path(), "Remove All Test", "20240201");
 
     cli::dat::run(
-        romshelf::DatCommands::Add {
+        cat198x::DatCommands::Add {
             path: dat_v1_path,
             collection: Some("Remove All Test".to_string()),
         },
@@ -1319,7 +1319,7 @@ fn test_dat_remove_all_versions() {
     .unwrap();
 
     cli::dat::run(
-        romshelf::DatCommands::Add {
+        cat198x::DatCommands::Add {
             path: dat_v2_path,
             collection: Some("Remove All Test".to_string()),
         },
@@ -1329,14 +1329,14 @@ fn test_dat_remove_all_versions() {
 
     // Verify collection exists with 2 versions
     let db = env.db();
-    let coll = romshelf::db::collections::get_collection_by_name(db.conn(), "Remove All Test")
+    let coll = cat198x::db::collections::get_collection_by_name(db.conn(), "Remove All Test")
         .unwrap();
     assert!(coll.is_some());
     drop(db);
 
     // Remove all versions
     cli::dat::run(
-        romshelf::DatCommands::Remove {
+        cat198x::DatCommands::Remove {
             target: "Remove All Test".to_string(),
             all_versions: true,
         },
@@ -1346,7 +1346,7 @@ fn test_dat_remove_all_versions() {
 
     // Verify collection is gone
     let db = env.db();
-    let coll = romshelf::db::collections::get_collection_by_name(db.conn(), "Remove All Test")
+    let coll = cat198x::db::collections::get_collection_by_name(db.conn(), "Remove All Test")
         .unwrap();
     assert!(coll.is_none(), "Collection should be removed");
 }
@@ -1362,7 +1362,7 @@ fn test_dat_remove_specific_version() {
     let dat_v2_path = create_versioned_dat(env.temp_dir.path(), "Specific Remove", "20240201");
 
     cli::dat::run(
-        romshelf::DatCommands::Add {
+        cat198x::DatCommands::Add {
             path: dat_v1_path,
             collection: Some("Specific Remove".to_string()),
         },
@@ -1371,7 +1371,7 @@ fn test_dat_remove_specific_version() {
     .unwrap();
 
     cli::dat::run(
-        romshelf::DatCommands::Add {
+        cat198x::DatCommands::Add {
             path: dat_v2_path,
             collection: Some("Specific Remove".to_string()),
         },
@@ -1381,7 +1381,7 @@ fn test_dat_remove_specific_version() {
 
     // Remove v1 specifically (the inactive one)
     cli::dat::run(
-        romshelf::DatCommands::Remove {
+        cat198x::DatCommands::Remove {
             target: "Specific Remove:20240101".to_string(),
             all_versions: false,
         },
@@ -1391,10 +1391,10 @@ fn test_dat_remove_specific_version() {
 
     // Verify v2 is still there and active
     let db = env.db();
-    let coll = romshelf::db::collections::get_collection_by_name(db.conn(), "Specific Remove")
+    let coll = cat198x::db::collections::get_collection_by_name(db.conn(), "Specific Remove")
         .unwrap()
         .unwrap();
-    let versions = romshelf::db::collections::list_versions(db.conn(), coll.id).unwrap();
+    let versions = cat198x::db::collections::list_versions(db.conn(), coll.id).unwrap();
     assert_eq!(versions.len(), 1);
     assert_eq!(versions[0].version, "20240201");
     assert!(versions[0].is_active);
@@ -1448,7 +1448,7 @@ fn test_dat_diff_versions() {
 
     // Import both versions
     cli::dat::run(
-        romshelf::DatCommands::Add {
+        cat198x::DatCommands::Add {
             path: dat_v1_path,
             collection: Some("Diff Test".to_string()),
         },
@@ -1457,7 +1457,7 @@ fn test_dat_diff_versions() {
     .unwrap();
 
     cli::dat::run(
-        romshelf::DatCommands::Add {
+        cat198x::DatCommands::Add {
             path: dat_v2_path,
             collection: Some("Diff Test".to_string()),
         },
@@ -1467,7 +1467,7 @@ fn test_dat_diff_versions() {
 
     // Run diff - this shouldn't error
     let result = cli::dat::run(
-        romshelf::DatCommands::Diff {
+        cat198x::DatCommands::Diff {
             collection: "Diff Test".to_string(),
             from: Some("20240101".to_string()),
             to: Some("20240201".to_string()),
@@ -1479,16 +1479,16 @@ fn test_dat_diff_versions() {
 
     // Verify the data through the DB to confirm diff would show correct changes
     let db = env.db();
-    let coll = romshelf::db::collections::get_collection_by_name(db.conn(), "Diff Test")
+    let coll = cat198x::db::collections::get_collection_by_name(db.conn(), "Diff Test")
         .unwrap()
         .unwrap();
-    let versions = romshelf::db::collections::list_versions(db.conn(), coll.id).unwrap();
+    let versions = cat198x::db::collections::list_versions(db.conn(), coll.id).unwrap();
 
     let v1 = versions.iter().find(|v| v.version == "20240101").unwrap();
     let v2 = versions.iter().find(|v| v.version == "20240201").unwrap();
 
-    let v1_games = romshelf::db::dats::get_games_for_version(db.conn(), v1.id).unwrap();
-    let v2_games = romshelf::db::dats::get_games_for_version(db.conn(), v2.id).unwrap();
+    let v1_games = cat198x::db::dats::get_games_for_version(db.conn(), v1.id).unwrap();
+    let v2_games = cat198x::db::dats::get_games_for_version(db.conn(), v2.id).unwrap();
 
     assert_eq!(v1_games.len(), 2, "v1 should have 2 games");
     assert_eq!(v2_games.len(), 3, "v2 should have 3 games");
@@ -1517,7 +1517,7 @@ fn test_dat_diff_requires_two_versions() {
     let dat_path = create_versioned_dat(env.temp_dir.path(), "Single Version", "20240101");
 
     cli::dat::run(
-        romshelf::DatCommands::Add {
+        cat198x::DatCommands::Add {
             path: dat_path,
             collection: Some("Single Version".to_string()),
         },
@@ -1527,7 +1527,7 @@ fn test_dat_diff_requires_two_versions() {
 
     // Diff should fail when there's only one version
     let result = cli::dat::run(
-        romshelf::DatCommands::Diff {
+        cat198x::DatCommands::Diff {
             collection: "Single Version".to_string(),
             from: None,
             to: None,
@@ -1547,7 +1547,7 @@ fn test_doctor_healthy_database() {
     // Import a DAT
     let dat_path = create_test_dat(env.temp_dir.path(), "Doctor Test");
     cli::dat::run(
-        romshelf::DatCommands::Add {
+        cat198x::DatCommands::Add {
             path: dat_path,
             collection: None,
         },
@@ -1556,7 +1556,7 @@ fn test_doctor_healthy_database() {
     .unwrap();
 
     // Add a source
-    use romshelf::SourceCommands;
+    use cat198x::SourceCommands;
     cli::source::run(
         SourceCommands::Add {
             path: env.roms_dir.clone(),
@@ -1579,7 +1579,7 @@ fn test_doctor_fix_orphaned_collection() {
     // Import a DAT
     let dat_path = create_test_dat(env.temp_dir.path(), "Orphan Test");
     cli::dat::run(
-        romshelf::DatCommands::Add {
+        cat198x::DatCommands::Add {
             path: dat_path,
             collection: None,
         },
@@ -1596,10 +1596,10 @@ fn test_doctor_fix_orphaned_collection() {
 
     // Verify no active version
     let db = env.db();
-    let coll = romshelf::db::collections::get_collection_by_name(db.conn(), "Orphan Test")
+    let coll = cat198x::db::collections::get_collection_by_name(db.conn(), "Orphan Test")
         .unwrap()
         .unwrap();
-    let active = romshelf::db::collections::get_active_version(db.conn(), coll.id).unwrap();
+    let active = cat198x::db::collections::get_active_version(db.conn(), coll.id).unwrap();
     assert!(active.is_none(), "Should have no active version before fix");
     drop(db);
 
@@ -1608,7 +1608,7 @@ fn test_doctor_fix_orphaned_collection() {
 
     // Verify a version is now active
     let db = env.db();
-    let active = romshelf::db::collections::get_active_version(db.conn(), coll.id).unwrap();
+    let active = cat198x::db::collections::get_active_version(db.conn(), coll.id).unwrap();
     assert!(active.is_some(), "Should have an active version after fix");
 }
 
@@ -1623,7 +1623,7 @@ fn test_dat_versions_lists_all() {
     let dat_v2_path = create_versioned_dat(env.temp_dir.path(), "Versions Test", "20240201");
 
     cli::dat::run(
-        romshelf::DatCommands::Add {
+        cat198x::DatCommands::Add {
             path: dat_v1_path,
             collection: Some("Versions Test".to_string()),
         },
@@ -1632,7 +1632,7 @@ fn test_dat_versions_lists_all() {
     .unwrap();
 
     cli::dat::run(
-        romshelf::DatCommands::Add {
+        cat198x::DatCommands::Add {
             path: dat_v2_path,
             collection: Some("Versions Test".to_string()),
         },
@@ -1642,7 +1642,7 @@ fn test_dat_versions_lists_all() {
 
     // dat versions should succeed
     let result = cli::dat::run(
-        romshelf::DatCommands::Versions {
+        cat198x::DatCommands::Versions {
             collection: "Versions Test".to_string(),
         },
         env.data_dir_opt(),
@@ -1651,10 +1651,10 @@ fn test_dat_versions_lists_all() {
 
     // Verify through DB that we have 2 versions
     let db = env.db();
-    let coll = romshelf::db::collections::get_collection_by_name(db.conn(), "Versions Test")
+    let coll = cat198x::db::collections::get_collection_by_name(db.conn(), "Versions Test")
         .unwrap()
         .unwrap();
-    let versions = romshelf::db::collections::list_versions(db.conn(), coll.id).unwrap();
+    let versions = cat198x::db::collections::list_versions(db.conn(), coll.id).unwrap();
     assert_eq!(versions.len(), 2, "Should have 2 versions");
 }
 
@@ -1667,7 +1667,7 @@ fn test_export_formats() {
     // Import a DAT
     let dat_path = create_test_dat(env.temp_dir.path(), "Export Test");
     cli::dat::run(
-        romshelf::DatCommands::Add {
+        cat198x::DatCommands::Add {
             path: dat_path,
             collection: None,
         },
@@ -1737,13 +1737,13 @@ fn test_export_filters() {
 
     // Create test content with known hash
     let test_content = b"have this rom";
-    let sha1_hash = romshelf::util::hex_upper(sha1::Sha1::digest(test_content));
+    let sha1_hash = cat198x::util::hex_upper(sha1::Sha1::digest(test_content));
 
     // Create DAT with the matching SHA1
     let dat_path = create_matching_dat(env.temp_dir.path(), "Filter Test", &sha1_hash);
 
     cli::dat::run(
-        romshelf::DatCommands::Add {
+        cat198x::DatCommands::Add {
             path: dat_path,
             collection: None,
         },
@@ -1755,7 +1755,7 @@ fn test_export_filters() {
     create_test_rom(&env.roms_dir, "source.rom", test_content);
 
     // Add source and scan
-    use romshelf::SourceCommands;
+    use cat198x::SourceCommands;
     cli::source::run(
         SourceCommands::Add {
             path: env.roms_dir.clone(),
@@ -1805,10 +1805,10 @@ fn test_export_filters() {
 #[test]
 fn test_dat_fetch_list() {
     // The fetch module has built-in sources
-    assert!(!romshelf::cli::fetch::KNOWN_SOURCES.is_empty());
+    assert!(!cat198x::cli::fetch::KNOWN_SOURCES.is_empty());
 
     // Check that MAME source exists
-    let mame = romshelf::cli::fetch::KNOWN_SOURCES
+    let mame = cat198x::cli::fetch::KNOWN_SOURCES
         .iter()
         .find(|s| s.name == "mame");
     assert!(mame.is_some(), "MAME source should be available");
@@ -1828,7 +1828,7 @@ fn test_torrent_create_and_verify() {
     let torrent_path = temp_dir.path().join("test.torrent");
 
     // Create torrent
-    use romshelf::TorrentCommands;
+    use cat198x::TorrentCommands;
     cli::torrent::run(TorrentCommands::Create {
         path: content_dir.clone(),
         output: Some(torrent_path.clone()),
@@ -1853,7 +1853,7 @@ fn test_torrent_create_and_verify() {
 /// Test header detection during scan
 #[test]
 fn test_header_detection_ines() {
-    use romshelf::scanner::{detect_header, HeaderFormat};
+    use cat198x::scanner::{detect_header, HeaderFormat};
 
     // Create iNES header: "NES\x1A" + 12 bytes of metadata
     let mut ines_data = vec![0x4E, 0x45, 0x53, 0x1A]; // "NES\x1A"
@@ -1869,7 +1869,7 @@ fn test_header_detection_ines() {
 
 #[test]
 fn test_header_detection_a78() {
-    use romshelf::scanner::{detect_header, HeaderFormat};
+    use cat198x::scanner::{detect_header, HeaderFormat};
 
     // Create A78 header: version byte + "ATARI7800" + padding
     let mut a78_data = vec![0x01]; // version
@@ -1886,7 +1886,7 @@ fn test_header_detection_a78() {
 
 #[test]
 fn test_no_header_for_plain_rom() {
-    use romshelf::scanner::detect_header;
+    use cat198x::scanner::detect_header;
 
     // Plain ROM data without any header magic
     let rom_data = vec![0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
@@ -1905,7 +1905,7 @@ fn test_stats_command() {
     // Create and import a DAT
     let dat_path = create_test_dat(env.temp_dir.path(), "Stats Test");
 
-    use romshelf::DatCommands;
+    use cat198x::DatCommands;
     cli::dat::run(
         DatCommands::Add {
             path: dat_path,
@@ -1916,7 +1916,7 @@ fn test_stats_command() {
     .expect("DAT import failed");
 
     // Add source and scan
-    use romshelf::SourceCommands;
+    use cat198x::SourceCommands;
     cli::source::run(
         SourceCommands::Add {
             path: env.roms_dir.clone(),

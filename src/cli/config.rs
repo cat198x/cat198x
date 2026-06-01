@@ -33,7 +33,7 @@ fn set_config(collection: &str, key: &str, value: &str, data_dir: Option<PathBuf
             if !path.exists() {
                 println!(
                     "Warning: Path does not exist yet: {}\n\
-                     It will be created when running 'romshelf apply'.",
+                     It will be created when running 'cat198x apply'.",
                     path.display()
                 );
             }
@@ -250,7 +250,7 @@ fn list_config(collection: Option<&str>, data_dir: Option<PathBuf>) -> Result<()
             println!("No collections configured yet.");
             println!();
             println!("Set destination path for a collection with:");
-            println!("  romshelf config set <collection> dest_path <path>");
+            println!("  cat198x config set <collection> dest_path <path>");
             return Ok(());
         }
 

@@ -3,12 +3,12 @@ use clap::{CommandFactory, Parser, Subcommand};
 use clap_complete::{generate, Shell};
 use std::io;
 
-use romshelf::cli::{apply as apply_cmd, config as config_cmd, dat as dat_cmd, doctor as doctor_cmd, export as export_cmd, init, plan as plan_cmd, quarantine as quarantine_cmd, scan, source, stats as stats_cmd, status, torrent as torrent_cmd, update as update_cmd};
-use romshelf::{ConfigCommands, DatCommands, QuarantineCommands, SourceCommands, TorrentCommands};
+use cat198x::cli::{apply as apply_cmd, config as config_cmd, dat as dat_cmd, doctor as doctor_cmd, export as export_cmd, init, plan as plan_cmd, quarantine as quarantine_cmd, scan, source, stats as stats_cmd, status, torrent as torrent_cmd, update as update_cmd};
+use cat198x::{ConfigCommands, DatCommands, QuarantineCommands, SourceCommands, TorrentCommands};
 
-/// ROMShelf - A cross-platform CLI for managing retro gaming ROM collections
+/// Cat198x - A cross-platform CLI for managing retro gaming ROM collections
 #[derive(Parser)]
-#[command(name = "romshelf")]
+#[command(name = "cat198x")]
 #[command(author, version, about, long_about = None)]
 #[command(propagate_version = true)]
 struct Cli {
@@ -21,11 +21,11 @@ struct Cli {
     quiet: bool,
 
     /// Path to configuration file
-    #[arg(long, global = true, env = "ROMSHELF_CONFIG")]
+    #[arg(long, global = true, env = "CAT198X_CONFIG")]
     config: Option<std::path::PathBuf>,
 
-    /// Path to data directory (default: ~/.romshelf)
-    #[arg(long, global = true, env = "ROMSHELF_DATA_DIR")]
+    /// Path to data directory (default: ~/.cat198x)
+    #[arg(long, global = true, env = "CAT198X_DATA_DIR")]
     data_dir: Option<std::path::PathBuf>,
 
     #[command(subcommand)]
@@ -34,7 +34,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Initialize ROMShelf in the current or specified directory
+    /// Initialize Cat198x in the current or specified directory
     Init {
         /// Directory to initialize (default: current directory)
         path: Option<std::path::PathBuf>,
@@ -114,7 +114,7 @@ enum Commands {
     #[command(subcommand)]
     Torrent(TorrentCommands),
 
-    /// Check ROMShelf installation health
+    /// Check Cat198x installation health
     Doctor {
         /// Attempt to fix problems automatically
         #[arg(long)]
@@ -150,7 +150,7 @@ enum Commands {
         shell: Shell,
     },
 
-    /// Update ROMShelf to the latest version
+    /// Update Cat198x to the latest version
     Update {
         /// Only check for updates, don't install
         #[arg(long)]
@@ -207,7 +207,7 @@ fn main() -> Result<()> {
             export_cmd::run(&collection, output, format.as_deref(), have, missing, cli.data_dir)
         }
         Commands::Completions { shell } => {
-            generate(shell, &mut Cli::command(), "romshelf", &mut io::stdout());
+            generate(shell, &mut Cli::command(), "cat198x", &mut io::stdout());
             Ok(())
         }
         Commands::Update { check, force } => update_cmd::run(check, force),

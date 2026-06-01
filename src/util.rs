@@ -10,7 +10,7 @@ use std::path::Path;
 ///
 /// # Examples
 /// ```
-/// use romshelf::util::truncate_path;
+/// use cat198x::util::truncate_path;
 /// assert_eq!(truncate_path("short.txt", 20), "short.txt");
 /// assert_eq!(truncate_path("very/long/path/file.txt", 15), "...ath/file.txt");
 /// ```
@@ -67,7 +67,7 @@ pub fn hex_lower(bytes: impl AsRef<[u8]>) -> String {
 ///
 /// # Examples
 /// ```
-/// use romshelf::util::format_bytes;
+/// use cat198x::util::format_bytes;
 /// assert_eq!(format_bytes(0), "0 bytes");
 /// assert_eq!(format_bytes(1024), "1.00 KB");
 /// assert_eq!(format_bytes(1048576), "1.00 MB");

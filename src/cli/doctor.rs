@@ -1,4 +1,4 @@
-//! Doctor command - health checks for ROMShelf installation
+//! Doctor command - health checks for Cat198x installation
 
 use anyhow::Result;
 use std::path::PathBuf;
@@ -273,7 +273,7 @@ pub fn run(fix: bool, data_dir: Option<PathBuf>) -> Result<()> {
     }
 
     // Print results
-    println!("ROMShelf Health Check");
+    println!("Cat198x Health Check");
     println!("=====================\n");
 
     let mut errors = 0;

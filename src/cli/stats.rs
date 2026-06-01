@@ -139,7 +139,7 @@ fn get_collection_stats(
 
 /// Print statistics to stdout
 fn print_stats(stats: &OverallStats) {
-    println!("ROMShelf Statistics");
+    println!("Cat198x Statistics");
     println!("===================");
     println!();
 

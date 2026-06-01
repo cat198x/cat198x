@@ -23,7 +23,7 @@ use crate::db::Database;
 
 /// Get the data directory, checking in order:
 /// 1. Explicit --data-dir argument
-/// 2. Default location (~/.romshelf)
+/// 2. Default location (~/.cat198x)
 pub fn get_data_dir(data_dir: Option<PathBuf>) -> Result<PathBuf> {
     init::get_data_dir(data_dir)
 }
@@ -35,7 +35,7 @@ pub fn open_database(data_dir: Option<PathBuf>) -> Result<Database> {
 
     if !db_path.exists() {
         anyhow::bail!(
-            "ROMShelf not initialized. Run 'romshelf init' first.\n\
+            "Cat198x not initialized. Run 'cat198x init' first.\n\
              Expected database at: {}",
             db_path.display()
         );

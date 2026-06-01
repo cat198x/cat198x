@@ -143,7 +143,7 @@ fn create_torrent(
     // Add creation info using extra field
     builder = builder.add_extra_field(
         "created by".to_string(),
-        lava_torrent::bencode::BencodeElem::String(format!("romshelf/{}", env!("CARGO_PKG_VERSION"))),
+        lava_torrent::bencode::BencodeElem::String(format!("cat198x/{}", env!("CARGO_PKG_VERSION"))),
     );
 
     println!();

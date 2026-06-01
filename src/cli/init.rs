@@ -1,4 +1,4 @@
-//! Initialize ROMShelf command
+//! Initialize Cat198x command
 
 use anyhow::{Context, Result};
 use std::path::PathBuf;
@@ -8,7 +8,7 @@ use crate::config::Config;
 use crate::db::Database;
 
 /// Default data directory name
-const DATA_DIR_NAME: &str = ".romshelf";
+const DATA_DIR_NAME: &str = ".cat198x";
 
 /// Get the data directory path
 pub fn get_data_dir(custom_path: Option<PathBuf>) -> Result<PathBuf> {
@@ -27,7 +27,7 @@ pub fn get_data_dir(custom_path: Option<PathBuf>) -> Result<PathBuf> {
 pub fn run(path: Option<PathBuf>, data_dir: Option<PathBuf>) -> Result<()> {
     let target_dir = get_data_dir(data_dir.or(path))?;
 
-    info!("Initializing ROMShelf at {:?}", target_dir);
+    info!("Initializing Cat198x at {:?}", target_dir);
 
     // Create the directory structure
     std::fs::create_dir_all(&target_dir)
@@ -49,12 +49,12 @@ pub fn run(path: Option<PathBuf>, data_dir: Option<PathBuf>) -> Result<()> {
         config.save(&config_path)?;
     }
 
-    println!("Initialized ROMShelf at {}", target_dir.display());
+    println!("Initialized Cat198x at {}", target_dir.display());
     println!();
     println!("Next steps:");
-    println!("  romshelf dat add <path>     Add a DAT file");
-    println!("  romshelf source add <path>  Add a ROM source directory");
-    println!("  romshelf scan               Scan for ROM files");
+    println!("  cat198x dat add <path>     Add a DAT file");
+    println!("  cat198x source add <path>  Add a ROM source directory");
+    println!("  cat198x scan               Scan for ROM files");
 
     Ok(())
 }
@@ -74,13 +74,13 @@ mod tests {
     #[test]
     fn test_get_data_dir_default() {
         let result = get_data_dir(None).unwrap();
-        assert!(result.to_string_lossy().contains(".romshelf"));
+        assert!(result.to_string_lossy().contains(".cat198x"));
     }
 
     #[test]
     fn test_init_creates_directory_structure() {
         let temp_dir = TempDir::new().unwrap();
-        let target = temp_dir.path().join("romshelf-test");
+        let target = temp_dir.path().join("cat198x-test");
 
         run(Some(target.clone()), None).unwrap();
 
@@ -95,7 +95,7 @@ mod tests {
     #[test]
     fn test_init_creates_database() {
         let temp_dir = TempDir::new().unwrap();
-        let target = temp_dir.path().join("romshelf-test");
+        let target = temp_dir.path().join("cat198x-test");
 
         run(Some(target.clone()), None).unwrap();
 
@@ -107,7 +107,7 @@ mod tests {
     #[test]
     fn test_init_creates_default_config() {
         let temp_dir = TempDir::new().unwrap();
-        let target = temp_dir.path().join("romshelf-test");
+        let target = temp_dir.path().join("cat198x-test");
 
         run(Some(target.clone()), None).unwrap();
 
@@ -123,7 +123,7 @@ mod tests {
     #[test]
     fn test_init_does_not_overwrite_existing_config() {
         let temp_dir = TempDir::new().unwrap();
-        let target = temp_dir.path().join("romshelf-test");
+        let target = temp_dir.path().join("cat198x-test");
         std::fs::create_dir_all(&target).unwrap();
 
         // Create existing config with custom content
@@ -142,7 +142,7 @@ mod tests {
     #[test]
     fn test_init_idempotent() {
         let temp_dir = TempDir::new().unwrap();
-        let target = temp_dir.path().join("romshelf-test");
+        let target = temp_dir.path().join("cat198x-test");
 
         // Run init twice
         run(Some(target.clone()), None).unwrap();
@@ -169,7 +169,7 @@ mod tests {
     #[test]
     fn test_database_has_schema() {
         let temp_dir = TempDir::new().unwrap();
-        let target = temp_dir.path().join("romshelf-test");
+        let target = temp_dir.path().join("cat198x-test");
 
         run(Some(target.clone()), None).unwrap();
 

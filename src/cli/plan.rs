@@ -56,7 +56,7 @@ pub fn run(dat_filter: Option<String>, data_dir: Option<PathBuf>) -> Result<()> 
     println!("Plan saved to: {}", plan_path.display());
     println!();
     println!("Review the plan, then apply with:");
-    println!("  romshelf apply");
+    println!("  cat198x apply");
 
     Ok(())
 }

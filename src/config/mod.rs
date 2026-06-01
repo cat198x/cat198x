@@ -1,4 +1,4 @@
-//! Configuration management for ROMShelf
+//! Configuration management for Cat198x
 
 mod types;
 

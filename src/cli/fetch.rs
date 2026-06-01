@@ -82,7 +82,7 @@ pub fn run(
         let output_path = output.unwrap_or_else(|| {
             let data_dir = data_dir
                 .or_else(|| {
-                    directories::ProjectDirs::from("", "", "romshelf")
+                    directories::ProjectDirs::from("", "", "cat198x")
                         .map(|d| d.data_dir().to_path_buf())
                 })
                 .unwrap_or_else(|| PathBuf::from("."));
@@ -105,15 +105,15 @@ pub fn run(
 
         println!();
         println!("To import this DAT, run:");
-        println!("  romshelf dat add {:?}", output_path);
+        println!("  cat198x dat add {:?}", output_path);
 
         return Ok(());
     }
 
     // No arguments - show help
-    println!("Usage: romshelf dat fetch <SOURCE> [--output <PATH>]");
-    println!("       romshelf dat fetch --url <URL> [--output <PATH>]");
-    println!("       romshelf dat fetch --list");
+    println!("Usage: cat198x dat fetch <SOURCE> [--output <PATH>]");
+    println!("       cat198x dat fetch --url <URL> [--output <PATH>]");
+    println!("       cat198x dat fetch --list");
     println!();
     println!("Use --list to see available DAT sources.");
 
@@ -133,8 +133,8 @@ fn list_sources() -> Result<()> {
     }
 
     println!("Usage:");
-    println!("  romshelf dat fetch mame              # Download MAME DAT");
-    println!("  romshelf dat fetch --url <URL>       # Download from custom URL");
+    println!("  cat198x dat fetch mame              # Download MAME DAT");
+    println!("  cat198x dat fetch --url <URL>       # Download from custom URL");
     println!();
     println!("Note: Some sources (like No-Intro) require manual download due to");
     println!("authentication. Visit https://datomatic.no-intro.org for official DATs.");
@@ -158,7 +158,7 @@ fn download_dat(url: &str, output_path: &PathBuf) -> Result<()> {
     // Use reqwest for HTTP download (blocking)
     let client = reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(300))
-        .user_agent(format!("romshelf/{}", env!("CARGO_PKG_VERSION")))
+        .user_agent(format!("cat198x/{}", env!("CARGO_PKG_VERSION")))
         .build()
         .context("Failed to create HTTP client")?;
 

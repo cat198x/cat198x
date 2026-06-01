@@ -92,8 +92,8 @@ fn run_status(
     }
 
     println!();
-    println!("Use 'romshelf quarantine prune' to permanently delete.");
-    println!("Use 'romshelf quarantine restore' to move back to sources.");
+    println!("Use 'cat198x quarantine prune' to permanently delete.");
+    println!("Use 'cat198x quarantine restore' to move back to sources.");
 
     Ok(())
 }
@@ -323,7 +323,7 @@ fn run_restore(
     // Remind user to rescan
     if restored > 0 {
         println!();
-        println!("Run 'romshelf scan' to update the file catalog.");
+        println!("Run 'cat198x scan' to update the file catalog.");
     }
 
     Ok(())
@@ -453,7 +453,7 @@ mod tests {
         let data_dir = temp.path().join("data");
         let sha1 = "ABCDEF0123456789ABCDEF0123456789ABCDEF01";
 
-        // ROMShelf must be initialised so the quarantine DB exists.
+        // Cat198x must be initialised so the quarantine DB exists.
         crate::cli::init::run(None, Some(data_dir.clone())).unwrap();
 
         // First file is quarantined under a full-SHA1 filename.

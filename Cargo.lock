@@ -218,6 +218,41 @@ dependencies = [
 ]
 
 [[package]]
+name = "cat198x"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "clap",
+ "clap_complete",
+ "crc32fast",
+ "ctrlc",
+ "directories",
+ "indicatif",
+ "lava_torrent",
+ "libc",
+ "md-5",
+ "quick-xml 0.40.1",
+ "rayon",
+ "reqwest",
+ "rusqlite",
+ "self_update",
+ "serde",
+ "serde_json",
+ "sevenz-rust2",
+ "sha1 0.11.0",
+ "sha2 0.11.0",
+ "tempfile",
+ "thiserror 2.0.18",
+ "toml",
+ "tracing",
+ "tracing-subscriber",
+ "walkdir",
+ "windows-sys 0.52.0",
+ "zip 8.6.0",
+]
+
+[[package]]
 name = "cbc"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2019,41 +2054,6 @@ dependencies = [
  "libc",
  "untrusted",
  "windows-sys 0.52.0",
-]
-
-[[package]]
-name = "romshelf"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "chrono",
- "clap",
- "clap_complete",
- "crc32fast",
- "ctrlc",
- "directories",
- "indicatif",
- "lava_torrent",
- "libc",
- "md-5",
- "quick-xml 0.40.1",
- "rayon",
- "reqwest",
- "rusqlite",
- "self_update",
- "serde",
- "serde_json",
- "sevenz-rust2",
- "sha1 0.11.0",
- "sha2 0.11.0",
- "tempfile",
- "thiserror 2.0.18",
- "toml",
- "tracing",
- "tracing-subscriber",
- "walkdir",
- "windows-sys 0.52.0",
- "zip 8.6.0",
 ]
 
 [[package]]

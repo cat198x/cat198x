@@ -51,7 +51,7 @@ fn add_source(path: &PathBuf, data_dir: Option<PathBuf>) -> Result<()> {
     println!("Added source #{}: {}", id, abs_path.display());
     println!("  Case sensitive: {}", case_sensitive);
     println!();
-    println!("Run 'romshelf scan' to index files in this source.");
+    println!("Run 'cat198x scan' to index files in this source.");
 
     Ok(())
 }
@@ -72,7 +72,7 @@ fn remove_source(path: &PathBuf, data_dir: Option<PathBuf>) -> Result<()> {
     } else {
         println!("Source not found: {}", abs_path.display());
         println!();
-        println!("Use 'romshelf source list' to see registered sources.");
+        println!("Use 'cat198x source list' to see registered sources.");
     }
 
     Ok(())
@@ -88,7 +88,7 @@ fn list_sources(data_dir: Option<PathBuf>) -> Result<()> {
         println!("No sources registered.");
         println!();
         println!("Add a source directory with:");
-        println!("  romshelf source add <path>");
+        println!("  cat198x source add <path>");
         return Ok(());
     }
 
@@ -118,8 +118,8 @@ fn list_sources(data_dir: Option<PathBuf>) -> Result<()> {
 fn detect_case_sensitivity(path: &Path) -> bool {
     // Try to detect by creating a temp file and checking if the
     // opposite-case version exists
-    let test_file = path.join(".romshelf_case_test");
-    let test_file_upper = path.join(".ROMSHELF_CASE_TEST");
+    let test_file = path.join(".cat198x_case_test");
+    let test_file_upper = path.join(".CAT198X_CASE_TEST");
 
     // Clean up any existing test files
     let _ = std::fs::remove_file(&test_file);
