@@ -356,9 +356,9 @@ fn extract_from_zip(archive_path: &str, entry_path: &str, dest_path: &str) -> Re
 
 /// Extract a file from a 7z archive
 fn extract_from_7z(archive_path: &str, entry_path: &str, dest_path: &str) -> Result<()> {
-    use sevenz_rust::SevenZReader;
+    use sevenz_rust2::ArchiveReader;
 
-    let archive = SevenZReader::open(archive_path, sevenz_rust::Password::empty())
+    let archive = ArchiveReader::open(archive_path, sevenz_rust2::Password::empty())
         .context("Failed to read 7z archive")?;
 
     // Find the entry
@@ -376,7 +376,7 @@ fn extract_from_7z(archive_path: &str, entry_path: &str, dest_path: &str) -> Res
 
     // Extract to temp then move
     let temp_dir = tempfile::tempdir().context("Failed to create temp directory")?;
-    sevenz_rust::decompress_file(archive_path, temp_dir.path())
+    sevenz_rust2::decompress_file(archive_path, temp_dir.path())
         .context("Failed to decompress 7z archive")?;
 
     let extracted = temp_dir.path().join(entry_path);

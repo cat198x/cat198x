@@ -273,7 +273,7 @@ fn extract_from_zip(archive_path: &Path, entry_path: &str) -> Result<Vec<u8>> {
 /// Extract a file from a 7z archive to memory
 fn extract_from_7z(archive_path: &Path, entry_path: &str) -> Result<Vec<u8>> {
     let mut archive =
-        sevenz_rust::SevenZReader::open(archive_path, sevenz_rust::Password::empty())
+        sevenz_rust2::ArchiveReader::open(archive_path, sevenz_rust2::Password::empty())
             .context("Failed to read 7z archive")?;
 
     let mut result: Option<Vec<u8>> = None;
@@ -283,7 +283,7 @@ fn extract_from_7z(archive_path: &Path, entry_path: &str) -> Result<Vec<u8>> {
             let mut data = Vec::new();
             reader
                 .read_to_end(&mut data)
-                .map_err(sevenz_rust::Error::io)?;
+                ?;
             result = Some(data);
             return Ok(false); // Stop iteration
         }

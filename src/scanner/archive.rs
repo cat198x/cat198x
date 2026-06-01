@@ -115,7 +115,7 @@ fn hash_zip_entries(path: &Path) -> Result<Vec<ArchiveEntry>> {
 // === 7Z handling ===
 
 fn list_7z_entries(path: &Path) -> Result<Vec<ArchiveEntry>> {
-    let mut archive = sevenz_rust::SevenZReader::open(path, sevenz_rust::Password::empty())
+    let mut archive = sevenz_rust2::ArchiveReader::open(path, sevenz_rust2::Password::empty())
         .with_context(|| format!("Failed to open 7Z: {:?}", path))?;
 
     let mut entries = Vec::new();
@@ -136,7 +136,7 @@ fn list_7z_entries(path: &Path) -> Result<Vec<ArchiveEntry>> {
 }
 
 fn hash_7z_entries(path: &Path) -> Result<Vec<ArchiveEntry>> {
-    let mut archive = sevenz_rust::SevenZReader::open(path, sevenz_rust::Password::empty())
+    let mut archive = sevenz_rust2::ArchiveReader::open(path, sevenz_rust2::Password::empty())
         .with_context(|| format!("Failed to open 7Z: {:?}", path))?;
 
     let mut entries = Vec::new();
@@ -153,7 +153,7 @@ fn hash_7z_entries(path: &Path) -> Result<Vec<ArchiveEntry>> {
 
         // Read into buffer and hash
         let mut data = Vec::new();
-        reader.read_to_end(&mut data).map_err(sevenz_rust::Error::io)?;
+        reader.read_to_end(&mut data)?;
 
         let mut cursor = std::io::Cursor::new(&data);
         match hash_reader(&mut cursor, size) {
@@ -196,5 +196,41 @@ mod tests {
         );
         assert_eq!(ArchiveType::from_path(Path::new("test.rar")), None);
         assert_eq!(ArchiveType::from_path(Path::new("test.txt")), None);
+    }
+
+    /// Round-trip a real 7z through the reader path. This exercises the
+    /// sevenz-rust2 API our adapter depends on (ArchiveReader::open,
+    /// for_each_entries yielding a readable stream, entry name/size), which
+    /// type-checking alone can't confirm.
+    #[test]
+    fn test_hash_7z_entries_roundtrip() {
+        use sevenz_rust2::{ArchiveEntry, ArchiveWriter};
+        use std::io::Cursor;
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let archive_path = temp.path().join("roms.7z");
+
+        let content = b"7z rom content";
+        {
+            let mut writer = ArchiveWriter::create(&archive_path).unwrap();
+            let entry = ArchiveEntry {
+                name: "game.rom".to_string(),
+                has_stream: true,
+                ..Default::default()
+            };
+            writer
+                .push_archive_entry(entry, Some(Cursor::new(content.to_vec())))
+                .unwrap();
+            writer.finish().unwrap();
+        }
+
+        let entries = hash_7z_entries(&archive_path).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, "game.rom");
+        assert_eq!(entries[0].size, content.len() as u64);
+
+        let hashes = entries[0].hashes.as_ref().expect("entry was hashed");
+        // SHA1 of "7z rom content"
+        assert_eq!(hashes.sha1, "76BF6FA80E58B8D8263A0663FBC189441AD2C30D");
     }
 }

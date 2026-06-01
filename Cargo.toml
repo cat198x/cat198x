@@ -30,7 +30,7 @@ crc32fast = "1.4"
 # zip's default zstd/bzip2/lzma/aes codecs (and their C dependency,
 # zstd-sys) to keep cross-compiled release builds lean.
 zip = { version = "8", default-features = false, features = ["deflate"] }
-sevenz-rust = "0.5"
+sevenz-rust2 = "0.21"
 
 # File system
 walkdir = "2"
