@@ -1,10 +1,10 @@
-# ROMShelf Technical Specification
+# Cat198x Technical Specification
 
 **Version 2.3 — December 2024**
 
 ## Executive Summary
 
-ROMShelf is a cross-platform ROM collection manager inspired by tools like RomVault and CLRMamePro, but designed with modern sensibilities: a clean CLI interface following Terraform-style workflows, proper versioning of DAT files, and a shared core library enabling CLI, TUI, and GUI frontends.
+Cat198x is a cross-platform ROM collection manager inspired by tools like RomVault and CLRMamePro, but designed with modern sensibilities: a clean CLI interface following Terraform-style workflows, proper versioning of DAT files, and a shared core library enabling CLI, TUI, and GUI frontends.
 
 The tool manages ROM collections against DAT files from sources including MAME, TOSEC, No-Intro, and Redump. It supports multiple archive formats, handles MAME's complex parent/clone relationships, and provides comprehensive status reporting with hierarchical rollups.
 
@@ -51,10 +51,10 @@ Each phase is independent and repeatable. Scan can be run without plan. Status c
 
 ## Data Directory Structure
 
-ROMShelf stores all state in a `.romshelf` directory, conceptually similar to Git's `.git` directory:
+Cat198x stores all state in a `.cat198x` directory, conceptually similar to Git's `.git` directory:
 
 ```
-.romshelf/
+.cat198x/
 ├── db.sqlite              # All metadata, queries, state (authoritative)
 ├── config.toml            # User-editable configuration
 ├── objects/               # Content-addressed artifacts
@@ -93,7 +93,7 @@ repeatable       effects         & logged
 
 ### Terraform Analogy
 
-| Terraform | ROMShelf | Description |
+| Terraform | Cat198x | Description |
 |-----------|----------|-------------|
 | HCL config | DAT files + config | Desired state definition |
 | State file | SQLite database | Current state tracking |
@@ -105,7 +105,7 @@ repeatable       effects         & logged
 
 ### Collections and Versions
 
-ROMShelf groups DATs into collections (MAME, TOSEC, No-Intro) with explicit versions. Only one version is active at a time per collection, enabling:
+Cat198x groups DATs into collections (MAME, TOSEC, No-Intro) with explicit versions. Only one version is active at a time per collection, enabling:
 
 - Version comparison and diff generation
 - Clean upgrade paths between DAT versions
@@ -126,14 +126,14 @@ Only one version per collection can be active at any time. The `--dat` filter op
 
 ```bash
 # If MAME 0.266 is active and 0.265 is inactive:
-romshelf plan --dat "MAME 0.265"    # ERROR: No matching active DATs
-romshelf plan --dat "MAME 0.266"    # OK: Matches active version
-romshelf plan --dat "MAME/**"       # OK: Matches all paths in active MAME version
+cat198x plan --dat "MAME 0.265"    # ERROR: No matching active DATs
+cat198x plan --dat "MAME 0.266"    # OK: Matches active version
+cat198x plan --dat "MAME/**"       # OK: Matches all paths in active MAME version
 ```
 
 ### Source Preference Order
 
-When multiple sources contain the same hash, ROMShelf uses a deterministic preference order:
+When multiple sources contain the same hash, Cat198x uses a deterministic preference order:
 
 1. Loose file preferred over archive entry
 2. ZIP preferred over 7Z (faster extraction)
@@ -223,8 +223,8 @@ Components:
 
 Apply operations are logged with reverse operations:
 
-- `romshelf apply --rollback` executes reverse operations in reverse order
-- `romshelf apply --rollback --continue` retries failed rollback operations
+- `cat198x apply --rollback` executes reverse operations in reverse order
+- `cat198x apply --rollback --continue` retries failed rollback operations
 
 ### Quarantine Triggers
 
@@ -243,7 +243,7 @@ Files are moved to quarantine when:
 ### Command Overview
 
 ```
-romshelf
+cat198x
 ├── init                    # Create new database
 ├── dat                     # DAT management
 │   ├── add <path>          # Import DAT file or directory
@@ -406,8 +406,8 @@ Header-aware matching computes multiple hashes without modifying files:
 - Database schema and migrations
 - Configuration loading (TOML parsing, platform paths)
 - CLI structure with clap
-- `romshelf init` command
-- `romshelf config get/set/list` commands
+- `cat198x init` command
+- `cat198x config get/set/list` commands
 
 **Deliverable**: Installable CLI that initialises database and manages config
 
@@ -418,7 +418,7 @@ Header-aware matching computes multiple hashes without modifying files:
 - TOSEC filename parsing and hierarchy injection
 - MAME parent/clone/BIOS/device extraction
 - Collection versioning logic
-- `romshelf dat add/list/remove/activate/deactivate` commands
+- `cat198x dat add/list/remove/activate/deactivate` commands
 
 **Deliverable**: Can import MAME and TOSEC DATs, view hierarchy
 
@@ -430,7 +430,7 @@ Header-aware matching computes multiple hashes without modifying files:
 - Parallel scanning with rayon
 - Incremental scanning (skip unchanged files based on modification time)
 - Scan interruption with graceful progress saving
-- `romshelf source add/list/remove` and `scan` commands
+- `cat198x source add/list/remove` and `scan` commands
 
 **Fully implemented**
 
@@ -439,7 +439,7 @@ Header-aware matching computes multiple hashes without modifying files:
 ### Phase 4: Status and Matching ✅
 - Hash-based matching (SHA1 primary)
 - Hierarchical rollup calculations
-- `romshelf status` command with drill-down
+- `cat198x status` command with drill-down
 - MAME merge-mode aware completeness (non-merged, split, merged)
 - BIOS/device set tracking and exclusion options
 - Mechanical set exclusion
@@ -458,7 +458,7 @@ Header-aware matching computes multiple hashes without modifying files:
 - Operation logging for rollback
 - Rollback implementation with `--continue` option
 - Disk space pre-check
-- `romshelf plan` and `apply` commands
+- `cat198x plan` and `apply` commands
 
 **Fully implemented**: All Phase 5 items complete
 
