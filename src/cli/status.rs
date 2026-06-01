@@ -157,12 +157,7 @@ fn show_detailed_status(conn: &rusqlite::Connection, version_id: i64, mode: Merg
         // Count how many required ROMs we have
         let have_count: usize = req.required_sha1s.iter()
             .filter(|sha1| {
-                let exists: bool = conn.query_row(
-                    "SELECT EXISTS(SELECT 1 FROM files WHERE sha1 = ?)",
-                    [sha1.as_str()],
-                    |row| row.get(0),
-                ).unwrap_or(false);
-                exists
+                crate::db::files::has_matching_file(conn, sha1.as_str()).unwrap_or(false)
             })
             .count();
 

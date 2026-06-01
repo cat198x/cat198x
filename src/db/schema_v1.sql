@@ -71,9 +71,13 @@ CREATE TABLE dat_game_devices (
     UNIQUE(game_id, device_name)
 );
 
--- Content-addressed file store
+-- Content-addressed file store. `sha1` is the full-file hash (the true bytes
+-- on disk and the dedup identity); `sha1_no_header` is the headerless hash,
+-- set only when a copier header was detected and stripped. Storing both lets a
+-- file match either a headerless DAT (No-Intro) or a headered DAT (GoodTools).
 CREATE TABLE files (
     sha1 TEXT PRIMARY KEY,
+    sha1_no_header TEXT,
     md5 TEXT,
     crc32 TEXT,
     size INTEGER NOT NULL,
@@ -147,5 +151,6 @@ CREATE INDEX idx_dat_roms_sha1 ON dat_roms(sha1);
 CREATE INDEX idx_dat_roms_crc32 ON dat_roms(crc32);
 CREATE INDEX idx_file_locations_sha1 ON file_locations(sha1);
 CREATE INDEX idx_file_locations_source ON file_locations(source_id);
+CREATE INDEX idx_files_sha1_no_header ON files(sha1_no_header);
 CREATE INDEX idx_quarantine_sha1 ON quarantine(sha1);
 CREATE INDEX idx_quarantine_collection ON quarantine(collection_name);

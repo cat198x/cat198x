@@ -22,7 +22,10 @@ enum ScanResult {
     /// A loose file with its hashes
     LooseFile {
         relative_path: String,
+        /// Full-file hashes (the true bytes on disk; the dedup identity).
         hashes: FileHashes,
+        /// Headerless SHA1, set only when a header was detected and stripped.
+        sha1_no_header: Option<String>,
         /// Header that was detected and skipped (for info only)
         header_skipped: Option<String>,
     },
@@ -247,17 +250,22 @@ fn scan_source(
                 // Hash loose file with header detection
                 match hash_file_with_header_detection(file_path) {
                     Ok(result) => {
-                        // Prefer headerless hash if header was detected
-                        let (hashes, header_skipped) = if let Some(headerless) = result.headerless {
-                            let header_name = result.header
-                                .map(|h| h.format.name().to_string());
-                            (headerless, header_name)
+                        // Identity is the full-file hash (the true bytes on
+                        // disk); the headerless SHA1 is kept alongside so the
+                        // file can also match headerless DATs (No-Intro).
+                        // Discarding the full hash, as before, made headered
+                        // files unmatchable against headered DATs.
+                        let sha1_no_header =
+                            result.headerless.as_ref().map(|h| h.sha1.clone());
+                        let header_skipped = if result.headerless.is_some() {
+                            result.header.map(|h| h.format.name().to_string())
                         } else {
-                            (result.full, None)
+                            None
                         };
                         ScanResult::LooseFile {
                             relative_path,
-                            hashes,
+                            hashes: result.full,
+                            sha1_no_header,
                             header_skipped,
                         }
                     }
@@ -296,10 +304,11 @@ fn scan_source(
 
     for result in results {
         match result {
-            ScanResult::LooseFile { relative_path, hashes, header_skipped } => {
+            ScanResult::LooseFile { relative_path, hashes, sha1_no_header, header_skipped } => {
                 files::upsert_file(
                     conn,
                     &hashes.sha1,
+                    sha1_no_header.as_deref(),
                     Some(&hashes.md5),
                     Some(&hashes.crc32),
                     hashes.size as i64,
@@ -321,6 +330,7 @@ fn scan_source(
                     files::upsert_file(
                         conn,
                         &entry.hashes.sha1,
+                        None, // archive entries aren't header-detected
                         Some(&entry.hashes.md5),
                         Some(&entry.hashes.crc32),
                         entry.hashes.size as i64,

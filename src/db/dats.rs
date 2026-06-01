@@ -512,12 +512,7 @@ pub fn calculate_merge_mode_stats(
     // Count how many we have
     let mut have_sha1s: HashSet<String> = HashSet::new();
     for sha1 in &all_required {
-        let exists: bool = conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM files WHERE sha1 = ?)",
-            [sha1],
-            |row| row.get(0),
-        )?;
-        if exists {
+        if crate::db::files::has_matching_file(conn, sha1)? {
             have_sha1s.insert(sha1.clone());
         }
     }
@@ -998,9 +993,9 @@ mod tests {
         let source_id = files::add_source(conn, "/roms", false).unwrap();
 
         // Only add the parent's ROMs to inventory (not the clone's unique ROMs)
-        files::upsert_file(conn, "SHA1_PACMAN_5E", None, None, 4096).unwrap();
-        files::upsert_file(conn, "SHA1_PACMAN_5F", None, None, 4096).unwrap();
-        files::upsert_file(conn, "SHA1_PROM", None, None, 256).unwrap();
+        files::upsert_file(conn, "SHA1_PACMAN_5E", None, None, None, 4096).unwrap();
+        files::upsert_file(conn, "SHA1_PACMAN_5F", None, None, None, 4096).unwrap();
+        files::upsert_file(conn, "SHA1_PROM", None, None, None, 256).unwrap();
 
         let _ = source_id; // unused, just need files in db
 

@@ -110,17 +110,36 @@ pub fn update_source_scanned(conn: &Connection, source_id: i64) -> Result<()> {
 pub fn upsert_file(
     conn: &Connection,
     sha1: &str,
+    sha1_no_header: Option<&str>,
     md5: Option<&str>,
     crc32: Option<&str>,
     size: i64,
 ) -> Result<()> {
     conn.execute(
-        "INSERT INTO files (sha1, md5, crc32, size) VALUES (?, ?, ?, ?)
-         ON CONFLICT(sha1) DO UPDATE SET md5 = COALESCE(excluded.md5, files.md5),
-                                         crc32 = COALESCE(excluded.crc32, files.crc32)",
-        params![sha1, md5, crc32, size],
+        "INSERT INTO files (sha1, sha1_no_header, md5, crc32, size) VALUES (?, ?, ?, ?, ?)
+         ON CONFLICT(sha1) DO UPDATE SET
+             sha1_no_header = COALESCE(excluded.sha1_no_header, files.sha1_no_header),
+             md5 = COALESCE(excluded.md5, files.md5),
+             crc32 = COALESCE(excluded.crc32, files.crc32)",
+        params![sha1, sha1_no_header, md5, crc32, size],
     )?;
     Ok(())
+}
+
+/// Does the inventory contain a file matching this DAT SHA1?
+///
+/// A DAT records either the headered or the headerless hash, so this matches
+/// against both `sha1` (the full-file hash) and `sha1_no_header`. This is the
+/// single source of truth for "do we have this ROM?" — used by `status` and by
+/// the merge-mode completeness calculation, so the predicate can't drift
+/// between them.
+pub fn has_matching_file(conn: &Connection, dat_sha1: &str) -> Result<bool> {
+    let exists: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM files WHERE sha1 = ?1 OR sha1_no_header = ?1)",
+        [dat_sha1],
+        |row| row.get(0),
+    )?;
+    Ok(exists)
 }
 
 /// Get a file by SHA1
@@ -215,6 +234,20 @@ mod tests {
 
     fn setup_db() -> Database {
         Database::open_in_memory().unwrap()
+    }
+
+    #[test]
+    fn test_has_matching_file_by_either_hash() {
+        let db = setup_db();
+        let conn = db.conn();
+        // A headered file: its full-file SHA1 differs from its headerless SHA1.
+        upsert_file(conn, "FULLHASH", Some("HEADERLESSHASH"), None, None, 1024).unwrap();
+
+        // A DAT records either the headered or the headerless hash; both forms
+        // must find the file, and an unrelated hash must not.
+        assert!(has_matching_file(conn, "FULLHASH").unwrap(), "headered DAT hash");
+        assert!(has_matching_file(conn, "HEADERLESSHASH").unwrap(), "headerless DAT hash");
+        assert!(!has_matching_file(conn, "NOPE").unwrap(), "unknown hash");
     }
 
     // === Source tests ===
@@ -320,7 +353,7 @@ mod tests {
 
         let sha1 = "FACEE9C577A5262DBE33AC4930BB0B58C8C037F7";
 
-        upsert_file(conn, sha1, Some("811B027EAF99C2DEF7B933C5208636DE"), Some("3337EC46"), 40976).unwrap();
+        upsert_file(conn, sha1, None, Some("811B027EAF99C2DEF7B933C5208636DE"), Some("3337EC46"), 40976).unwrap();
 
         let file = get_file_by_sha1(conn, sha1).unwrap();
         assert!(file.is_some());
@@ -340,14 +373,14 @@ mod tests {
         let sha1 = "ABCD1234567890ABCDEF1234567890ABCDEF1234";
 
         // Insert with only SHA1
-        upsert_file(conn, sha1, None, None, 1000).unwrap();
+        upsert_file(conn, sha1, None, None, None, 1000).unwrap();
 
         let file = get_file_by_sha1(conn, sha1).unwrap().unwrap();
         assert!(file.md5.is_none());
         assert!(file.crc32.is_none());
 
         // Update with MD5 and CRC32
-        upsert_file(conn, sha1, Some("DEADBEEF"), Some("12345678"), 1000).unwrap();
+        upsert_file(conn, sha1, None, Some("DEADBEEF"), Some("12345678"), 1000).unwrap();
 
         let file = get_file_by_sha1(conn, sha1).unwrap().unwrap();
         assert_eq!(file.md5, Some("DEADBEEF".to_string()));
@@ -372,7 +405,7 @@ mod tests {
 
         let sha1 = "FACEE9C577A5262DBE33AC4930BB0B58C8C037F7";
         let source_id = add_source(conn, "/roms", true).unwrap();
-        upsert_file(conn, sha1, None, None, 40976).unwrap();
+        upsert_file(conn, sha1, None, None, None, 40976).unwrap();
 
         // Add loose file location
         upsert_file_location(conn, sha1, source_id, "nes/mario.nes", None).unwrap();
@@ -390,7 +423,7 @@ mod tests {
 
         let sha1 = "FACEE9C577A5262DBE33AC4930BB0B58C8C037F7";
         let source_id = add_source(conn, "/roms", true).unwrap();
-        upsert_file(conn, sha1, None, None, 40976).unwrap();
+        upsert_file(conn, sha1, None, None, None, 40976).unwrap();
 
         // Add file inside archive
         upsert_file_location(conn, sha1, source_id, "games.zip", Some("mario.nes")).unwrap();
@@ -409,7 +442,7 @@ mod tests {
         let sha1 = "FACEE9C577A5262DBE33AC4930BB0B58C8C037F7";
         let source1 = add_source(conn, "/roms1", true).unwrap();
         let source2 = add_source(conn, "/roms2", true).unwrap();
-        upsert_file(conn, sha1, None, None, 40976).unwrap();
+        upsert_file(conn, sha1, None, None, None, 40976).unwrap();
 
         upsert_file_location(conn, sha1, source1, "mario.nes", None).unwrap();
         upsert_file_location(conn, sha1, source2, "backup/mario.nes", None).unwrap();
@@ -427,9 +460,9 @@ mod tests {
         let source_id = add_source(conn, "/roms", true).unwrap();
 
         // Add 3 unique files
-        upsert_file(conn, "SHA1_FILE1", None, None, 100).unwrap();
-        upsert_file(conn, "SHA1_FILE2", None, None, 200).unwrap();
-        upsert_file(conn, "SHA1_FILE3", None, None, 300).unwrap();
+        upsert_file(conn, "SHA1_FILE1", None, None, None, 100).unwrap();
+        upsert_file(conn, "SHA1_FILE2", None, None, None, 200).unwrap();
+        upsert_file(conn, "SHA1_FILE3", None, None, None, 300).unwrap();
 
         upsert_file_location(conn, "SHA1_FILE1", source_id, "file1.rom", None).unwrap();
         upsert_file_location(conn, "SHA1_FILE2", source_id, "file2.rom", None).unwrap();
@@ -447,7 +480,7 @@ mod tests {
         let conn = db.conn();
 
         let source_id = add_source(conn, "/roms", true).unwrap();
-        upsert_file(conn, "SHA1_FILE1", None, None, 100).unwrap();
+        upsert_file(conn, "SHA1_FILE1", None, None, None, 100).unwrap();
 
         upsert_file_location(conn, "SHA1_FILE1", source_id, "file1.rom", None).unwrap();
 
