@@ -1,18 +1,29 @@
 //! DAT file management commands
 
 use anyhow::{Context, Result};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use walkdir::WalkDir;
 
 use crate::DatCommands;
 use crate::dat::{DatSourceType, parse_dat_file_auto};
-use crate::db::{collections, dats};
+use crate::db::{Database, collections, dats};
 
 use super::{fetch, open_database};
 
 /// Run a DAT subcommand
 pub fn run(cmd: DatCommands, data_dir: Option<PathBuf>) -> Result<()> {
     match cmd {
-        DatCommands::Add { path, collection } => add_dat(&path, collection.as_deref(), data_dir),
+        DatCommands::Add {
+            path,
+            collection,
+            recursive,
+        } => {
+            if recursive {
+                add_dats_recursive(&path, collection.as_deref(), data_dir)
+            } else {
+                add_dat(&path, collection.as_deref(), data_dir)
+            }
+        }
         DatCommands::Remove {
             target,
             all_versions,
@@ -40,7 +51,24 @@ pub fn run(cmd: DatCommands, data_dir: Option<PathBuf>) -> Result<()> {
     }
 }
 
-fn add_dat(path: &PathBuf, collection_name: Option<&str>, data_dir: Option<PathBuf>) -> Result<()> {
+fn add_dat(path: &Path, collection_name: Option<&str>, data_dir: Option<PathBuf>) -> Result<()> {
+    let db = open_database(data_dir)?;
+    import_dat_file(&db, path, collection_name, false)?;
+    Ok(())
+}
+
+/// Import a single DAT file into an already-open database.
+///
+/// Returns `(games, roms)` imported. With `quiet`, the per-file progress chatter
+/// is suppressed so callers (such as recursive add) can print their own summary.
+/// Each call commits its own transaction, so one bad DAT in a batch does not roll
+/// back the DATs imported before it.
+fn import_dat_file(
+    db: &Database,
+    path: &Path,
+    collection_name: Option<&str>,
+    quiet: bool,
+) -> Result<(usize, usize)> {
     let abs_path =
         std::fs::canonicalize(path).with_context(|| format!("Cannot resolve path: {:?}", path))?;
 
@@ -48,7 +76,9 @@ fn add_dat(path: &PathBuf, collection_name: Option<&str>, data_dir: Option<PathB
         anyhow::bail!("Path is not a file: {}", abs_path.display());
     }
 
-    println!("Parsing DAT file: {}", abs_path.display());
+    if !quiet {
+        println!("Parsing DAT file: {}", abs_path.display());
+    }
 
     // Parse the DAT file (auto-detects Logiqx XML or ClrMamePro format)
     let (header, games) = parse_dat_file_auto(&abs_path)?;
@@ -58,24 +88,27 @@ fn add_dat(path: &PathBuf, collection_name: Option<&str>, data_dir: Option<PathB
         .map(|s| s.to_string())
         .unwrap_or_else(|| header.name.clone());
 
-    println!("  Name: {}", header.name);
-    if let Some(ref desc) = header.description {
-        println!("  Description: {}", desc);
+    if !quiet {
+        println!("  Name: {}", header.name);
+        if let Some(ref desc) = header.description {
+            println!("  Description: {}", desc);
+        }
+        if let Some(ref ver) = header.version {
+            println!("  Version: {}", ver);
+        }
+        println!("  Games: {}", games.len());
+        println!(
+            "  ROMs: {}",
+            games.iter().map(|g| g.roms.len()).sum::<usize>()
+        );
     }
-    if let Some(ref ver) = header.version {
-        println!("  Version: {}", ver);
-    }
-    println!("  Games: {}", games.len());
-    println!(
-        "  ROMs: {}",
-        games.iter().map(|g| g.roms.len()).sum::<usize>()
-    );
 
     // Detect source type
     let source_type = DatSourceType::detect(&header);
-    println!("  Detected type: {}", source_type.as_str());
+    if !quiet {
+        println!("  Detected type: {}", source_type.as_str());
+    }
 
-    let db = open_database(data_dir)?;
     let conn = db.conn();
 
     // Wrap the whole import (collection, version, node, games, ROMs) in one
@@ -87,11 +120,15 @@ fn add_dat(path: &PathBuf, collection_name: Option<&str>, data_dir: Option<PathB
     // Get or create collection
     let collection = match collections::get_collection_by_name(conn, &coll_name)? {
         Some(c) => {
-            println!("\nAdding to existing collection: {}", c.name);
+            if !quiet {
+                println!("\nAdding to existing collection: {}", c.name);
+            }
             c
         }
         None => {
-            println!("\nCreating new collection: {}", coll_name);
+            if !quiet {
+                println!("\nCreating new collection: {}", coll_name);
+            }
             let _id = collections::create_collection(conn, &coll_name, source_type.as_str())?;
             collections::get_collection_by_name(conn, &coll_name)?
                 .ok_or_else(|| anyhow::anyhow!("Failed to create collection"))?
@@ -146,13 +183,113 @@ fn add_dat(path: &PathBuf, collection_name: Option<&str>, data_dir: Option<PathB
 
     tx.commit()?;
 
+    if !quiet {
+        println!();
+        println!("Imported {} games with {} ROMs", game_count, rom_count);
+        println!("Version '{}' is now active", version);
+        println!();
+        println!("Run 'cat198x scan' to match files against this DAT.");
+    }
+
+    Ok((game_count, rom_count))
+}
+
+/// Add every `.dat`/`.xml` file found under `dir` (recursively).
+///
+/// The DB is opened once and each DAT is imported in its own transaction, so a
+/// single malformed DAT is reported and skipped without losing the rest of the
+/// batch. `--collection` is intentionally ignored here: each DAT names its own
+/// collection from its header.
+fn add_dats_recursive(
+    dir: &Path,
+    collection_name: Option<&str>,
+    data_dir: Option<PathBuf>,
+) -> Result<()> {
+    if !dir.is_dir() {
+        anyhow::bail!(
+            "--recursive expects a directory, but this is not one: {}",
+            dir.display()
+        );
+    }
+    if collection_name.is_some() {
+        println!("Note: --collection is ignored with --recursive; each DAT names its own.");
+    }
+
+    let dat_files = collect_dat_files(dir);
+    if dat_files.is_empty() {
+        println!("No .dat or .xml files found under {}", dir.display());
+        return Ok(());
+    }
+
+    println!(
+        "Found {} DAT file(s) under {}",
+        dat_files.len(),
+        dir.display()
+    );
+
+    let db = open_database(data_dir)?;
+
+    let mut added = 0usize;
+    let mut games_total = 0usize;
+    let mut roms_total = 0usize;
+    let mut failures: Vec<(PathBuf, String)> = Vec::new();
+
+    for (idx, file) in dat_files.iter().enumerate() {
+        match import_dat_file(&db, file, None, true) {
+            Ok((games, roms)) => {
+                added += 1;
+                games_total += games;
+                roms_total += roms;
+                let name = file
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| file.display().to_string());
+                println!(
+                    "  [{}/{}] {} ({} games)",
+                    idx + 1,
+                    dat_files.len(),
+                    name,
+                    games
+                );
+            }
+            Err(e) => failures.push((file.clone(), e.to_string())),
+        }
+    }
+
     println!();
-    println!("Imported {} games with {} ROMs", game_count, rom_count);
-    println!("Version '{}' is now active", version);
+    println!(
+        "Added {} DAT file(s): {} games, {} ROMs.",
+        added, games_total, roms_total
+    );
+    if !failures.is_empty() {
+        println!("{} file(s) failed:", failures.len());
+        for (file, err) in &failures {
+            println!("  {}: {}", file.display(), err);
+        }
+    }
     println!();
-    println!("Run 'cat198x scan' to match files against this DAT.");
+    println!("Run 'cat198x scan' to match files against these DATs.");
 
     Ok(())
+}
+
+/// Collect every `.dat`/`.xml` file under `dir`, sorted for stable output.
+fn collect_dat_files(dir: &Path) -> Vec<PathBuf> {
+    let mut files: Vec<PathBuf> = WalkDir::new(dir)
+        .follow_links(true)
+        .into_iter()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().is_file())
+        .map(|e| e.into_path())
+        .filter(|p| {
+            p.extension()
+                .and_then(|e| e.to_str())
+                .map(|e| e.eq_ignore_ascii_case("dat") || e.eq_ignore_ascii_case("xml"))
+                .unwrap_or(false)
+        })
+        .collect();
+    files.sort();
+    files
 }
 
 fn remove_dat(target: &str, all_versions: bool, data_dir: Option<PathBuf>) -> Result<()> {
@@ -691,4 +828,41 @@ fn upgrade_dat(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    #[test]
+    fn collect_dat_files_finds_dat_and_xml_recursively_and_ignores_others() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let root = dir.path();
+
+        fs::write(root.join("a.dat"), "x").expect("write a.dat");
+        fs::write(root.join("b.DAT"), "x").expect("write b.DAT"); // case-insensitive
+        fs::create_dir(root.join("nested")).expect("mkdir nested");
+        fs::write(root.join("nested/c.xml"), "x").expect("write c.xml");
+        fs::write(root.join("notes.txt"), "x").expect("write notes.txt"); // ignored
+        fs::write(root.join("archive.zip"), "x").expect("write archive.zip"); // ignored
+
+        let found = collect_dat_files(root);
+        let names: Vec<String> = found
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+
+        assert_eq!(found.len(), 3, "expected 3 DAT/XML files, got {names:?}");
+        assert!(names.contains(&"a.dat".to_string()));
+        assert!(names.contains(&"b.DAT".to_string()));
+        assert!(names.contains(&"c.xml".to_string()));
+        assert!(!names.iter().any(|n| n == "notes.txt" || n == "archive.zip"));
+    }
+
+    #[test]
+    fn collect_dat_files_on_empty_dir_returns_nothing() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        assert!(collect_dat_files(dir.path()).is_empty());
+    }
 }

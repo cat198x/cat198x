@@ -25,12 +25,17 @@ use clap::Subcommand;
 pub enum DatCommands {
     /// Add a DAT file to the database
     Add {
-        /// Path to DAT file
+        /// Path to a DAT file, or a directory when used with --recursive
         path: std::path::PathBuf,
 
-        /// Collection name (auto-detected from DAT if not specified)
+        /// Collection name (auto-detected from DAT if not specified).
+        /// Ignored with --recursive, where each DAT names its own collection.
         #[arg(short, long)]
         collection: Option<String>,
+
+        /// Add every .dat/.xml file found under the given directory
+        #[arg(short, long)]
+        recursive: bool,
     },
 
     /// Remove a DAT file/collection

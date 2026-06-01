@@ -110,6 +110,7 @@ fn test_full_workflow_init_to_status() {
         DatCommands::Add {
             path: dat_path,
             collection: None,
+            recursive: false,
         },
         env.data_dir_opt(),
     )
@@ -163,6 +164,7 @@ fn test_dat_import_creates_correct_structure() {
         DatCommands::Add {
             path: dat_path,
             collection: None,
+            recursive: false,
         },
         env.data_dir_opt(),
     )
@@ -358,6 +360,7 @@ fn test_dat_list_shows_collections() {
         DatCommands::Add {
             path: dat1,
             collection: None,
+            recursive: false,
         },
         env.data_dir_opt(),
     )
@@ -367,6 +370,7 @@ fn test_dat_list_shows_collections() {
         DatCommands::Add {
             path: dat2,
             collection: None,
+            recursive: false,
         },
         env.data_dir_opt(),
     )
@@ -427,6 +431,7 @@ fn test_dat_activate_version() {
         DatCommands::Add {
             path: dat_v1_path,
             collection: None,
+            recursive: false,
         },
         env.data_dir_opt(),
     )
@@ -437,6 +442,7 @@ fn test_dat_activate_version() {
         DatCommands::Add {
             path: dat_v2_path,
             collection: None,
+            recursive: false,
         },
         env.data_dir_opt(),
     )
@@ -590,6 +596,7 @@ fn test_clrmamepro_dat_import() {
         DatCommands::Add {
             path: dat_path,
             collection: None,
+            recursive: false,
         },
         env.data_dir_opt(),
     )
@@ -628,6 +635,7 @@ fn test_plan_generation() {
         DatCommands::Add {
             path: dat_path,
             collection: None,
+            recursive: false,
         },
         env.data_dir_opt(),
     )
@@ -752,6 +760,7 @@ fn test_plan_apply_rollback_cycle() {
         DatCommands::Add {
             path: dat_path,
             collection: None,
+            recursive: false,
         },
         env.data_dir_opt(),
     )
@@ -876,6 +885,7 @@ fn test_apply_from_zip_archive() {
         DatCommands::Add {
             path: dat_path,
             collection: None,
+            recursive: false,
         },
         env.data_dir_opt(),
     )
@@ -955,6 +965,7 @@ fn test_stale_plan_detection() {
         DatCommands::Add {
             path: dat_path,
             collection: None,
+            recursive: false,
         },
         env.data_dir_opt(),
     )
@@ -1068,6 +1079,7 @@ fn test_multi_file_plan_apply() {
         DatCommands::Add {
             path: dat_path,
             collection: None,
+            recursive: false,
         },
         env.data_dir_opt(),
     )
@@ -1164,6 +1176,7 @@ fn test_apply_skips_already_correct_files() {
         DatCommands::Add {
             path: dat_path,
             collection: None,
+            recursive: false,
         },
         env.data_dir_opt(),
     )
@@ -1269,6 +1282,7 @@ fn test_dat_remove_active_version() {
         cat198x::DatCommands::Add {
             path: dat_v1_path,
             collection: Some("Remove Test".to_string()),
+            recursive: false,
         },
         env.data_dir_opt(),
     )
@@ -1278,6 +1292,7 @@ fn test_dat_remove_active_version() {
         cat198x::DatCommands::Add {
             path: dat_v2_path,
             collection: Some("Remove Test".to_string()),
+            recursive: false,
         },
         env.data_dir_opt(),
     )
@@ -1332,6 +1347,7 @@ fn test_dat_remove_all_versions() {
         cat198x::DatCommands::Add {
             path: dat_v1_path,
             collection: Some("Remove All Test".to_string()),
+            recursive: false,
         },
         env.data_dir_opt(),
     )
@@ -1341,6 +1357,7 @@ fn test_dat_remove_all_versions() {
         cat198x::DatCommands::Add {
             path: dat_v2_path,
             collection: Some("Remove All Test".to_string()),
+            recursive: false,
         },
         env.data_dir_opt(),
     )
@@ -1384,6 +1401,7 @@ fn test_dat_remove_specific_version() {
         cat198x::DatCommands::Add {
             path: dat_v1_path,
             collection: Some("Specific Remove".to_string()),
+            recursive: false,
         },
         env.data_dir_opt(),
     )
@@ -1393,6 +1411,7 @@ fn test_dat_remove_specific_version() {
         cat198x::DatCommands::Add {
             path: dat_v2_path,
             collection: Some("Specific Remove".to_string()),
+            recursive: false,
         },
         env.data_dir_opt(),
     )
@@ -1470,6 +1489,7 @@ fn test_dat_diff_versions() {
         cat198x::DatCommands::Add {
             path: dat_v1_path,
             collection: Some("Diff Test".to_string()),
+            recursive: false,
         },
         env.data_dir_opt(),
     )
@@ -1479,6 +1499,7 @@ fn test_dat_diff_versions() {
         cat198x::DatCommands::Add {
             path: dat_v2_path,
             collection: Some("Diff Test".to_string()),
+            recursive: false,
         },
         env.data_dir_opt(),
     )
@@ -1539,6 +1560,7 @@ fn test_dat_diff_requires_two_versions() {
         cat198x::DatCommands::Add {
             path: dat_path,
             collection: Some("Single Version".to_string()),
+            recursive: false,
         },
         env.data_dir_opt(),
     )
@@ -1572,6 +1594,7 @@ fn test_doctor_healthy_database() {
         cat198x::DatCommands::Add {
             path: dat_path,
             collection: None,
+            recursive: false,
         },
         env.data_dir_opt(),
     )
@@ -1604,6 +1627,7 @@ fn test_doctor_fix_orphaned_collection() {
         cat198x::DatCommands::Add {
             path: dat_path,
             collection: None,
+            recursive: false,
         },
         env.data_dir_opt(),
     )
@@ -1648,6 +1672,7 @@ fn test_dat_versions_lists_all() {
         cat198x::DatCommands::Add {
             path: dat_v1_path,
             collection: Some("Versions Test".to_string()),
+            recursive: false,
         },
         env.data_dir_opt(),
     )
@@ -1657,6 +1682,7 @@ fn test_dat_versions_lists_all() {
         cat198x::DatCommands::Add {
             path: dat_v2_path,
             collection: Some("Versions Test".to_string()),
+            recursive: false,
         },
         env.data_dir_opt(),
     )
@@ -1692,6 +1718,7 @@ fn test_export_formats() {
         cat198x::DatCommands::Add {
             path: dat_path,
             collection: None,
+            recursive: false,
         },
         env.data_dir_opt(),
     )
@@ -1774,6 +1801,7 @@ fn test_export_filters() {
         cat198x::DatCommands::Add {
             path: dat_path,
             collection: None,
+            recursive: false,
         },
         env.data_dir_opt(),
     )
@@ -1951,6 +1979,7 @@ fn test_stats_command() {
         DatCommands::Add {
             path: dat_path,
             collection: None,
+            recursive: false,
         },
         env.data_dir_opt(),
     )
