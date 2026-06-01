@@ -31,9 +31,36 @@ pub fn verify_sha1(path: &Path, expected: &str) -> Result<bool> {
     let mut hasher = sha1::Sha1::new();
     hasher.update(&contents);
     let hash = hasher.finalize();
-    let actual = format!("{:X}", hash);
+    let actual = hex_upper(hash);
 
     Ok(actual.eq_ignore_ascii_case(expected))
+}
+
+/// Format bytes as an uppercase hex string with no separators.
+///
+/// This is the canonical hash representation used throughout the catalogue
+/// (SHA-1, MD5, CRC32). RustCrypto 0.11 changed digest outputs to a type that
+/// no longer implements `UpperHex`, so the formatting lives here instead of a
+/// `format!("{:X}", digest)`.
+pub fn hex_upper(bytes: impl AsRef<[u8]>) -> String {
+    use std::fmt::Write;
+    let bytes = bytes.as_ref();
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        write!(s, "{:02X}", b).expect("writing to a String never fails");
+    }
+    s
+}
+
+/// Format bytes as a lowercase hex string with no separators.
+pub fn hex_lower(bytes: impl AsRef<[u8]>) -> String {
+    use std::fmt::Write;
+    let bytes = bytes.as_ref();
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        write!(s, "{:02x}", b).expect("writing to a String never fails");
+    }
+    s
 }
 
 /// Format a byte count as a human-readable string

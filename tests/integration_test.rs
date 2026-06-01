@@ -737,7 +737,7 @@ fn test_plan_apply_rollback_cycle() {
     // Create a test file with known content
     // "hello" has SHA1 = AAF4C61DDCC5E8A2DABEDE0F3B482CD9AEA9434D
     let test_content = b"hello";
-    let sha1_hash = format!("{:X}", sha1::Sha1::digest(test_content));
+    let sha1_hash = romshelf::util::hex_upper(sha1::Sha1::digest(test_content));
 
     // Create DAT that expects this exact SHA1
     let dat_path = create_matching_dat(env.temp_dir.path(), "Apply Test", &sha1_hash);
@@ -858,7 +858,7 @@ fn test_apply_from_zip_archive() {
 
     // Create test content with known hash
     let test_content = b"archived rom data";
-    let sha1_hash = format!("{:X}", sha1::Sha1::digest(test_content));
+    let sha1_hash = romshelf::util::hex_upper(sha1::Sha1::digest(test_content));
 
     // Create DAT expecting this hash
     let dat_path = create_matching_dat(env.temp_dir.path(), "Archive Test", &sha1_hash);
@@ -935,7 +935,7 @@ fn test_stale_plan_detection() {
 
     // Create initial setup
     let test_content = b"hello";
-    let sha1_hash = format!("{:X}", sha1::Sha1::digest(test_content));
+    let sha1_hash = romshelf::util::hex_upper(sha1::Sha1::digest(test_content));
     let dat_path = create_matching_dat(env.temp_dir.path(), "Stale Test", &sha1_hash);
 
     use romshelf::DatCommands;
@@ -1042,7 +1042,7 @@ fn test_multi_file_plan_apply() {
     let roms: Vec<(&str, String)> = contents
         .iter()
         .map(|(content, name)| {
-            let hash = format!("{:X}", sha1::Sha1::digest(*content));
+            let hash = romshelf::util::hex_upper(sha1::Sha1::digest(*content));
             (*name, hash)
         })
         .collect();
@@ -1136,7 +1136,7 @@ fn test_apply_skips_already_correct_files() {
     env.init();
 
     let test_content = b"existing content";
-    let sha1_hash = format!("{:X}", sha1::Sha1::digest(test_content));
+    let sha1_hash = romshelf::util::hex_upper(sha1::Sha1::digest(test_content));
     let dat_path = create_matching_dat(env.temp_dir.path(), "Skip Test", &sha1_hash);
 
     use romshelf::DatCommands;
@@ -1737,7 +1737,7 @@ fn test_export_filters() {
 
     // Create test content with known hash
     let test_content = b"have this rom";
-    let sha1_hash = format!("{:X}", sha1::Sha1::digest(test_content));
+    let sha1_hash = romshelf::util::hex_upper(sha1::Sha1::digest(test_content));
 
     // Create DAT with the matching SHA1
     let dat_path = create_matching_dat(env.temp_dir.path(), "Filter Test", &sha1_hash);

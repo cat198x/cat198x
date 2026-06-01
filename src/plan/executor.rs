@@ -846,8 +846,8 @@ mod tests {
         let dest_path = temp.path().join("game.zip");
 
         // Compute actual SHA1 values
-        let sha1_z = format!("{:X}", sha1::Sha1::digest(b"z data"));
-        let sha1_a = format!("{:X}", sha1::Sha1::digest(b"a data"));
+        let sha1_z = crate::util::hex_upper(sha1::Sha1::digest(b"z data"));
+        let sha1_a = crate::util::hex_upper(sha1::Sha1::digest(b"a data"));
 
         let sources = vec![
             SourceRef {

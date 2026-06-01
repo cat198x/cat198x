@@ -249,7 +249,7 @@ fn is_file_correct_at_dest(path: &str, expected_sha1: &str) -> Result<bool> {
     let mut hasher = sha1::Sha1::new();
     Sha1Digest::update(&mut hasher, &contents);
     let hash = Sha1Digest::finalize(hasher);
-    let actual_sha1 = format!("{:X}", hash);
+    let actual_sha1 = crate::util::hex_upper(hash);
 
     Ok(actual_sha1.eq_ignore_ascii_case(expected_sha1))
 }
@@ -292,7 +292,7 @@ pub fn compute_state_hash(conn: &Connection) -> Result<String> {
     }
 
     let result = hasher.finalize();
-    Ok(format!("{:x}", result))
+    Ok(crate::util::hex_lower(result))
 }
 
 /// Simple glob pattern matching (case-insensitive)

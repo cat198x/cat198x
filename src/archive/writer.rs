@@ -72,7 +72,7 @@ impl ZipWriter {
         let mut hasher = sha1::Sha1::new();
         Sha1Digest::update(&mut hasher, data);
         let hash = Sha1Digest::finalize(hasher);
-        let sha1 = format!("{:X}", hash);
+        let sha1 = crate::util::hex_upper(hash);
 
         // Build file options
         let mut file_options =
@@ -176,7 +176,7 @@ impl TorrentZipWriter {
         let mut hasher = sha1::Sha1::new();
         Sha1Digest::update(&mut hasher, &data);
         let hash = Sha1Digest::finalize(hasher);
-        let sha1 = format!("{:X}", hash);
+        let sha1 = crate::util::hex_upper(hash);
 
         self.entries.push(TorrentZipEntry {
             name: entry_name.to_string(),

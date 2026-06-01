@@ -20,9 +20,9 @@ rusqlite = { version = "0.40", features = ["bundled"] }
 quick-xml = "0.40"
 
 # Hashing
-sha1 = "0.10"
-sha2 = "0.10"
-md-5 = "0.10"
+sha1 = "0.11"
+sha2 = "0.11"
+md-5 = "0.11"
 crc32fast = "1.4"
 
 # Archive support

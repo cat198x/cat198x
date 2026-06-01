@@ -114,8 +114,8 @@ pub fn hash_reader<R: Read>(reader: &mut R, size: u64) -> Result<FileHashes> {
     let crc32_result = crc32.finalize();
 
     Ok(FileHashes {
-        sha1: format!("{:X}", sha1_result),
-        md5: format!("{:X}", md5_result),
+        sha1: crate::util::hex_upper(sha1_result),
+        md5: crate::util::hex_upper(md5_result),
         crc32: format!("{:08X}", crc32_result),
         size,
     })
