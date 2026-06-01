@@ -26,7 +26,10 @@ md-5 = "0.10"
 crc32fast = "1.4"
 
 # Archive support
-zip = "8"
+# Deflate-only: ROM-set zips are always Stored or Deflated, so we skip
+# zip's default zstd/bzip2/lzma/aes codecs (and their C dependency,
+# zstd-sys) to keep cross-compiled release builds lean.
+zip = { version = "8", default-features = false, features = ["deflate"] }
 sevenz-rust = "0.5"
 
 # File system
