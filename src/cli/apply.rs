@@ -36,15 +36,14 @@ pub fn run(dry_run: bool, skip_space_check: bool, data_dir: Option<std::path::Pa
     }
 
     // Check disk space before proceeding (unless skipped)
-    if !skip_space_check {
-        if let Err(e) = check_disk_space(&plan) {
+    if !skip_space_check
+        && let Err(e) = check_disk_space(&plan) {
             println!("Disk space check failed:");
             println!("  {}", e);
             println!();
             println!("Free up disk space or use --skip-space-check to proceed anyway.");
             return Ok(());
         }
-    }
 
     // Check if plan has any pending operations
     let pending_count = plan
@@ -337,9 +336,9 @@ pub fn run_rollback(dry_run: bool, continue_rollback: bool, data_dir: Option<std
         let entry = entry?;
         let path = entry.path();
 
-        if path.extension().map(|e| e == "json").unwrap_or(false) {
-            if let Ok(metadata) = entry.metadata() {
-                if let Ok(modified) = metadata.modified() {
+        if path.extension().map(|e| e == "json").unwrap_or(false)
+            && let Ok(metadata) = entry.metadata()
+                && let Ok(modified) = metadata.modified() {
                     match &latest {
                         None => latest = Some((path, modified)),
                         Some((_, prev_time)) if modified > *prev_time => {
@@ -348,8 +347,6 @@ pub fn run_rollback(dry_run: bool, continue_rollback: bool, data_dir: Option<std
                         _ => {}
                     }
                 }
-            }
-        }
     }
 
     let log_path = match latest {

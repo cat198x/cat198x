@@ -77,9 +77,9 @@ pub fn load_latest_plan(data_dir: Option<PathBuf>) -> Result<Option<(Plan, PathB
         let entry = entry?;
         let path = entry.path();
 
-        if path.extension().map(|e| e == "json").unwrap_or(false) {
-            if let Ok(metadata) = entry.metadata() {
-                if let Ok(modified) = metadata.modified() {
+        if path.extension().map(|e| e == "json").unwrap_or(false)
+            && let Ok(metadata) = entry.metadata()
+                && let Ok(modified) = metadata.modified() {
                     match &latest {
                         None => latest = Some((path, modified)),
                         Some((_, prev_time)) if modified > *prev_time => {
@@ -88,8 +88,6 @@ pub fn load_latest_plan(data_dir: Option<PathBuf>) -> Result<Option<(Plan, PathB
                         _ => {}
                     }
                 }
-            }
-        }
     }
 
     match latest {

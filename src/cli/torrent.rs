@@ -259,7 +259,7 @@ fn verify_torrent(torrent_path: &Path, base_path: Option<PathBuf>) -> Result<()>
 
     let total = file_count;
     let ok = found.len();
-    let percentage = if total > 0 { ok * 100 / total } else { 100 };
+    let percentage = (ok * 100).checked_div(total).unwrap_or(100);
 
     println!("Verification complete:");
     println!("  Found: {}/{} ({}%)", ok, total, percentage);

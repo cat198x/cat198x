@@ -268,15 +268,14 @@ fn list_config(collection: Option<&str>, data_dir: Option<PathBuf>) -> Result<()
             if let Some(ref mode) = cfg.merge_mode {
                 println!("  merge_mode:    {}", mode);
             }
-            if let Some(ref extra) = cfg.extra_config {
-                if extra.one_g_one_r {
+            if let Some(ref extra) = cfg.extra_config
+                && extra.one_g_one_r {
                     print!("  1g1r:          on");
                     if !extra.region_priority.is_empty() {
                         print!(" ({})", extra.region_priority.join(", "));
                     }
                     println!();
                 }
-            }
             println!();
         }
     }

@@ -99,15 +99,13 @@ fn tokenize(content: &str) -> Vec<String> {
                         break;
                     }
                     // Handle escaped quotes
-                    if ch == '\\' {
-                        if let Some(&next) = chars.peek() {
-                            if next == '"' {
+                    if ch == '\\'
+                        && let Some(&next) = chars.peek()
+                            && next == '"' {
                                 s.push('"');
                                 chars.next();
                                 continue;
                             }
-                        }
-                    }
                     s.push(ch);
                 }
                 tokens.push(s);
@@ -216,17 +214,15 @@ fn parse_game_block(tokens: &[String]) -> Option<DatGameEntry> {
         }
 
         // Check for nested block (rom, disk, etc.)
-        if tokens[i] == "(" {
-            if let Ok((block, new_i)) = parse_block(tokens, i) {
-                if key == "rom" {
-                    if let Some(rom) = parse_rom_block(&block) {
+        if tokens[i] == "("
+            && let Ok((block, new_i)) = parse_block(tokens, i) {
+                if key == "rom"
+                    && let Some(rom) = parse_rom_block(&block) {
                         game.roms.push(rom);
                     }
-                }
                 i = new_i;
                 continue;
             }
-        }
 
         // Simple key-value
         let value = &tokens[i];

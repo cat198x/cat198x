@@ -46,8 +46,8 @@ fn check_for_update() -> Result<()> {
         println!("Run 'romshelf update' to install the update.");
 
         // Show release notes if available
-        if let Some(body) = &status.body {
-            if !body.is_empty() {
+        if let Some(body) = &status.body
+            && !body.is_empty() {
                 println!();
                 println!("Release notes:");
                 // Truncate to first 500 chars
@@ -60,7 +60,6 @@ fn check_for_update() -> Result<()> {
                     println!("  {}", line);
                 }
             }
-        }
     } else {
         println!("You're running the latest version (v{})", VERSION);
     }

@@ -193,11 +193,10 @@ pub fn select_preferred<'a>(
     }
 
     // If prefer_parent is set and we have a parent, prefer it
-    if prefs.prefer_parent {
-        if let Some(parent) = valid.iter().find(|c| c.is_parent) {
+    if prefs.prefer_parent
+        && let Some(parent) = valid.iter().find(|c| c.is_parent) {
             return Some(parent.name);
         }
-    }
 
     // Find the best candidate by comparing preferences
     let best = valid.iter().min_by(|a, b| prefs.compare(&a.parsed, &b.parsed));
@@ -339,8 +338,10 @@ mod tests {
 
     #[test]
     fn test_select_preferred_parent() {
-        let mut prefs = FilterPreferences::default();
-        prefs.prefer_parent = true;
+        let prefs = FilterPreferences {
+            prefer_parent: true,
+            ..Default::default()
+        };
 
         let candidates = vec![
             RomCandidate::with_parent_status("Game (USA)", true),

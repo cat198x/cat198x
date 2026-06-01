@@ -154,13 +154,11 @@ fn scan_source(
             .into_iter()
             .filter(|path| {
                 // For incremental scan, check if file was modified since last scan
-                if let Some(threshold) = last_scanned {
-                    if let Ok(metadata) = std::fs::metadata(path) {
-                        if let Ok(modified) = metadata.modified() {
+                if let Some(threshold) = last_scanned
+                    && let Ok(metadata) = std::fs::metadata(path)
+                        && let Ok(modified) = metadata.modified() {
                             return modified > threshold;
                         }
-                    }
-                }
                 // If we can't determine modification time, scan it
                 true
             })
@@ -218,7 +216,7 @@ fn scan_source(
 
             // Update progress
             let count = processed_count.fetch_add(1, Ordering::SeqCst);
-            if count % 10 == 0 {
+            if count.is_multiple_of(10) {
                 pb.set_position(count as u64);
                 pb.set_message(truncate_path(&relative_path, 30));
             }
