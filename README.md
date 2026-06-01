@@ -1,5 +1,7 @@
 # Cat198x
 
+[![CI](https://github.com/cat198x/cat198x/actions/workflows/ci.yml/badge.svg)](https://github.com/cat198x/cat198x/actions/workflows/ci.yml)
+
 Catalogue, verify, and reorganise a retro-gaming ROM collection — safely.
 
 Cat198x scans your ROM directories, matches every file against
