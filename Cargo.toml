@@ -57,7 +57,7 @@ chrono = "0.4"
 ctrlc = "3.4"
 
 # Self-update from GitHub releases
-self_update = { version = "0.41", features = ["archive-tar", "archive-zip", "compression-flate2", "compression-zip-deflate"] }
+self_update = { version = "0.44", features = ["archive-tar", "archive-zip", "compression-flate2", "compression-zip-deflate"] }
 
 # HTTP client for DAT fetching
 reqwest = { version = "0.12", features = ["blocking"] }
