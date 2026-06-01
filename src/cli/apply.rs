@@ -623,6 +623,14 @@ fn execute_move(
         return Ok(());
     }
 
+    // Flush the verified destination to disk before deleting the source, so a
+    // power loss in this window can't lose both copies of the ROM. Verification
+    // above reads back through the page cache, which is not a durability
+    // guarantee on its own.
+    std::fs::File::open(dest_path)
+        .and_then(|f| f.sync_all())
+        .with_context(|| format!("Failed to flush destination before delete: {}", dest_path))?;
+
     // Delete the source file (only for loose files)
     let source = Path::new(source_path);
     if source.exists() {
