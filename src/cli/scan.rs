@@ -3,11 +3,18 @@
 use anyhow::{Context, Result};
 use indicatif::{ProgressBar, ProgressStyle};
 use rayon::prelude::*;
+use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::SystemTime;
 use walkdir::WalkDir;
+
+/// When stderr is not a terminal (piped, redirected, run in the background, or
+/// in CI), the indicatif progress bar draws nothing, so the scan would appear to
+/// hang. In that case we emit a plain progress line every this many files
+/// instead, plus one for the final file.
+const PROGRESS_LOG_INTERVAL: usize = 250;
 
 use crate::db::files::{self, Source};
 use crate::scanner::archive::{ArchiveType, hash_archive_entries};
@@ -179,13 +186,23 @@ fn scan_source(
         println!("  {} files to scan ({} unchanged)", total_to_scan, skipped);
     }
 
-    let pb = ProgressBar::new(total_to_scan as u64);
-    pb.set_style(
-        ProgressStyle::default_bar()
-            .template("  [{bar:40.cyan/blue}] {pos}/{len} {msg}")
-            .expect("progress-bar template is a valid literal")
-            .progress_chars("=>-"),
-    );
+    // A terminal gets the live progress bar; anything else (pipe, redirect,
+    // background, CI) gets periodic textual progress lines instead, because the
+    // bar is invisible there and the scan would otherwise look frozen.
+    let interactive = std::io::stderr().is_terminal();
+    let pb = if interactive {
+        let bar = ProgressBar::new(total_to_scan as u64);
+        bar.set_style(
+            ProgressStyle::default_bar()
+                .template("  [{bar:40.cyan/blue}] {pos}/{len} {msg}")
+                .expect("progress-bar template is a valid literal")
+                .progress_chars("=>-"),
+        );
+        bar
+    } else {
+        println!("  hashing {} files...", total_to_scan);
+        ProgressBar::hidden()
+    };
 
     // For tracking progress across threads
     let processed_count = Arc::new(AtomicUsize::new(0));
@@ -216,10 +233,19 @@ fn scan_source(
                 .to_string();
 
             // Update progress
-            let count = processed_count.fetch_add(1, Ordering::SeqCst);
-            if count.is_multiple_of(10) {
-                pb.set_position(count as u64);
-                pb.set_message(truncate_path(&relative_path, 30));
+            let done = processed_count.fetch_add(1, Ordering::SeqCst) + 1;
+            if interactive {
+                if done.is_multiple_of(10) {
+                    pb.set_position(done as u64);
+                    pb.set_message(truncate_path(&relative_path, 30));
+                }
+            } else if done.is_multiple_of(PROGRESS_LOG_INTERVAL) || done == total_to_scan {
+                println!(
+                    "  hashed {}/{} ({}%)",
+                    done,
+                    total_to_scan,
+                    done * 100 / total_to_scan
+                );
             }
 
             // Check if it's an archive
@@ -286,7 +312,11 @@ fn scan_source(
         return Ok((0, 0, 0));
     }
 
-    pb.set_message("writing to database...");
+    if interactive {
+        pb.set_message("writing to database...");
+    } else {
+        println!("  writing results to database...");
+    }
 
     // Sequential database write phase
     let mut processed_files = 0;
