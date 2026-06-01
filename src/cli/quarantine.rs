@@ -143,12 +143,33 @@ fn run_prune(collection: Option<String>, yes: bool, data_dir: Option<PathBuf>) -
     for entry in &entries {
         let file_path = quarantine_dir.join(&entry.quarantine_path);
 
-        // Delete the file
+        // A permanent delete must not destroy the wrong bytes: re-hash the
+        // quarantined file and confirm it still matches the recorded SHA1
+        // before unlinking. If it was replaced or tampered with, refuse.
         if file_path.exists() {
-            if let Err(e) = fs::remove_file(&file_path) {
-                eprintln!("Failed to delete {}: {}", file_path.display(), e);
-                errors += 1;
-                continue;
+            match crate::scanner::hasher::hash_file(&file_path) {
+                Ok(h) if h.sha1.eq_ignore_ascii_case(&entry.sha1) => {
+                    if let Err(e) = fs::remove_file(&file_path) {
+                        eprintln!("Failed to delete {}: {}", file_path.display(), e);
+                        errors += 1;
+                        continue;
+                    }
+                }
+                Ok(h) => {
+                    eprintln!(
+                        "Skipping {}: content {} does not match recorded {} — not deleting",
+                        file_path.display(),
+                        h.sha1,
+                        entry.sha1
+                    );
+                    errors += 1;
+                    continue;
+                }
+                Err(e) => {
+                    eprintln!("Failed to hash {} — not deleting: {}", file_path.display(), e);
+                    errors += 1;
+                    continue;
+                }
             }
         }
 
@@ -325,14 +346,27 @@ pub fn move_to_quarantine(
     // Create quarantine directory if it doesn't exist
     fs::create_dir_all(&quarantine_dir).context("Failed to create quarantine directory")?;
 
-    // Generate quarantine filename: sha1_originalname
+    // Quarantine filename: <full-sha1>_originalname. The full SHA1 (not an
+    // 8-char prefix) means two distinct files can never collide onto the same
+    // path — an 8-char prefix could, losing a ROM, and slicing it also panicked
+    // on a short or empty hash.
     let original_filename = std::path::Path::new(file_path)
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("unknown");
 
-    let quarantine_filename = format!("{}_{}", &sha1[..8], original_filename);
+    let quarantine_filename = format!("{}_{}", sha1, original_filename);
     let quarantine_path = quarantine_dir.join(&quarantine_filename);
+
+    // Never overwrite an existing quarantine file — that would destroy whatever
+    // is already there. A collision under the full SHA1 means identical content
+    // under the same name, so refuse rather than clobber.
+    if quarantine_path.exists() {
+        anyhow::bail!(
+            "Quarantine target already exists, refusing to overwrite: {}",
+            quarantine_path.display()
+        );
+    }
 
     // Move the file
     let source = std::path::Path::new(file_path);
@@ -409,5 +443,47 @@ mod tests {
         let truncated = truncate_path(long, 30);
         assert!(truncated.starts_with("..."));
         assert_eq!(truncated.len(), 30);
+    }
+
+    #[test]
+    fn test_move_to_quarantine_refuses_to_overwrite() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let data_dir = temp.path().join("data");
+        let sha1 = "ABCDEF0123456789ABCDEF0123456789ABCDEF01";
+
+        // ROMShelf must be initialised so the quarantine DB exists.
+        crate::cli::init::run(None, Some(data_dir.clone())).unwrap();
+
+        // First file is quarantined under a full-SHA1 filename.
+        let f1 = temp.path().join("game.rom");
+        std::fs::write(&f1, b"first").unwrap();
+        move_to_quarantine(
+            f1.to_str().unwrap(),
+            sha1,
+            5,
+            db_quarantine::QuarantineReason::SetRemoved,
+            None,
+            Some(data_dir.clone()),
+        )
+        .unwrap();
+        let qfile = data_dir.join("quarantine").join(format!("{}_game.rom", sha1));
+        assert!(qfile.exists(), "quarantined under the full-SHA1 name");
+        let original = std::fs::read(&qfile).unwrap();
+
+        // A different file mapping to the same quarantine path must be refused,
+        // not silently clobbered, and its source left in place.
+        let f2 = temp.path().join("game.rom");
+        std::fs::write(&f2, b"second-and-different").unwrap();
+        let result = move_to_quarantine(
+            f2.to_str().unwrap(),
+            sha1,
+            20,
+            db_quarantine::QuarantineReason::SetRemoved,
+            None,
+            Some(data_dir.clone()),
+        );
+        assert!(result.is_err(), "must refuse to overwrite an existing quarantine file");
+        assert_eq!(std::fs::read(&qfile).unwrap(), original, "existing quarantine file untouched");
+        assert!(f2.exists(), "source left in place when quarantine is refused");
     }
 }
