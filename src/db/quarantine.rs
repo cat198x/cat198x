@@ -117,7 +117,8 @@ pub fn get_entry(conn: &Connection, id: i64) -> Result<Option<QuarantineEntry>> 
                 original_path: row.get(2)?,
                 quarantine_path: row.get(3)?,
                 size: row.get(4)?,
-                reason: QuarantineReason::parse(&reason_str).unwrap_or(QuarantineReason::PathChanged),
+                reason: QuarantineReason::parse(&reason_str)
+                    .unwrap_or(QuarantineReason::PathChanged),
                 collection_name: row.get(6)?,
                 quarantined_at: row.get(7)?,
             })
@@ -143,7 +144,8 @@ pub fn list_entries(conn: &Connection) -> Result<Vec<QuarantineEntry>> {
                 original_path: row.get(2)?,
                 quarantine_path: row.get(3)?,
                 size: row.get(4)?,
-                reason: QuarantineReason::parse(&reason_str).unwrap_or(QuarantineReason::PathChanged),
+                reason: QuarantineReason::parse(&reason_str)
+                    .unwrap_or(QuarantineReason::PathChanged),
                 collection_name: row.get(6)?,
                 quarantined_at: row.get(7)?,
             })
@@ -177,7 +179,8 @@ pub fn list_entries_by_collection(
                 original_path: row.get(2)?,
                 quarantine_path: row.get(3)?,
                 size: row.get(4)?,
-                reason: QuarantineReason::parse(&reason_str).unwrap_or(QuarantineReason::PathChanged),
+                reason: QuarantineReason::parse(&reason_str)
+                    .unwrap_or(QuarantineReason::PathChanged),
                 collection_name: row.get(6)?,
                 quarantined_at: row.get(7)?,
             })
@@ -195,11 +198,9 @@ pub fn count_entries(conn: &Connection) -> Result<i64> {
 
 /// Get total size of quarantined files
 pub fn total_size(conn: &Connection) -> Result<i64> {
-    let size: i64 = conn.query_row(
-        "SELECT COALESCE(SUM(size), 0) FROM quarantine",
-        [],
-        |row| row.get(0),
-    )?;
+    let size: i64 = conn.query_row("SELECT COALESCE(SUM(size), 0) FROM quarantine", [], |row| {
+        row.get(0)
+    })?;
     Ok(size)
 }
 
@@ -337,8 +338,26 @@ mod tests {
         let db = setup_db();
         let conn = db.conn();
 
-        add_entry(conn, "sha1", "/a.rom", "a.rom", 100, QuarantineReason::SetRemoved, None).unwrap();
-        add_entry(conn, "sha2", "/b.rom", "b.rom", 200, QuarantineReason::SetRemoved, None).unwrap();
+        add_entry(
+            conn,
+            "sha1",
+            "/a.rom",
+            "a.rom",
+            100,
+            QuarantineReason::SetRemoved,
+            None,
+        )
+        .unwrap();
+        add_entry(
+            conn,
+            "sha2",
+            "/b.rom",
+            "b.rom",
+            200,
+            QuarantineReason::SetRemoved,
+            None,
+        )
+        .unwrap();
 
         assert_eq!(count_entries(conn).unwrap(), 2);
         assert_eq!(total_size(conn).unwrap(), 300);
@@ -349,9 +368,36 @@ mod tests {
         let db = setup_db();
         let conn = db.conn();
 
-        add_entry(conn, "sha1", "/a.rom", "a.rom", 100, QuarantineReason::SetRemoved, None).unwrap();
-        add_entry(conn, "sha2", "/b.rom", "b.rom", 200, QuarantineReason::SetRemoved, None).unwrap();
-        add_entry(conn, "sha3", "/c.rom", "c.rom", 50, QuarantineReason::ContentChanged, None).unwrap();
+        add_entry(
+            conn,
+            "sha1",
+            "/a.rom",
+            "a.rom",
+            100,
+            QuarantineReason::SetRemoved,
+            None,
+        )
+        .unwrap();
+        add_entry(
+            conn,
+            "sha2",
+            "/b.rom",
+            "b.rom",
+            200,
+            QuarantineReason::SetRemoved,
+            None,
+        )
+        .unwrap();
+        add_entry(
+            conn,
+            "sha3",
+            "/c.rom",
+            "c.rom",
+            50,
+            QuarantineReason::ContentChanged,
+            None,
+        )
+        .unwrap();
 
         let summary = summary_by_reason(conn).unwrap();
         assert_eq!(summary.len(), 2);

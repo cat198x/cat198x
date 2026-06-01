@@ -4,7 +4,7 @@ use anyhow::{Context, Result};
 use std::fs;
 use std::path::PathBuf;
 
-use crate::plan::{generate_plan_filtered, Plan};
+use crate::plan::{Plan, generate_plan_filtered};
 
 use super::{get_data_dir, open_database};
 
@@ -79,15 +79,14 @@ pub fn load_latest_plan(data_dir: Option<PathBuf>) -> Result<Option<(Plan, PathB
 
         if path.extension().map(|e| e == "json").unwrap_or(false)
             && let Ok(metadata) = entry.metadata()
-                && let Ok(modified) = metadata.modified() {
-                    match &latest {
-                        None => latest = Some((path, modified)),
-                        Some((_, prev_time)) if modified > *prev_time => {
-                            latest = Some((path, modified))
-                        }
-                        _ => {}
-                    }
-                }
+            && let Ok(modified) = metadata.modified()
+        {
+            match &latest {
+                None => latest = Some((path, modified)),
+                Some((_, prev_time)) if modified > *prev_time => latest = Some((path, modified)),
+                _ => {}
+            }
+        }
     }
 
     match latest {

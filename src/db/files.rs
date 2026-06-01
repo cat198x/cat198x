@@ -1,7 +1,7 @@
 //! File and location CRUD operations
 
 use anyhow::Result;
-use rusqlite::{params, Connection};
+use rusqlite::{Connection, params};
 
 /// A source directory
 #[derive(Debug, Clone)]
@@ -157,9 +157,8 @@ pub fn has_matching_crc_size(conn: &Connection, crc32: &str, size: i64) -> Resul
 
 /// Get a file by SHA1
 pub fn get_file_by_sha1(conn: &Connection, sha1: &str) -> Result<Option<File>> {
-    let mut stmt = conn.prepare(
-        "SELECT sha1, md5, crc32, size, first_seen FROM files WHERE sha1 = ?",
-    )?;
+    let mut stmt =
+        conn.prepare("SELECT sha1, md5, crc32, size, first_seen FROM files WHERE sha1 = ?")?;
 
     let result = stmt.query_row([sha1], |row| {
         Ok(File {
@@ -258,8 +257,14 @@ mod tests {
 
         // A DAT records either the headered or the headerless hash; both forms
         // must find the file, and an unrelated hash must not.
-        assert!(has_matching_file(conn, "FULLHASH").unwrap(), "headered DAT hash");
-        assert!(has_matching_file(conn, "HEADERLESSHASH").unwrap(), "headerless DAT hash");
+        assert!(
+            has_matching_file(conn, "FULLHASH").unwrap(),
+            "headered DAT hash"
+        );
+        assert!(
+            has_matching_file(conn, "HEADERLESSHASH").unwrap(),
+            "headerless DAT hash"
+        );
         assert!(!has_matching_file(conn, "NOPE").unwrap(), "unknown hash");
     }
 
@@ -336,13 +341,17 @@ mod tests {
         let id = add_source(conn, "/home/user/roms", true).unwrap();
 
         // Initially no last_scanned
-        let source = get_source_by_path(conn, "/home/user/roms").unwrap().unwrap();
+        let source = get_source_by_path(conn, "/home/user/roms")
+            .unwrap()
+            .unwrap();
         assert!(source.last_scanned.is_none());
 
         // Update scanned time
         update_source_scanned(conn, id).unwrap();
 
-        let source = get_source_by_path(conn, "/home/user/roms").unwrap().unwrap();
+        let source = get_source_by_path(conn, "/home/user/roms")
+            .unwrap()
+            .unwrap();
         assert!(source.last_scanned.is_some());
     }
 
@@ -366,7 +375,15 @@ mod tests {
 
         let sha1 = "FACEE9C577A5262DBE33AC4930BB0B58C8C037F7";
 
-        upsert_file(conn, sha1, None, Some("811B027EAF99C2DEF7B933C5208636DE"), Some("3337EC46"), 40976).unwrap();
+        upsert_file(
+            conn,
+            sha1,
+            None,
+            Some("811B027EAF99C2DEF7B933C5208636DE"),
+            Some("3337EC46"),
+            40976,
+        )
+        .unwrap();
 
         let file = get_file_by_sha1(conn, sha1).unwrap();
         assert!(file.is_some());

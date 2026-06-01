@@ -90,7 +90,8 @@ pub fn run(
             let downloads_dir = data_dir.join("downloads");
             fs::create_dir_all(&downloads_dir).ok();
 
-            let filename = source.url_pattern
+            let filename = source
+                .url_pattern
                 .rsplit('/')
                 .next()
                 .unwrap_or("download.dat");

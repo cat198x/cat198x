@@ -3,8 +3,8 @@
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 
-use crate::db::files;
 use crate::SourceCommands;
+use crate::db::files;
 
 use super::open_database;
 
@@ -18,8 +18,8 @@ pub fn run(cmd: SourceCommands, data_dir: Option<PathBuf>) -> Result<()> {
 }
 
 fn add_source(path: &PathBuf, data_dir: Option<PathBuf>) -> Result<()> {
-    let abs_path = std::fs::canonicalize(path)
-        .with_context(|| format!("Cannot resolve path: {:?}", path))?;
+    let abs_path =
+        std::fs::canonicalize(path).with_context(|| format!("Cannot resolve path: {:?}", path))?;
 
     // Check if directory exists
     if !abs_path.is_dir() {
@@ -57,8 +57,8 @@ fn add_source(path: &PathBuf, data_dir: Option<PathBuf>) -> Result<()> {
 }
 
 fn remove_source(path: &PathBuf, data_dir: Option<PathBuf>) -> Result<()> {
-    let abs_path = std::fs::canonicalize(path)
-        .with_context(|| format!("Cannot resolve path: {:?}", path))?;
+    let abs_path =
+        std::fs::canonicalize(path).with_context(|| format!("Cannot resolve path: {:?}", path))?;
 
     let db = open_database(data_dir)?;
     let conn = db.conn();

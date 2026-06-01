@@ -3,8 +3,8 @@
 use anyhow::Result;
 use std::path::PathBuf;
 
-use crate::db::config as db_config;
 use crate::ConfigCommands;
+use crate::db::config as db_config;
 
 use super::open_database;
 
@@ -16,7 +16,9 @@ pub fn run(cmd: ConfigCommands, data_dir: Option<PathBuf>) -> Result<()> {
             key,
             value,
         } => set_config(&collection, &key, &value, data_dir),
-        ConfigCommands::Get { collection, key } => get_config(&collection, key.as_deref(), data_dir),
+        ConfigCommands::Get { collection, key } => {
+            get_config(&collection, key.as_deref(), data_dir)
+        }
         ConfigCommands::List { collection } => list_config(collection.as_deref(), data_dir),
     }
 }
@@ -109,25 +111,26 @@ fn set_config(collection: &str, key: &str, value: &str, data_dir: Option<PathBuf
                 println!("  {}. {}", i + 1, region);
             }
         }
-        "exclude_prereleases" => {
-            match value.to_lowercase().as_str() {
-                "on" | "true" | "yes" | "1" => {
-                    db_config::set_exclude_prereleases(conn, collection, true)?;
-                    println!("Enabled prerelease exclusion for '{}' (betas, protos, demos)", collection);
-                }
-                "off" | "false" | "no" | "0" => {
-                    db_config::set_exclude_prereleases(conn, collection, false)?;
-                    println!("Disabled prerelease exclusion for '{}'", collection);
-                }
-                _ => {
-                    anyhow::bail!(
-                        "Invalid exclude_prereleases value: '{}'\n\
-                         Valid options: on, off (or true/false, yes/no)",
-                        value
-                    );
-                }
+        "exclude_prereleases" => match value.to_lowercase().as_str() {
+            "on" | "true" | "yes" | "1" => {
+                db_config::set_exclude_prereleases(conn, collection, true)?;
+                println!(
+                    "Enabled prerelease exclusion for '{}' (betas, protos, demos)",
+                    collection
+                );
             }
-        }
+            "off" | "false" | "no" | "0" => {
+                db_config::set_exclude_prereleases(conn, collection, false)?;
+                println!("Disabled prerelease exclusion for '{}'", collection);
+            }
+            _ => {
+                anyhow::bail!(
+                    "Invalid exclude_prereleases value: '{}'\n\
+                         Valid options: on, off (or true/false, yes/no)",
+                    value
+                );
+            }
+        },
         _ => {
             anyhow::bail!(
                 "Unknown config key: '{}'\n\
@@ -188,7 +191,10 @@ fn get_config(collection: &str, key: Option<&str>, data_dir: Option<PathBuf>) ->
                         }
                     }
                     "exclude_prereleases" => {
-                        let enabled = cfg.extra_config.as_ref().is_some_and(|e| e.exclude_prereleases);
+                        let enabled = cfg
+                            .extra_config
+                            .as_ref()
+                            .is_some_and(|e| e.exclude_prereleases);
                         println!("{}", if enabled { "on" } else { "off" });
                     }
                     _ => anyhow::bail!("Unknown config key: '{}'", k),
@@ -213,13 +219,32 @@ fn get_config(collection: &str, key: Option<&str>, data_dir: Option<PathBuf>) ->
                 if let Some(ref extra) = cfg.extra_config {
                     println!();
                     println!("  Filtering:");
-                    println!("    1g1r:               {}", if extra.one_g_one_r { "on" } else { "off" });
+                    println!(
+                        "    1g1r:               {}",
+                        if extra.one_g_one_r { "on" } else { "off" }
+                    );
                     if !extra.region_priority.is_empty() {
-                        println!("    regions:            {}", extra.region_priority.join(", "));
+                        println!(
+                            "    regions:            {}",
+                            extra.region_priority.join(", ")
+                        );
                     }
-                    println!("    exclude_modified:   {}", if extra.exclude_modified { "on" } else { "off" });
-                    println!("    exclude_bad_dumps:  {}", if extra.exclude_bad_dumps { "on" } else { "off" });
-                    println!("    exclude_prereleases:{}", if extra.exclude_prereleases { "on" } else { "off" });
+                    println!(
+                        "    exclude_modified:   {}",
+                        if extra.exclude_modified { "on" } else { "off" }
+                    );
+                    println!(
+                        "    exclude_bad_dumps:  {}",
+                        if extra.exclude_bad_dumps { "on" } else { "off" }
+                    );
+                    println!(
+                        "    exclude_prereleases:{}",
+                        if extra.exclude_prereleases {
+                            "on"
+                        } else {
+                            "off"
+                        }
+                    );
                 }
             }
         }
@@ -269,13 +294,14 @@ fn list_config(collection: Option<&str>, data_dir: Option<PathBuf>) -> Result<()
                 println!("  merge_mode:    {}", mode);
             }
             if let Some(ref extra) = cfg.extra_config
-                && extra.one_g_one_r {
-                    print!("  1g1r:          on");
-                    if !extra.region_priority.is_empty() {
-                        print!(" ({})", extra.region_priority.join(", "));
-                    }
-                    println!();
+                && extra.one_g_one_r
+            {
+                print!("  1g1r:          on");
+                if !extra.region_priority.is_empty() {
+                    print!(" ({})", extra.region_priority.join(", "));
                 }
+                println!();
+            }
             println!();
         }
     }

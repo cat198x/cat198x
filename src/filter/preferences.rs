@@ -194,12 +194,15 @@ pub fn select_preferred<'a>(
 
     // If prefer_parent is set and we have a parent, prefer it
     if prefs.prefer_parent
-        && let Some(parent) = valid.iter().find(|c| c.is_parent) {
-            return Some(parent.name);
-        }
+        && let Some(parent) = valid.iter().find(|c| c.is_parent)
+    {
+        return Some(parent.name);
+    }
 
     // Find the best candidate by comparing preferences
-    let best = valid.iter().min_by(|a, b| prefs.compare(&a.parsed, &b.parsed));
+    let best = valid
+        .iter()
+        .min_by(|a, b| prefs.compare(&a.parsed, &b.parsed));
 
     best.map(|c| c.name)
 }

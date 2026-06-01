@@ -58,11 +58,8 @@ fn gather_stats(conn: &rusqlite::Connection) -> Result<OverallStats> {
     let sources = files::list_sources(conn)?;
     let total_sources = sources.len() as i64;
 
-    let total_files_scanned: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM files",
-        [],
-        |row| row.get(0),
-    )?;
+    let total_files_scanned: i64 =
+        conn.query_row("SELECT COUNT(*) FROM files", [], |row| row.get(0))?;
 
     // Get quarantine stats
     let (quarantine_count, quarantine_size): (i64, i64) = conn.query_row(
@@ -154,10 +151,15 @@ fn print_stats(stats: &OverallStats) {
         0
     };
 
-    println!("Overall: {}/{} ROMs ({}%)", have_roms, total_roms, overall_pct);
-    println!("         {} / {} total",
+    println!(
+        "Overall: {}/{} ROMs ({}%)",
+        have_roms, total_roms, overall_pct
+    );
+    println!(
+        "         {} / {} total",
         crate::util::format_bytes(have_size as u64),
-        crate::util::format_bytes(total_size as u64));
+        crate::util::format_bytes(total_size as u64)
+    );
     println!();
 
     // Per-collection breakdown
@@ -166,7 +168,9 @@ fn print_stats(stats: &OverallStats) {
         println!();
 
         // Find longest collection name for alignment
-        let max_name_len = stats.collections.iter()
+        let max_name_len = stats
+            .collections
+            .iter()
             .map(|c| c.name.len())
             .max()
             .unwrap_or(10);
@@ -195,7 +199,10 @@ fn print_stats(stats: &OverallStats) {
 
     // Sources and files
     println!("Sources: {} registered", stats.total_sources);
-    println!("Files:   {} unique hashes indexed", stats.total_files_scanned);
+    println!(
+        "Files:   {} unique hashes indexed",
+        stats.total_files_scanned
+    );
 
     // Quarantine
     if stats.quarantine_count > 0 {

@@ -8,7 +8,7 @@ use std::path::Path;
 
 use super::{Plan, SourceRef};
 use crate::db::{collections, config as db_config};
-use crate::filter::{parse_game_name, select_preferred, RomCandidate};
+use crate::filter::{RomCandidate, parse_game_name, select_preferred};
 
 /// A matched ROM ready for planning
 #[derive(Debug, Clone)]
@@ -585,16 +585,10 @@ mod tests {
     fn test_one_g_one_r_custom_region_priority() {
         use crate::filter::FilterPreferences;
 
-        let matches = vec![
-            make_test_rom("Game (USA)"),
-            make_test_rom("Game (Japan)"),
-        ];
+        let matches = vec![make_test_rom("Game (USA)"), make_test_rom("Game (Japan)")];
 
         // Prefer Japan over USA
-        let prefs = FilterPreferences::with_regions(vec![
-            "Japan".to_string(),
-            "USA".to_string(),
-        ]);
+        let prefs = FilterPreferences::with_regions(vec!["Japan".to_string(), "USA".to_string()]);
         let filtered = apply_one_g_one_r_filter(&matches, &prefs);
 
         assert_eq!(filtered.len(), 1);

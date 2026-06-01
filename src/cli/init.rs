@@ -17,8 +17,7 @@ pub fn get_data_dir(custom_path: Option<PathBuf>) -> Result<PathBuf> {
     }
 
     // Use platform-appropriate default location
-    let base_dirs = directories::BaseDirs::new()
-        .context("Could not determine home directory")?;
+    let base_dirs = directories::BaseDirs::new().context("Could not determine home directory")?;
 
     Ok(base_dirs.home_dir().join(DATA_DIR_NAME))
 }
@@ -87,8 +86,14 @@ mod tests {
         // Verify directory structure
         assert!(target.exists(), "Root directory should exist");
         assert!(target.join("objects").exists(), "objects/ should exist");
-        assert!(target.join("objects/plans").exists(), "objects/plans/ should exist");
-        assert!(target.join("objects/logs").exists(), "objects/logs/ should exist");
+        assert!(
+            target.join("objects/plans").exists(),
+            "objects/plans/ should exist"
+        );
+        assert!(
+            target.join("objects/logs").exists(),
+            "objects/logs/ should exist"
+        );
         assert!(target.join("cache").exists(), "cache/ should exist");
     }
 
@@ -101,7 +106,10 @@ mod tests {
 
         let db_path = target.join("db.sqlite");
         assert!(db_path.exists(), "Database file should exist");
-        assert!(db_path.metadata().unwrap().len() > 0, "Database should not be empty");
+        assert!(
+            db_path.metadata().unwrap().len() > 0,
+            "Database should not be empty"
+        );
     }
 
     #[test]
@@ -116,8 +124,14 @@ mod tests {
 
         // Verify config content
         let content = std::fs::read_to_string(&config_path).unwrap();
-        assert!(content.contains("default_output_format"), "Config should have output format");
-        assert!(content.contains("default_merge_mode"), "Config should have merge mode");
+        assert!(
+            content.contains("default_output_format"),
+            "Config should have output format"
+        );
+        assert!(
+            content.contains("default_merge_mode"),
+            "Config should have merge mode"
+        );
     }
 
     #[test]
@@ -128,15 +142,22 @@ mod tests {
 
         // Create existing config with custom content
         let config_path = target.join("config.toml");
-        let custom_content = "# Custom config\ndefault_output_format = \"zip\"\ndefault_merge_mode = \"merged\"\n";
+        let custom_content =
+            "# Custom config\ndefault_output_format = \"zip\"\ndefault_merge_mode = \"merged\"\n";
         std::fs::write(&config_path, custom_content).unwrap();
 
         run(Some(target.clone()), None).unwrap();
 
         // Verify config was not overwritten
         let content = std::fs::read_to_string(&config_path).unwrap();
-        assert!(content.contains("# Custom config"), "Config should preserve custom content");
-        assert!(content.contains("\"zip\""), "Config should preserve zip format");
+        assert!(
+            content.contains("# Custom config"),
+            "Config should preserve custom content"
+        );
+        assert!(
+            content.contains("\"zip\""),
+            "Config should preserve zip format"
+        );
     }
 
     #[test]
@@ -188,10 +209,25 @@ mod tests {
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
 
-        assert!(tables.contains(&"collections".to_string()), "Should have collections table");
-        assert!(tables.contains(&"files".to_string()), "Should have files table");
-        assert!(tables.contains(&"sources".to_string()), "Should have sources table");
-        assert!(tables.contains(&"dat_games".to_string()), "Should have dat_games table");
-        assert!(tables.contains(&"dat_roms".to_string()), "Should have dat_roms table");
+        assert!(
+            tables.contains(&"collections".to_string()),
+            "Should have collections table"
+        );
+        assert!(
+            tables.contains(&"files".to_string()),
+            "Should have files table"
+        );
+        assert!(
+            tables.contains(&"sources".to_string()),
+            "Should have sources table"
+        );
+        assert!(
+            tables.contains(&"dat_games".to_string()),
+            "Should have dat_games table"
+        );
+        assert!(
+            tables.contains(&"dat_roms".to_string()),
+            "Should have dat_roms table"
+        );
     }
 }

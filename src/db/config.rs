@@ -74,7 +74,10 @@ impl ExtraConfig {
 }
 
 /// Get configuration for a specific collection (exact match on path_pattern)
-pub fn get_collection_config(conn: &Connection, collection: &str) -> Result<Option<CollectionConfig>> {
+pub fn get_collection_config(
+    conn: &Connection,
+    collection: &str,
+) -> Result<Option<CollectionConfig>> {
     let mut stmt = conn.prepare(
         "SELECT id, path_pattern, dest_path, output_format, merge_mode, config_json
          FROM dat_config
@@ -168,19 +171,19 @@ pub fn get_dest_path(conn: &Connection, collection: &str) -> Result<Option<Strin
 /// Enable or disable 1G1R filtering for a collection
 pub fn set_one_g_one_r(conn: &Connection, collection: &str, enabled: bool) -> Result<()> {
     let existing = get_collection_config(conn, collection)?;
-    let mut extra = existing
-        .and_then(|c| c.extra_config)
-        .unwrap_or_default();
+    let mut extra = existing.and_then(|c| c.extra_config).unwrap_or_default();
     extra.one_g_one_r = enabled;
     set_extra_config(conn, collection, &extra)
 }
 
 /// Set region priority for 1G1R filtering
-pub fn set_region_priority(conn: &Connection, collection: &str, regions: Vec<String>) -> Result<()> {
+pub fn set_region_priority(
+    conn: &Connection,
+    collection: &str,
+    regions: Vec<String>,
+) -> Result<()> {
     let existing = get_collection_config(conn, collection)?;
-    let mut extra = existing
-        .and_then(|c| c.extra_config)
-        .unwrap_or_default();
+    let mut extra = existing.and_then(|c| c.extra_config).unwrap_or_default();
     extra.region_priority = regions;
     set_extra_config(conn, collection, &extra)
 }
@@ -188,9 +191,7 @@ pub fn set_region_priority(conn: &Connection, collection: &str, regions: Vec<Str
 /// Set whether to exclude prereleases (betas, protos, demos)
 pub fn set_exclude_prereleases(conn: &Connection, collection: &str, exclude: bool) -> Result<()> {
     let existing = get_collection_config(conn, collection)?;
-    let mut extra = existing
-        .and_then(|c| c.extra_config)
-        .unwrap_or_default();
+    let mut extra = existing.and_then(|c| c.extra_config).unwrap_or_default();
     extra.exclude_prereleases = exclude;
     set_extra_config(conn, collection, &extra)
 }

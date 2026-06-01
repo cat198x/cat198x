@@ -45,7 +45,7 @@ pub fn parse_dat(xml: &str) -> Result<(DatHeader, Vec<DatGameEntry>)> {
                     "Error parsing XML at position {}: {:?}",
                     reader.buffer_position(),
                     e
-                ))
+                ));
             }
             _ => {}
         }
@@ -178,10 +178,7 @@ fn parse_game(
 /// tag — `<rom>` and `<device_ref>`. Works for both the self-closing
 /// (`Event::Empty`) and non-self-closing (`Event::Start`) forms. Returns true
 /// if the element was a recognised child and has been consumed.
-fn handle_game_child(
-    e: &quick_xml::events::BytesStart,
-    game: &mut DatGameEntry,
-) -> Result<bool> {
+fn handle_game_child(e: &quick_xml::events::BytesStart, game: &mut DatGameEntry) -> Result<bool> {
     match e.name().as_ref() {
         b"rom" => {
             game.roms.push(parse_rom_attrs(e)?);
@@ -519,15 +516,24 @@ mod tests {
     #[test]
     fn test_detect_all_source_types() {
         // No-Intro
-        let h = DatHeader { author: Some("No-Intro".to_string()), ..Default::default() };
+        let h = DatHeader {
+            author: Some("No-Intro".to_string()),
+            ..Default::default()
+        };
         assert_eq!(DatSourceType::detect(&h), DatSourceType::NoIntro);
 
         // Redump
-        let h = DatHeader { author: Some("redump.org".to_string()), ..Default::default() };
+        let h = DatHeader {
+            author: Some("redump.org".to_string()),
+            ..Default::default()
+        };
         assert_eq!(DatSourceType::detect(&h), DatSourceType::Redump);
 
         // TOSEC - by name
-        let h = DatHeader { name: "TOSEC - Commodore Amiga".to_string(), ..Default::default() };
+        let h = DatHeader {
+            name: "TOSEC - Commodore Amiga".to_string(),
+            ..Default::default()
+        };
         assert_eq!(DatSourceType::detect(&h), DatSourceType::Tosec);
 
         // TOSEC - by homepage (real TOSEC DATs use this)
@@ -547,11 +553,17 @@ mod tests {
         assert_eq!(DatSourceType::detect(&h), DatSourceType::Tosec);
 
         // MAME
-        let h = DatHeader { name: "MAME".to_string(), ..Default::default() };
+        let h = DatHeader {
+            name: "MAME".to_string(),
+            ..Default::default()
+        };
         assert_eq!(DatSourceType::detect(&h), DatSourceType::Mame);
 
         // Custom/Unknown
-        let h = DatHeader { name: "My Custom DAT".to_string(), ..Default::default() };
+        let h = DatHeader {
+            name: "My Custom DAT".to_string(),
+            ..Default::default()
+        };
         assert_eq!(DatSourceType::detect(&h), DatSourceType::Custom);
     }
 

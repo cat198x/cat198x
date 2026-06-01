@@ -4,14 +4,14 @@ use anyhow::{Context, Result};
 use indicatif::{ProgressBar, ProgressStyle};
 use rayon::prelude::*;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::SystemTime;
 use walkdir::WalkDir;
 
 use crate::db::files::{self, Source};
-use crate::scanner::archive::{hash_archive_entries, ArchiveType};
-use crate::scanner::hasher::{hash_file_with_header_detection, FileHashes};
+use crate::scanner::archive::{ArchiveType, hash_archive_entries};
+use crate::scanner::hasher::{FileHashes, hash_file_with_header_detection};
 use crate::util::truncate_path;
 
 use super::open_database;
@@ -156,9 +156,10 @@ fn scan_source(
                 // For incremental scan, check if file was modified since last scan
                 if let Some(threshold) = last_scanned
                     && let Ok(metadata) = std::fs::metadata(path)
-                        && let Ok(modified) = metadata.modified() {
-                            return modified > threshold;
-                        }
+                    && let Ok(modified) = metadata.modified()
+                {
+                    return modified > threshold;
+                }
                 // If we can't determine modification time, scan it
                 true
             })
@@ -253,8 +254,7 @@ fn scan_source(
                         // file can also match headerless DATs (No-Intro).
                         // Discarding the full hash, as before, made headered
                         // files unmatchable against headered DATs.
-                        let sha1_no_header =
-                            result.headerless.as_ref().map(|h| h.sha1.clone());
+                        let sha1_no_header = result.headerless.as_ref().map(|h| h.sha1.clone());
                         let header_skipped = if result.headerless.is_some() {
                             result.header.map(|h| h.format.name().to_string())
                         } else {
@@ -302,7 +302,12 @@ fn scan_source(
 
     for result in results {
         match result {
-            ScanResult::LooseFile { relative_path, hashes, sha1_no_header, header_skipped } => {
+            ScanResult::LooseFile {
+                relative_path,
+                hashes,
+                sha1_no_header,
+                header_skipped,
+            } => {
                 files::upsert_file(
                     conn,
                     &hashes.sha1,
@@ -311,19 +316,16 @@ fn scan_source(
                     Some(&hashes.crc32),
                     hashes.size as i64,
                 )?;
-                files::upsert_file_location(
-                    conn,
-                    &hashes.sha1,
-                    source.id,
-                    &relative_path,
-                    None,
-                )?;
+                files::upsert_file_location(conn, &hashes.sha1, source.id, &relative_path, None)?;
                 processed_files += 1;
                 if header_skipped.is_some() {
                     headers_skipped += 1;
                 }
             }
-            ScanResult::Archive { relative_path, entries } => {
+            ScanResult::Archive {
+                relative_path,
+                entries,
+            } => {
                 for entry in entries {
                     files::upsert_file(
                         conn,
@@ -344,7 +346,10 @@ fn scan_source(
                 }
                 processed_files += 1;
             }
-            ScanResult::Error { relative_path, error } => {
+            ScanResult::Error {
+                relative_path,
+                error,
+            } => {
                 if !error.is_empty() && error != "Interrupted" {
                     errors.push((relative_path, error));
                 }

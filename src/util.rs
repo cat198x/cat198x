@@ -101,7 +101,10 @@ mod tests {
 
     #[test]
     fn test_truncate_path_exact() {
-        assert_eq!(truncate_path("exactly20chars.txt!!", 20), "exactly20chars.txt!!");
+        assert_eq!(
+            truncate_path("exactly20chars.txt!!", 20),
+            "exactly20chars.txt!!"
+        );
     }
 
     #[test]

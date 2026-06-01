@@ -51,10 +51,7 @@ pub enum LoggedOperation {
     /// Delete operation
     Delete { path: String },
     /// Repack operation
-    Repack {
-        sources: Vec<String>,
-        dest: String,
-    },
+    Repack { sources: Vec<String>, dest: String },
     /// Quarantine operation — a file moved into the quarantine store. Its
     /// reverse is a Move back to `original_path`.
     Quarantine {
@@ -165,13 +162,7 @@ impl OperationLog {
     }
 
     /// Add a completed repack operation
-    pub fn log_repack(
-        &mut self,
-        operation_id: u64,
-        sources: &[String],
-        dest: &str,
-        success: bool,
-    ) {
+    pub fn log_repack(&mut self, operation_id: u64, sources: &[String], dest: &str, success: bool) {
         let forward = LoggedOperation::Repack {
             sources: sources.to_vec(),
             dest: dest.to_string(),
@@ -287,7 +278,7 @@ impl OperationLog {
 
 /// Get current timestamp in ISO 8601 format (YYYYMMDDTHHMMSSZ)
 fn chrono_now() -> String {
-    use chrono::{Utc, Timelike, Datelike};
+    use chrono::{Datelike, Timelike, Utc};
     let now = Utc::now();
     format!(
         "{:04}{:02}{:02}T{:02}{:02}{:02}Z",
@@ -351,7 +342,13 @@ mod tests {
     #[test]
     fn test_log_quarantine_reverses_with_move_back() {
         let mut log = OperationLog::new("abc123".to_string());
-        log.log_quarantine(1, "/roms/game.rom", "/data/quarantine/h_game.rom", "HASH", true);
+        log.log_quarantine(
+            1,
+            "/roms/game.rom",
+            "/data/quarantine/h_game.rom",
+            "HASH",
+            true,
+        );
 
         // The reverse of a quarantine restores the original from the store.
         match log.entries[0].reverse.as_ref().unwrap() {

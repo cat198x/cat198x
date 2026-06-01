@@ -75,9 +75,7 @@ pub enum OperationKind {
         format: String,
     },
     /// Delete a file
-    Delete {
-        path: String,
-    },
+    Delete { path: String },
     /// Move a file to quarantine (instead of deleting)
     Quarantine {
         path: String,
@@ -160,7 +158,7 @@ impl Plan {
 
 /// Generate a timestamp string in SQLite datetime format (YYYY-MM-DD HH:MM:SS)
 fn chrono_lite_now() -> String {
-    use chrono::{Local, Timelike, Datelike};
+    use chrono::{Datelike, Local, Timelike};
     let now = Local::now();
     format!(
         "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",

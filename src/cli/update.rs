@@ -47,19 +47,20 @@ fn check_for_update() -> Result<()> {
 
         // Show release notes if available
         if let Some(body) = &status.body
-            && !body.is_empty() {
-                println!();
-                println!("Release notes:");
-                // Truncate to first 500 chars
-                let notes = if body.len() > 500 {
-                    format!("{}...", &body[..500])
-                } else {
-                    body.clone()
-                };
-                for line in notes.lines().take(10) {
-                    println!("  {}", line);
-                }
+            && !body.is_empty()
+        {
+            println!();
+            println!("Release notes:");
+            // Truncate to first 500 chars
+            let notes = if body.len() > 500 {
+                format!("{}...", &body[..500])
+            } else {
+                body.clone()
+            };
+            for line in notes.lines().take(10) {
+                println!("  {}", line);
             }
+        }
     } else {
         println!("You're running the latest version (v{})", VERSION);
     }
@@ -136,7 +137,10 @@ fn is_newer_version(new: &str, current: &str) -> bool {
         let parts: Vec<&str> = v.trim_start_matches('v').split('.').collect();
         let major = parts.first().and_then(|s| s.parse().ok()).unwrap_or(0);
         let minor = parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(0);
-        let patch = parts.get(2).and_then(|s| s.split('-').next()?.parse().ok()).unwrap_or(0);
+        let patch = parts
+            .get(2)
+            .and_then(|s| s.split('-').next()?.parse().ok())
+            .unwrap_or(0);
         (major, minor, patch)
     };
 

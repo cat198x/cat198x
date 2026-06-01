@@ -88,8 +88,11 @@ impl DatSourceType {
             DatSourceType::NoIntro
         } else if author.contains("redump") || name.contains("redump") {
             DatSourceType::Redump
-        } else if name.contains("tosec") || author.contains("tosec")
-            || homepage.contains("tosec") || category.contains("tosec") {
+        } else if name.contains("tosec")
+            || author.contains("tosec")
+            || homepage.contains("tosec")
+            || category.contains("tosec")
+        {
             DatSourceType::Tosec
         } else if name.contains("mame") || author.contains("mame") {
             DatSourceType::Mame

@@ -207,7 +207,11 @@ pub fn run(fix: bool, data_dir: Option<PathBuf>) -> Result<()> {
                     "{} DAT file(s) not found: {}",
                     missing_dats.len(),
                     if missing_dats.len() > 3 {
-                        format!("{}, ... and {} more", missing_dats[..3].join(", "), missing_dats.len() - 3)
+                        format!(
+                            "{}, ... and {} more",
+                            missing_dats[..3].join(", "),
+                            missing_dats.len() - 3
+                        )
                     } else {
                         missing_dats.join(", ")
                     }

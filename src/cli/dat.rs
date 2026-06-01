@@ -3,9 +3,9 @@
 use anyhow::{Context, Result};
 use std::path::PathBuf;
 
-use crate::dat::{parse_dat_file_auto, DatSourceType};
-use crate::db::{collections, dats};
 use crate::DatCommands;
+use crate::dat::{DatSourceType, parse_dat_file_auto};
+use crate::db::{collections, dats};
 
 use super::{fetch, open_database};
 
@@ -13,18 +13,27 @@ use super::{fetch, open_database};
 pub fn run(cmd: DatCommands, data_dir: Option<PathBuf>) -> Result<()> {
     match cmd {
         DatCommands::Add { path, collection } => add_dat(&path, collection.as_deref(), data_dir),
-        DatCommands::Remove { target, all_versions } => remove_dat(&target, all_versions, data_dir),
+        DatCommands::Remove {
+            target,
+            all_versions,
+        } => remove_dat(&target, all_versions, data_dir),
         DatCommands::List { all } => list_dats(all, data_dir),
-        DatCommands::Activate { collection, version } => {
-            activate_version(&collection, &version, data_dir)
-        }
-        DatCommands::Diff { collection, from, to } => {
-            diff_versions(&collection, from.as_deref(), to.as_deref(), data_dir)
-        }
+        DatCommands::Activate {
+            collection,
+            version,
+        } => activate_version(&collection, &version, data_dir),
+        DatCommands::Diff {
+            collection,
+            from,
+            to,
+        } => diff_versions(&collection, from.as_deref(), to.as_deref(), data_dir),
         DatCommands::Versions { collection } => list_versions(&collection, data_dir),
-        DatCommands::Fetch { source, url, output, list } => {
-            fetch::run(source.as_deref(), url.as_deref(), output, list, data_dir)
-        }
+        DatCommands::Fetch {
+            source,
+            url,
+            output,
+            list,
+        } => fetch::run(source.as_deref(), url.as_deref(), output, list, data_dir),
         DatCommands::Upgrade { path, collection } => {
             upgrade_dat(&path, collection.as_deref(), data_dir)
         }
@@ -170,10 +179,7 @@ fn remove_dat(target: &str, all_versions: bool, data_dir: Option<PathBuf>) -> Re
             if let Some(version) = active {
                 let (deleted, _) = collections::remove_version(conn, version.id)?;
                 if deleted {
-                    println!(
-                        "Removed version '{}' from '{}'",
-                        version.version, coll.name
-                    );
+                    println!("Removed version '{}' from '{}'", version.version, coll.name);
 
                     // Check if there are remaining versions
                     let remaining = collections::list_versions(conn, coll.id)?;
@@ -185,11 +191,17 @@ fn remove_dat(target: &str, all_versions: bool, data_dir: Option<PathBuf>) -> Re
                         // Activate the most recent remaining version
                         let newest = &remaining[0]; // Already sorted by imported_at DESC
                         collections::activate_version(conn, coll.id, &newest.version)?;
-                        println!("  Activated version '{}' as the new active version", newest.version);
+                        println!(
+                            "  Activated version '{}' as the new active version",
+                            newest.version
+                        );
                     }
                 }
             } else {
-                println!("Collection '{}' has no active version to remove.", coll.name);
+                println!(
+                    "Collection '{}' has no active version to remove.",
+                    coll.name
+                );
                 println!("Use --all-versions to remove the entire collection.");
             }
         }
@@ -221,7 +233,11 @@ fn remove_dat(target: &str, all_versions: bool, data_dir: Option<PathBuf>) -> Re
                         }
                     }
                 } else {
-                    anyhow::bail!("Version '{}' not found in collection '{}'", ver_name, coll_name);
+                    anyhow::bail!(
+                        "Version '{}' not found in collection '{}'",
+                        ver_name,
+                        coll_name
+                    );
                 }
             } else {
                 anyhow::bail!("Collection '{}' not found", coll_name);
@@ -293,11 +309,7 @@ fn list_dats(all: bool, data_dir: Option<PathBuf>) -> Result<()> {
     Ok(())
 }
 
-fn activate_version(
-    collection: &str,
-    version: &str,
-    data_dir: Option<PathBuf>,
-) -> Result<()> {
+fn activate_version(collection: &str, version: &str, data_dir: Option<PathBuf>) -> Result<()> {
     let db = open_database(data_dir)?;
     let conn = db.conn();
 
@@ -385,8 +397,14 @@ fn diff_versions(
     };
 
     println!("Comparing versions of '{}':", collection);
-    println!("  From: {} ({})", from_version.version, from_version.imported_at);
-    println!("  To:   {} ({})", to_version.version, to_version.imported_at);
+    println!(
+        "  From: {} ({})",
+        from_version.version, from_version.imported_at
+    );
+    println!(
+        "  To:   {} ({})",
+        to_version.version, to_version.imported_at
+    );
     println!();
 
     // Get games from both versions
@@ -419,18 +437,28 @@ fn diff_versions(
 
     // Print summary
     println!("Games:");
-    println!("  {} → {} ({}{})",
+    println!(
+        "  {} → {} ({}{})",
         from_games.len(),
         to_games.len(),
-        if to_games.len() >= from_games.len() { "+" } else { "" },
+        if to_games.len() >= from_games.len() {
+            "+"
+        } else {
+            ""
+        },
         to_games.len() as i64 - from_games.len() as i64
     );
 
     println!("ROMs (unique SHA1s):");
-    println!("  {} → {} ({}{})",
+    println!(
+        "  {} → {} ({}{})",
         from_sha1s.len(),
         to_sha1s.len(),
-        if to_sha1s.len() >= from_sha1s.len() { "+" } else { "" },
+        if to_sha1s.len() >= from_sha1s.len() {
+            "+"
+        } else {
+            ""
+        },
         to_sha1s.len() as i64 - from_sha1s.len() as i64
     );
 
@@ -467,7 +495,11 @@ fn diff_versions(
         println!("  {} removed ROM hashes", removed_sha1s.len());
     }
 
-    if added_games.is_empty() && removed_games.is_empty() && new_sha1s.is_empty() && removed_sha1s.is_empty() {
+    if added_games.is_empty()
+        && removed_games.is_empty()
+        && new_sha1s.is_empty()
+        && removed_sha1s.is_empty()
+    {
         println!("No differences found between versions.");
     }
 
@@ -546,15 +578,14 @@ fn upgrade_dat(
     let conn = db.conn();
 
     // Check if collection exists
-    let collection = collections::get_collection_by_name(conn, &coll_name)?
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "Collection '{}' not found.\n\n\
+    let collection = collections::get_collection_by_name(conn, &coll_name)?.ok_or_else(|| {
+        anyhow::anyhow!(
+            "Collection '{}' not found.\n\n\
                  Use 'cat198x dat add' to create a new collection,\n\
                  or 'cat198x dat upgrade --collection <name>' to specify an existing collection.",
-                coll_name
-            )
-        })?;
+            coll_name
+        )
+    })?;
 
     // Get current active version info
     let old_version = collections::get_active_version(conn, collection.id)?;

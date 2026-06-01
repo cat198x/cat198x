@@ -4,7 +4,7 @@ use anyhow::{Context, Result};
 use std::io::Read;
 use std::path::Path;
 
-use super::hasher::{hash_reader, FileHashes};
+use super::hasher::{FileHashes, hash_reader};
 
 /// An entry within an archive
 #[derive(Debug, Clone)]
@@ -55,8 +55,8 @@ pub fn hash_archive_entries(path: &Path) -> Result<Vec<ArchiveEntry>> {
 
 fn list_zip_entries(path: &Path) -> Result<Vec<ArchiveEntry>> {
     let file = std::fs::File::open(path)?;
-    let mut archive = zip::ZipArchive::new(file)
-        .with_context(|| format!("Failed to open ZIP: {:?}", path))?;
+    let mut archive =
+        zip::ZipArchive::new(file).with_context(|| format!("Failed to open ZIP: {:?}", path))?;
 
     let mut entries = Vec::new();
 
@@ -80,8 +80,8 @@ fn list_zip_entries(path: &Path) -> Result<Vec<ArchiveEntry>> {
 
 fn hash_zip_entries(path: &Path) -> Result<Vec<ArchiveEntry>> {
     let file = std::fs::File::open(path)?;
-    let mut archive = zip::ZipArchive::new(file)
-        .with_context(|| format!("Failed to open ZIP: {:?}", path))?;
+    let mut archive =
+        zip::ZipArchive::new(file).with_context(|| format!("Failed to open ZIP: {:?}", path))?;
 
     let mut entries = Vec::new();
 

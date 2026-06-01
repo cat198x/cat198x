@@ -5,9 +5,9 @@ use sha1::Digest as Sha1Digest;
 use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::path::Path;
-use zip::write::SimpleFileOptions;
 use zip::CompressionMethod;
 use zip::DateTime;
+use zip::write::SimpleFileOptions;
 
 /// Options for ZIP writing
 #[derive(Debug, Clone)]
@@ -281,9 +281,7 @@ fn extract_from_7z(archive_path: &Path, entry_path: &str) -> Result<Vec<u8>> {
     archive.for_each_entries(|entry, reader| {
         if entry.name() == entry_path {
             let mut data = Vec::new();
-            reader
-                .read_to_end(&mut data)
-                ?;
+            reader.read_to_end(&mut data)?;
             result = Some(data);
             return Ok(false); // Stop iteration
         }
@@ -449,11 +447,20 @@ mod tests {
 
         let dest_path = temp.path().join("output.zip");
 
-        let result =
-            write_single_file_zip(&dest_path, "game.rom", &src_path, "0000000000000000000000000000000000000000");
+        let result = write_single_file_zip(
+            &dest_path,
+            "game.rom",
+            &src_path,
+            "0000000000000000000000000000000000000000",
+        );
 
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("verification failed"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("verification failed")
+        );
 
         // Bad ZIP should be removed
         assert!(!dest_path.exists());
@@ -603,7 +610,9 @@ mod tests {
         let mut archive = zip::ZipArchive::new(file).unwrap();
         let entry = archive.by_index(0).unwrap();
 
-        let datetime = entry.last_modified().expect("entry has a last-modified time");
+        let datetime = entry
+            .last_modified()
+            .expect("entry has a last-modified time");
         assert_eq!(datetime.year(), 1996);
         assert_eq!(datetime.month(), 12);
         assert_eq!(datetime.day(), 24);

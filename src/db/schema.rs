@@ -93,10 +93,8 @@ impl Database {
         if from_version < 2 {
             // Migrate to v2: add quarantine table
             self.conn.execute_batch(include_str!("schema_v2.sql"))?;
-            self.conn.execute(
-                "INSERT INTO schema_version (version) VALUES (?)",
-                [2],
-            )?;
+            self.conn
+                .execute("INSERT INTO schema_version (version) VALUES (?)", [2])?;
         }
         Ok(())
     }

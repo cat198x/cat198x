@@ -531,15 +531,19 @@ fn test_file_hashing_correctness() {
     let conn = db.conn();
 
     // Query for the file with known empty hash
-    let file = cat198x::db::files::get_file_by_sha1(
-        conn,
-        "DA39A3EE5E6B4B0D3255BFEF95601890AFD80709",
-    )
-    .unwrap();
+    let file =
+        cat198x::db::files::get_file_by_sha1(conn, "DA39A3EE5E6B4B0D3255BFEF95601890AFD80709")
+            .unwrap();
 
-    assert!(file.is_some(), "Empty file should be indexed with correct SHA1");
+    assert!(
+        file.is_some(),
+        "Empty file should be indexed with correct SHA1"
+    );
     let file = file.unwrap();
-    assert_eq!(file.md5, Some("D41D8CD98F00B204E9800998ECF8427E".to_string()));
+    assert_eq!(
+        file.md5,
+        Some("D41D8CD98F00B204E9800998ECF8427E".to_string())
+    );
     assert_eq!(file.crc32, Some("00000000".to_string()));
     assert_eq!(file.size, 0);
 }
@@ -822,10 +826,7 @@ fn test_plan_apply_rollback_cycle() {
     cli::apply::run_rollback(false, false, env.data_dir_opt()).expect("Rollback failed");
 
     // Verify file was deleted from destination
-    assert!(
-        !dest_file.exists(),
-        "File should be deleted after rollback"
-    );
+    assert!(!dest_file.exists(), "File should be deleted after rollback");
 
     // Verify source file still exists (rollback only affects destination)
     let source_file = env.roms_dir.join("source.rom");
@@ -833,16 +834,22 @@ fn test_plan_apply_rollback_cycle() {
 }
 
 /// Create a ZIP archive containing a file with known content
-fn create_test_zip(dir: &std::path::Path, zip_name: &str, entry_name: &str, content: &[u8]) -> PathBuf {
+fn create_test_zip(
+    dir: &std::path::Path,
+    zip_name: &str,
+    entry_name: &str,
+    content: &[u8],
+) -> PathBuf {
     use std::io::Write;
 
     let zip_path = dir.join(zip_name);
     let file = fs::File::create(&zip_path).expect("Failed to create ZIP file");
     let mut zip = zip::ZipWriter::new(file);
 
-    let options = zip::write::SimpleFileOptions::default()
-        .compression_method(zip::CompressionMethod::Stored);
-    zip.start_file(entry_name, options).expect("start ZIP entry");
+    let options =
+        zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+    zip.start_file(entry_name, options)
+        .expect("start ZIP entry");
     zip.write_all(content).expect("write ZIP entry");
     zip.finish().expect("finish ZIP archive");
 
@@ -891,8 +898,7 @@ fn test_apply_from_zip_archive() {
 
     // Verify the file inside the archive was indexed
     let db = env.db();
-    let file = cat198x::db::files::get_file_by_sha1(db.conn(), &sha1_hash)
-        .expect("Query failed");
+    let file = cat198x::db::files::get_file_by_sha1(db.conn(), &sha1_hash).expect("Query failed");
     assert!(file.is_some(), "File from archive should be indexed");
     drop(db);
 
@@ -911,7 +917,10 @@ fn test_apply_from_zip_archive() {
 
     // Verify file was extracted to destination
     let dest_file = dest_dir.join("test.rom");
-    assert!(dest_file.exists(), "File should be extracted from archive to destination");
+    assert!(
+        dest_file.exists(),
+        "File should be extracted from archive to destination"
+    );
     assert_eq!(
         fs::read(&dest_file).unwrap(),
         test_content,
@@ -923,7 +932,10 @@ fn test_apply_from_zip_archive() {
     assert!(!dest_file.exists(), "File should be deleted after rollback");
 
     // Original archive should be untouched
-    assert!(env.roms_dir.join("games.zip").exists(), "Source archive should remain");
+    assert!(
+        env.roms_dir.join("games.zip").exists(),
+        "Source archive should remain"
+    );
 }
 
 #[test]
@@ -1109,7 +1121,11 @@ fn test_multi_file_plan_apply() {
     // Verify all 3 files were copied
     for (content, name) in &contents {
         let dest_file = dest_dir.join(name);
-        assert!(dest_file.exists(), "File {} should exist at destination", name);
+        assert!(
+            dest_file.exists(),
+            "File {} should exist at destination",
+            name
+        );
         assert_eq!(
             fs::read(&dest_file).unwrap(),
             *content,
@@ -1124,7 +1140,11 @@ fn test_multi_file_plan_apply() {
     // Verify all files removed
     for (_, name) in &contents {
         let dest_file = dest_dir.join(name);
-        assert!(!dest_file.exists(), "File {} should be deleted after rollback", name);
+        assert!(
+            !dest_file.exists(),
+            "File {} should be deleted after rollback",
+            name
+        );
     }
 }
 
@@ -1171,8 +1191,7 @@ fn test_apply_skips_already_correct_files() {
     fs::write(&dest_file, test_content).unwrap();
 
     let db = env.db();
-    cat198x::db::config::set_dest_path(db.conn(), "Skip Test", dest_dir.to_str().unwrap())
-        .unwrap();
+    cat198x::db::config::set_dest_path(db.conn(), "Skip Test", dest_dir.to_str().unwrap()).unwrap();
     drop(db);
 
     // Generate plan - should detect file is already correct
@@ -1329,8 +1348,8 @@ fn test_dat_remove_all_versions() {
 
     // Verify collection exists with 2 versions
     let db = env.db();
-    let coll = cat198x::db::collections::get_collection_by_name(db.conn(), "Remove All Test")
-        .unwrap();
+    let coll =
+        cat198x::db::collections::get_collection_by_name(db.conn(), "Remove All Test").unwrap();
     assert!(coll.is_some());
     drop(db);
 
@@ -1346,8 +1365,8 @@ fn test_dat_remove_all_versions() {
 
     // Verify collection is gone
     let db = env.db();
-    let coll = cat198x::db::collections::get_collection_by_name(db.conn(), "Remove All Test")
-        .unwrap();
+    let coll =
+        cat198x::db::collections::get_collection_by_name(db.conn(), "Remove All Test").unwrap();
     assert!(coll.is_none(), "Collection should be removed");
 }
 
@@ -1535,7 +1554,10 @@ fn test_dat_diff_requires_two_versions() {
         env.data_dir_opt(),
     );
 
-    assert!(result.is_err(), "dat diff should fail with only one version");
+    assert!(
+        result.is_err(),
+        "dat diff should fail with only one version"
+    );
 }
 
 /// Test doctor command runs successfully on healthy database
@@ -1689,7 +1711,10 @@ fn test_export_formats() {
     assert!(txt_path.exists(), "Text file should be created");
 
     let txt_content = fs::read_to_string(&txt_path).unwrap();
-    assert!(txt_content.contains("Export Test"), "Should contain collection name");
+    assert!(
+        txt_content.contains("Export Test"),
+        "Should contain collection name"
+    );
     assert!(txt_content.contains("ROMs:"), "Should contain ROM stats");
 
     // Test CSV export
@@ -1706,7 +1731,10 @@ fn test_export_formats() {
     assert!(csv_path.exists(), "CSV file should be created");
 
     let csv_content = fs::read_to_string(&csv_path).unwrap();
-    assert!(csv_content.contains("game,rom,sha1"), "Should contain CSV header");
+    assert!(
+        csv_content.contains("game,rom,sha1"),
+        "Should contain CSV header"
+    );
 
     // Test JSON export
     let json_path = env.temp_dir.path().join("export.json");
@@ -1772,16 +1800,20 @@ fn test_export_filters() {
         "Filter Test",
         Some(have_path.clone()),
         Some("json"),
-        true,  // have only
+        true, // have only
         false,
         env.data_dir_opt(),
     )
     .unwrap();
 
-    let have_json: serde_json::Value = serde_json::from_str(&fs::read_to_string(&have_path).unwrap()).unwrap();
+    let have_json: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&have_path).unwrap()).unwrap();
     let have_roms = have_json["roms"].as_array().unwrap();
     assert_eq!(have_roms.len(), 1, "Should have 1 ROM with --have filter");
-    assert!(have_roms[0]["have"].as_bool().unwrap(), "ROM should be marked as 'have'");
+    assert!(
+        have_roms[0]["have"].as_bool().unwrap(),
+        "ROM should be marked as 'have'"
+    );
 
     // Export with --missing filter
     let missing_path = env.temp_dir.path().join("missing.json");
@@ -1790,15 +1822,20 @@ fn test_export_filters() {
         Some(missing_path.clone()),
         Some("json"),
         false,
-        true,  // missing only
+        true, // missing only
         env.data_dir_opt(),
     )
     .unwrap();
 
-    let missing_json: serde_json::Value = serde_json::from_str(&fs::read_to_string(&missing_path).unwrap()).unwrap();
+    let missing_json: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&missing_path).unwrap()).unwrap();
     let missing_roms = missing_json["roms"].as_array().unwrap();
     // All ROMs in our test DAT should be "have" since we scanned the matching file
-    assert_eq!(missing_roms.len(), 0, "Should have 0 ROMs with --missing filter (all are found)");
+    assert_eq!(
+        missing_roms.len(),
+        0,
+        "Should have 0 ROMs with --missing filter (all are found)"
+    );
 }
 
 /// Test dat fetch --list shows available sources
@@ -1853,11 +1890,13 @@ fn test_torrent_create_and_verify() {
 /// Test header detection during scan
 #[test]
 fn test_header_detection_ines() {
-    use cat198x::scanner::{detect_header, HeaderFormat};
+    use cat198x::scanner::{HeaderFormat, detect_header};
 
     // Create iNES header: "NES\x1A" + 12 bytes of metadata
     let mut ines_data = vec![0x4E, 0x45, 0x53, 0x1A]; // "NES\x1A"
-    ines_data.extend([0x02, 0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]);
+    ines_data.extend([
+        0x02, 0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    ]);
 
     let header = detect_header(&ines_data, 32784, "nes");
     assert!(header.is_some(), "Should detect iNES header");
@@ -1869,7 +1908,7 @@ fn test_header_detection_ines() {
 
 #[test]
 fn test_header_detection_a78() {
-    use cat198x::scanner::{detect_header, HeaderFormat};
+    use cat198x::scanner::{HeaderFormat, detect_header};
 
     // Create A78 header: version byte + "ATARI7800" + padding
     let mut a78_data = vec![0x01]; // version
@@ -1889,8 +1928,10 @@ fn test_no_header_for_plain_rom() {
     use cat198x::scanner::detect_header;
 
     // Plain ROM data without any header magic
-    let rom_data = vec![0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
-                        0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F];
+    let rom_data = vec![
+        0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E,
+        0x0F,
+    ];
 
     let header = detect_header(&rom_data, 32768, "bin");
     assert!(header.is_none(), "Should not detect header for plain ROM");

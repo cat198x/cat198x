@@ -132,9 +132,8 @@ pub fn execute_move(
     // Delete the source file (only for loose files)
     let source = Path::new(source_path);
     if source.exists() {
-        fs::remove_file(source).with_context(|| {
-            format!("Failed to delete source file after move: {}", source_path)
-        })?;
+        fs::remove_file(source)
+            .with_context(|| format!("Failed to delete source file after move: {}", source_path))?;
     }
 
     Ok(())
@@ -214,7 +213,10 @@ pub fn execute_repack(sources: &[SourceRef], dest_path: &str, format: &str) -> R
     match format {
         "zip" => execute_repack_zip(sources, dest),
         "torrentzip" => execute_repack_torrentzip(sources, dest),
-        _ => anyhow::bail!("Unsupported repack format: {} (use 'zip' or 'torrentzip')", format),
+        _ => anyhow::bail!(
+            "Unsupported repack format: {} (use 'zip' or 'torrentzip')",
+            format
+        ),
     }
 }
 
@@ -394,7 +396,6 @@ fn extract_from_7z(archive_path: &str, entry_path: &str, dest_path: &str) -> Res
     Ok(())
 }
 
-
 /// Check if there's enough disk space for all planned operations
 ///
 /// Groups operations by destination filesystem mount point and checks
@@ -421,10 +422,13 @@ pub fn check_disk_space(plan: &Plan) -> Result<()> {
             }
             OperationKind::Repack { sources, dest, .. } => {
                 // For repack, estimate size as sum of source sizes
-                let total_size: u64 = sources.iter().filter_map(|s| {
-                    // Try to get file size from source path
-                    fs::metadata(&s.path).ok().map(|m| m.len())
-                }).sum();
+                let total_size: u64 = sources
+                    .iter()
+                    .filter_map(|s| {
+                        // Try to get file size from source path
+                        fs::metadata(&s.path).ok().map(|m| m.len())
+                    })
+                    .sum();
 
                 let dest_dir = Path::new(dest)
                     .parent()
@@ -555,7 +559,12 @@ mod tests {
         );
 
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("Verification failed"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Verification failed")
+        );
 
         // Bad file should be removed
         assert!(!dest_path.exists());
@@ -634,7 +643,12 @@ mod tests {
         );
 
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("Verification failed"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Verification failed")
+        );
 
         // Bad ZIP should be removed
         assert!(!dest_path.exists());
@@ -748,7 +762,12 @@ mod tests {
         let result = execute_repack(&sources, dest_path.to_str().unwrap(), "zip");
 
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("verification failed"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("verification failed")
+        );
 
         // Bad ZIP should be removed
         assert!(!dest_path.exists());
@@ -773,7 +792,12 @@ mod tests {
         let result = execute_repack(&sources, dest_path.to_str().unwrap(), "7z");
 
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("Unsupported repack format"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Unsupported repack format")
+        );
     }
 
     #[test]
@@ -826,7 +850,9 @@ mod tests {
         let file = File::open(&dest_path).unwrap();
         let mut archive = zip::ZipArchive::new(file).unwrap();
         let entry = archive.by_index(0).unwrap();
-        let datetime = entry.last_modified().expect("entry has a last-modified time");
+        let datetime = entry
+            .last_modified()
+            .expect("entry has a last-modified time");
         assert_eq!(datetime.year(), 1996);
         assert_eq!(datetime.month(), 12);
         assert_eq!(datetime.day(), 24);
@@ -933,7 +959,12 @@ mod tests {
         );
 
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("Source file not found"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Source file not found")
+        );
     }
 
     #[test]

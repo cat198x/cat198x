@@ -3,8 +3,8 @@
 use anyhow::Result;
 use std::path::PathBuf;
 
-use crate::db::{collections, dats};
 use crate::db::dats::MergeMode;
+use crate::db::{collections, dats};
 
 use super::open_database;
 
@@ -65,10 +65,7 @@ pub fn run(
 
         // Use merge-mode aware stats calculation
         let stats = dats::calculate_merge_mode_stats(
-            conn,
-            version.id,
-            mode,
-            true, // exclude_mechanical by default
+            conn, version.id, mode, true, // exclude_mechanical by default
         )?;
 
         // Calculate completion percentage
@@ -94,10 +91,7 @@ pub fn run(
             "  {} games, {} ROMs required",
             stats.total_games, stats.total_roms
         );
-        println!(
-            "  {} have, {} missing",
-            stats.have_roms, missing
-        );
+        println!("  {} have, {} missing", stats.have_roms, missing);
 
         // Show additional info for MAME-style collections
         let mut extras = Vec::new();
@@ -139,13 +133,14 @@ fn parse_merge_mode(mode: Option<&str>) -> Result<MergeMode> {
 }
 
 /// Show detailed per-game status with merge-mode awareness
-fn show_detailed_status(conn: &rusqlite::Connection, version_id: i64, mode: MergeMode) -> Result<()> {
+fn show_detailed_status(
+    conn: &rusqlite::Connection,
+    version_id: i64,
+    mode: MergeMode,
+) -> Result<()> {
     // Get game requirements accounting for merge mode
     let requirements = dats::calculate_rom_requirements(
-        conn,
-        version_id,
-        mode,
-        true, // exclude_mechanical
+        conn, version_id, mode, true, // exclude_mechanical
     )?;
 
     let mut complete_count = 0;
@@ -155,7 +150,9 @@ fn show_detailed_status(conn: &rusqlite::Connection, version_id: i64, mode: Merg
     println!("  Games:");
     for req in &requirements {
         // Count how many required ROMs we have
-        let have_count: usize = req.required_roms.iter()
+        let have_count: usize = req
+            .required_roms
+            .iter()
             .filter(|key| crate::db::dats::rom_present(conn, key).unwrap_or(false))
             .count();
 

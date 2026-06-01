@@ -7,7 +7,7 @@ use crate::db::quarantine::QuarantineReason;
 use crate::plan::executor::{
     check_disk_space, execute_copy, execute_move, execute_repack, execute_rollback_move,
 };
-use crate::plan::{compute_state_hash, OperationKind, OperationLog, OperationStatus};
+use crate::plan::{OperationKind, OperationLog, OperationStatus, compute_state_hash};
 use crate::util::truncate_path;
 
 use super::quarantine::move_to_quarantine;
@@ -15,7 +15,11 @@ use super::quarantine::move_to_quarantine;
 use super::{open_database, plan::load_latest_plan};
 
 /// Run the apply command
-pub fn run(dry_run: bool, skip_space_check: bool, data_dir: Option<std::path::PathBuf>) -> Result<()> {
+pub fn run(
+    dry_run: bool,
+    skip_space_check: bool,
+    data_dir: Option<std::path::PathBuf>,
+) -> Result<()> {
     // Load the most recent plan
     let (mut plan, plan_path) = match load_latest_plan(data_dir.clone())? {
         Some(p) => p,
@@ -37,14 +41,13 @@ pub fn run(dry_run: bool, skip_space_check: bool, data_dir: Option<std::path::Pa
     }
 
     // Check disk space before proceeding (unless skipped)
-    if !skip_space_check
-        && let Err(e) = check_disk_space(&plan) {
-            println!("Disk space check failed:");
-            println!("  {}", e);
-            println!();
-            println!("Free up disk space or use --skip-space-check to proceed anyway.");
-            return Ok(());
-        }
+    if !skip_space_check && let Err(e) = check_disk_space(&plan) {
+        println!("Disk space check failed:");
+        println!("  {}", e);
+        println!();
+        println!("Free up disk space or use --skip-space-check to proceed anyway.");
+        return Ok(());
+    }
 
     // Check if plan has any pending operations
     let pending_count = plan
@@ -100,8 +103,12 @@ pub fn run(dry_run: bool, skip_space_check: bool, data_dir: Option<std::path::Pa
                     continue;
                 }
 
-                let result =
-                    execute_copy(&source.path, source.archive_path.as_deref(), dest, &source.sha1);
+                let result = execute_copy(
+                    &source.path,
+                    source.archive_path.as_deref(),
+                    dest,
+                    &source.sha1,
+                );
                 let success = result.is_ok();
 
                 // Log the operation
@@ -250,8 +257,8 @@ pub fn run(dry_run: bool, skip_space_check: bool, data_dir: Option<std::path::Pa
                     continue;
                 }
 
-                let reason_enum = QuarantineReason::parse(reason)
-                    .unwrap_or(QuarantineReason::PathChanged);
+                let reason_enum =
+                    QuarantineReason::parse(reason).unwrap_or(QuarantineReason::PathChanged);
 
                 let result = move_to_quarantine(
                     path,
@@ -319,7 +326,11 @@ pub fn run(dry_run: bool, skip_space_check: bool, data_dir: Option<std::path::Pa
 }
 
 /// Run the rollback command
-pub fn run_rollback(dry_run: bool, continue_rollback: bool, data_dir: Option<std::path::PathBuf>) -> Result<()> {
+pub fn run_rollback(
+    dry_run: bool,
+    continue_rollback: bool,
+    data_dir: Option<std::path::PathBuf>,
+) -> Result<()> {
     use crate::plan::{LogStatus, LoggedOperation, OperationLog};
 
     // Find the most recent operation log
@@ -339,15 +350,14 @@ pub fn run_rollback(dry_run: bool, continue_rollback: bool, data_dir: Option<std
 
         if path.extension().map(|e| e == "json").unwrap_or(false)
             && let Ok(metadata) = entry.metadata()
-                && let Ok(modified) = metadata.modified() {
-                    match &latest {
-                        None => latest = Some((path, modified)),
-                        Some((_, prev_time)) if modified > *prev_time => {
-                            latest = Some((path, modified))
-                        }
-                        _ => {}
-                    }
-                }
+            && let Ok(modified) = metadata.modified()
+        {
+            match &latest {
+                None => latest = Some((path, modified)),
+                Some((_, prev_time)) if modified > *prev_time => latest = Some((path, modified)),
+                _ => {}
+            }
+        }
     }
 
     let log_path = match latest {
@@ -390,7 +400,11 @@ pub fn run_rollback(dry_run: bool, continue_rollback: bool, data_dir: Option<std
     println!(
         "Rolling back {} operations{}...",
         indices_to_rollback.len(),
-        if continue_rollback { " (continue mode)" } else { "" }
+        if continue_rollback {
+            " (continue mode)"
+        } else {
+            ""
+        }
     );
     println!();
 
@@ -405,7 +419,10 @@ pub fn run_rollback(dry_run: bool, continue_rollback: bool, data_dir: Option<std
     // Process in reverse order (last operation first)
     for idx in indices_to_rollback.into_iter().rev() {
         let entry = &log.entries[idx];
-        let reverse_op = entry.reverse.clone().expect("filtered to entries with reverse ops");
+        let reverse_op = entry
+            .reverse
+            .clone()
+            .expect("filtered to entries with reverse ops");
         let operation_id = entry.operation_id;
 
         match reverse_op {
@@ -436,7 +453,11 @@ pub fn run_rollback(dry_run: bool, continue_rollback: bool, data_dir: Option<std
                     }
                 }
             }
-            LoggedOperation::Move { ref source, ref dest, ref sha1 } => {
+            LoggedOperation::Move {
+                ref source,
+                ref dest,
+                ref sha1,
+            } => {
                 println!(
                     "[{}] MOVE {} -> {}",
                     operation_id,
@@ -464,7 +485,11 @@ pub fn run_rollback(dry_run: bool, continue_rollback: bool, data_dir: Option<std
             }
             LoggedOperation::Copy { ref dest, .. } => {
                 // The reverse of COPY should be DELETE, but handle this case just in case
-                println!("[{}] DELETE {} (reverse of copy)", operation_id, truncate_path(dest, 50));
+                println!(
+                    "[{}] DELETE {} (reverse of copy)",
+                    operation_id,
+                    truncate_path(dest, 50)
+                );
 
                 if dry_run {
                     success_count += 1;
@@ -490,7 +515,11 @@ pub fn run_rollback(dry_run: bool, continue_rollback: bool, data_dir: Option<std
             }
             LoggedOperation::Repack { ref dest, .. } => {
                 // Reverse of REPACK is DELETE the created archive
-                println!("[{}] DELETE {} (reverse of repack)", operation_id, truncate_path(dest, 50));
+                println!(
+                    "[{}] DELETE {} (reverse of repack)",
+                    operation_id,
+                    truncate_path(dest, 50)
+                );
 
                 if dry_run {
                     success_count += 1;
@@ -518,7 +547,10 @@ pub fn run_rollback(dry_run: bool, continue_rollback: bool, data_dir: Option<std
                 // A quarantine never appears as a reverse op — its reverse is a
                 // Move (restore from quarantine), handled by the Move arm above.
                 // Present only for match exhaustiveness.
-                eprintln!("[{}] unexpected quarantine reverse op, skipping", operation_id);
+                eprintln!(
+                    "[{}] unexpected quarantine reverse op, skipping",
+                    operation_id
+                );
                 error_count += 1;
             }
         }
@@ -538,7 +570,9 @@ pub fn run_rollback(dry_run: bool, continue_rollback: bool, data_dir: Option<std
 
     if error_count > 0 {
         println!();
-        println!("Some rollback operations failed. Run 'cat198x apply --rollback --continue' to retry.");
+        println!(
+            "Some rollback operations failed. Run 'cat198x apply --rollback --continue' to retry."
+        );
     }
 
     Ok(())

@@ -1,7 +1,7 @@
 //! Collection and version CRUD operations
 
 use anyhow::Result;
-use rusqlite::{params, Connection};
+use rusqlite::{Connection, params};
 
 /// A collection (e.g., "Nintendo - NES", "MAME")
 #[derive(Debug, Clone)]
@@ -34,9 +34,8 @@ pub fn create_collection(conn: &Connection, name: &str, source_type: &str) -> Re
 
 /// Get a collection by name
 pub fn get_collection_by_name(conn: &Connection, name: &str) -> Result<Option<Collection>> {
-    let mut stmt = conn.prepare(
-        "SELECT id, name, source_type, created_at FROM collections WHERE name = ?",
-    )?;
+    let mut stmt =
+        conn.prepare("SELECT id, name, source_type, created_at FROM collections WHERE name = ?")?;
 
     let result = stmt.query_row([name], |row| {
         Ok(Collection {
@@ -56,9 +55,8 @@ pub fn get_collection_by_name(conn: &Connection, name: &str) -> Result<Option<Co
 
 /// List all collections
 pub fn list_collections(conn: &Connection) -> Result<Vec<Collection>> {
-    let mut stmt = conn.prepare(
-        "SELECT id, name, source_type, created_at FROM collections ORDER BY name",
-    )?;
+    let mut stmt =
+        conn.prepare("SELECT id, name, source_type, created_at FROM collections ORDER BY name")?;
 
     let collections = stmt
         .query_map([], |row| {
@@ -99,7 +97,10 @@ pub fn add_version(
 }
 
 /// Get the active version for a collection
-pub fn get_active_version(conn: &Connection, collection_id: i64) -> Result<Option<CollectionVersion>> {
+pub fn get_active_version(
+    conn: &Connection,
+    collection_id: i64,
+) -> Result<Option<CollectionVersion>> {
     let mut stmt = conn.prepare(
         "SELECT id, collection_id, version, dat_path, is_active, imported_at
          FROM collection_versions
@@ -386,14 +387,22 @@ mod tests {
         add_version(conn, coll_id, "20231215", "/path/to/v2.dat", false).unwrap();
 
         // Verify it exists
-        assert!(get_collection_by_name(conn, "Nintendo - NES").unwrap().is_some());
+        assert!(
+            get_collection_by_name(conn, "Nintendo - NES")
+                .unwrap()
+                .is_some()
+        );
 
         // Remove it
         let removed = remove_collection(conn, coll_id).unwrap();
         assert!(removed);
 
         // Verify it's gone
-        assert!(get_collection_by_name(conn, "Nintendo - NES").unwrap().is_none());
+        assert!(
+            get_collection_by_name(conn, "Nintendo - NES")
+                .unwrap()
+                .is_none()
+        );
 
         // Verify versions are gone too (CASCADE)
         let versions = list_versions(conn, coll_id).unwrap();
@@ -415,7 +424,11 @@ mod tests {
         assert!(was_active);
 
         // Collection should still exist
-        assert!(get_collection_by_name(conn, "Nintendo - NES").unwrap().is_some());
+        assert!(
+            get_collection_by_name(conn, "Nintendo - NES")
+                .unwrap()
+                .is_some()
+        );
 
         // Only one version should remain
         let versions = list_versions(conn, coll_id).unwrap();

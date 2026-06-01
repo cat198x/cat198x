@@ -8,8 +8,8 @@ use std::fs;
 use std::io::{self, Write};
 use std::path::PathBuf;
 
-use crate::db::quarantine as db_quarantine;
 use crate::QuarantineCommands;
+use crate::db::quarantine as db_quarantine;
 
 use super::{get_data_dir, open_database};
 
@@ -30,11 +30,7 @@ pub fn run(cmd: QuarantineCommands, data_dir: Option<PathBuf>) -> Result<()> {
 }
 
 /// Show quarantine status and contents
-fn run_status(
-    collection: Option<String>,
-    detailed: bool,
-    data_dir: Option<PathBuf>,
-) -> Result<()> {
+fn run_status(collection: Option<String>, detailed: bool, data_dir: Option<PathBuf>) -> Result<()> {
     let db = open_database(data_dir.clone())?;
     let conn = db.conn();
 
@@ -52,7 +48,11 @@ fn run_status(
     let total_size = db_quarantine::total_size(conn)?;
     let count = entries.len();
 
-    println!("Quarantine: {} files, {}", count, format_bytes(total_size as u64));
+    println!(
+        "Quarantine: {} files, {}",
+        count,
+        format_bytes(total_size as u64)
+    );
     println!();
 
     // Show summary by collection
@@ -61,7 +61,12 @@ fn run_status(
         println!("By collection:");
         for (coll, cnt, size) in &by_collection {
             let name = coll.as_deref().unwrap_or("(unknown)");
-            println!("  {} ··· {} files, {}", name, cnt, format_bytes(*size as u64));
+            println!(
+                "  {} ··· {} files, {}",
+                name,
+                cnt,
+                format_bytes(*size as u64)
+            );
         }
         println!();
     }
@@ -166,7 +171,11 @@ fn run_prune(collection: Option<String>, yes: bool, data_dir: Option<PathBuf>) -
                     continue;
                 }
                 Err(e) => {
-                    eprintln!("Failed to hash {} — not deleting: {}", file_path.display(), e);
+                    eprintln!(
+                        "Failed to hash {} — not deleting: {}",
+                        file_path.display(),
+                        e
+                    );
                     errors += 1;
                     continue;
                 }
@@ -184,11 +193,7 @@ fn run_prune(collection: Option<String>, yes: bool, data_dir: Option<PathBuf>) -
     }
 
     println!();
-    println!(
-        "Pruned {} files, {} errors",
-        deleted,
-        errors
-    );
+    println!("Pruned {} files, {} errors", deleted, errors);
 
     Ok(())
 }
@@ -274,10 +279,7 @@ fn run_restore(
 
         // Check for conflicts
         if dest_path.exists() {
-            eprintln!(
-                "Skipping {} - file already exists at destination",
-                filename
-            );
+            eprintln!("Skipping {} - file already exists at destination", filename);
             errors += 1;
             continue;
         }
@@ -468,7 +470,9 @@ mod tests {
             Some(data_dir.clone()),
         )
         .unwrap();
-        let qfile = data_dir.join("quarantine").join(format!("{}_game.rom", sha1));
+        let qfile = data_dir
+            .join("quarantine")
+            .join(format!("{}_game.rom", sha1));
         assert!(qfile.exists(), "quarantined under the full-SHA1 name");
         let original = std::fs::read(&qfile).unwrap();
 
@@ -484,8 +488,18 @@ mod tests {
             None,
             Some(data_dir.clone()),
         );
-        assert!(result.is_err(), "must refuse to overwrite an existing quarantine file");
-        assert_eq!(std::fs::read(&qfile).unwrap(), original, "existing quarantine file untouched");
-        assert!(f2.exists(), "source left in place when quarantine is refused");
+        assert!(
+            result.is_err(),
+            "must refuse to overwrite an existing quarantine file"
+        );
+        assert_eq!(
+            std::fs::read(&qfile).unwrap(),
+            original,
+            "existing quarantine file untouched"
+        );
+        assert!(
+            f2.exists(),
+            "source left in place when quarantine is refused"
+        );
     }
 }

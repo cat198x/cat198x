@@ -26,7 +26,7 @@ pub fn run(cmd: TorrentCommands) -> Result<()> {
 /// Aims for roughly 1000-2000 pieces for efficient torrent operation.
 /// Minimum: 16 KiB, Maximum: 16 MiB
 fn calculate_piece_size(total_size: u64) -> u64 {
-    const MIN_PIECE_SIZE: u64 = 16 * 1024;        // 16 KiB
+    const MIN_PIECE_SIZE: u64 = 16 * 1024; // 16 KiB
     const MAX_PIECE_SIZE: u64 = 16 * 1024 * 1024; // 16 MiB
     const TARGET_PIECES: u64 = 1500;
 
@@ -72,16 +72,15 @@ fn create_torrent(
         anyhow::bail!("Path does not exist: {}", path.display());
     }
 
-    let canonical_path = path.canonicalize()
+    let canonical_path = path
+        .canonicalize()
         .with_context(|| format!("Failed to resolve path: {}", path.display()))?;
 
     // Determine piece size
     let piece_size = if let Some(size) = piece_size {
         // Validate user-provided piece size is power of 2
         if !size.is_power_of_two() || size < 16 * 1024 {
-            anyhow::bail!(
-                "Piece size must be a power of 2 and at least 16384 bytes (16 KiB)"
-            );
+            anyhow::bail!("Piece size must be a power of 2 and at least 16384 bytes (16 KiB)");
         }
         size
     } else {
@@ -118,10 +117,8 @@ fn create_torrent(
 
         // Additional trackers go in announce_list
         if trackers.len() > 1 {
-            let announce_list: Vec<Vec<String>> = trackers
-                .iter()
-                .map(|t| vec![t.clone()])
-                .collect();
+            let announce_list: Vec<Vec<String>> =
+                trackers.iter().map(|t| vec![t.clone()]).collect();
             builder = builder.set_announce_list(announce_list);
         }
     }
@@ -143,15 +140,16 @@ fn create_torrent(
     // Add creation info using extra field
     builder = builder.add_extra_field(
         "created by".to_string(),
-        lava_torrent::bencode::BencodeElem::String(format!("cat198x/{}", env!("CARGO_PKG_VERSION"))),
+        lava_torrent::bencode::BencodeElem::String(format!(
+            "cat198x/{}",
+            env!("CARGO_PKG_VERSION")
+        )),
     );
 
     println!();
     println!("Hashing files (this may take a while for large collections)...");
 
-    let torrent = builder
-        .build()
-        .context("Failed to build torrent")?;
+    let torrent = builder.build().context("Failed to build torrent")?;
 
     // Extract info before writing (write_into_file consumes the torrent)
     let file_count = count_torrent_files(&torrent);
@@ -167,7 +165,10 @@ fn create_torrent(
     println!();
     println!("Torrent created successfully!");
     println!("  Files: {}", file_count);
-    println!("  Total size: {}", crate::util::format_bytes(total_size as u64));
+    println!(
+        "  Total size: {}",
+        crate::util::format_bytes(total_size as u64)
+    );
     println!("  Pieces: {}", piece_count);
     println!("  Info hash: {}", info_hash);
 
@@ -200,7 +201,8 @@ fn verify_torrent(torrent_path: &Path, base_path: Option<PathBuf>) -> Result<()>
 
     // Determine base path for verification
     let base_path = base_path.unwrap_or_else(|| PathBuf::from("."));
-    let base_path = base_path.canonicalize()
+    let base_path = base_path
+        .canonicalize()
         .with_context(|| format!("Failed to resolve path: {}", base_path.display()))?;
 
     println!("Verifying torrent: {}", torrent_path.display());
@@ -211,7 +213,11 @@ fn verify_torrent(torrent_path: &Path, base_path: Option<PathBuf>) -> Result<()>
     let file_count = count_torrent_files(&torrent);
     let total_size = torrent.length as u64;
 
-    println!("Torrent contains {} file(s), {} total", file_count, crate::util::format_bytes(total_size));
+    println!(
+        "Torrent contains {} file(s), {} total",
+        file_count,
+        crate::util::format_bytes(total_size)
+    );
     println!();
 
     // Check for files
@@ -225,13 +231,25 @@ fn verify_torrent(torrent_path: &Path, base_path: Option<PathBuf>) -> Result<()>
             let torrent_name = &torrent.name;
             for file in files {
                 let file_path = base_path.join(torrent_name).join(file.path.as_path());
-                check_file(&file_path, file.length as u64, &mut found, &mut missing, &mut wrong_size);
+                check_file(
+                    &file_path,
+                    file.length as u64,
+                    &mut found,
+                    &mut missing,
+                    &mut wrong_size,
+                );
             }
         }
         None => {
             // Single file torrent
             let file_path = base_path.join(&torrent.name);
-            check_file(&file_path, total_size, &mut found, &mut missing, &mut wrong_size);
+            check_file(
+                &file_path,
+                total_size,
+                &mut found,
+                &mut missing,
+                &mut wrong_size,
+            );
         }
     }
 
@@ -274,7 +292,11 @@ fn verify_torrent(torrent_path: &Path, base_path: Option<PathBuf>) -> Result<()>
         println!("Full piece hash verification would require reading all file contents.");
         Ok(())
     } else {
-        anyhow::bail!("Verification failed: {} missing, {} wrong size", missing.len(), wrong_size.len());
+        anyhow::bail!(
+            "Verification failed: {} missing, {} wrong size",
+            missing.len(),
+            wrong_size.len()
+        );
     }
 }
 
@@ -342,7 +364,11 @@ mod tests {
     fn test_piece_size_is_power_of_two() {
         for size_mb in [1, 10, 100, 1000, 10000] {
             let piece_size = calculate_piece_size(size_mb * 1024 * 1024);
-            assert!(piece_size.is_power_of_two(), "Piece size {} should be power of 2", piece_size);
+            assert!(
+                piece_size.is_power_of_two(),
+                "Piece size {} should be power of 2",
+                piece_size
+            );
         }
     }
 }

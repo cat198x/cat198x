@@ -1,7 +1,7 @@
 //! DAT node, game, and ROM CRUD operations
 
 use anyhow::Result;
-use rusqlite::{params, Connection};
+use rusqlite::{Connection, params};
 use std::collections::{HashMap, HashSet};
 
 /// Merge mode for MAME-style ROM sets
@@ -519,7 +519,8 @@ pub fn calculate_merge_mode_stats(
     merge_mode: MergeMode,
     exclude_mechanical: bool,
 ) -> Result<MergeModeStats> {
-    let requirements = calculate_rom_requirements(conn, version_id, merge_mode, exclude_mechanical)?;
+    let requirements =
+        calculate_rom_requirements(conn, version_id, merge_mode, exclude_mechanical)?;
 
     // Collect all unique required ROMs and count BIOS/device sets
     let mut all_required: HashSet<RomKey> = HashSet::new();
@@ -561,7 +562,9 @@ pub fn calculate_merge_mode_stats(
             continue;
         }
 
-        let have_count = req.required_roms.iter()
+        let have_count = req
+            .required_roms
+            .iter()
             .filter(|key| have.contains(*key))
             .count();
 
@@ -590,7 +593,7 @@ pub fn calculate_merge_mode_stats(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::{collections, Database};
+    use crate::db::{Database, collections};
 
     fn setup_db() -> Database {
         Database::open_in_memory().unwrap()
@@ -599,7 +602,8 @@ mod tests {
     /// Helper to create a collection and version for tests
     fn create_test_collection_version(conn: &Connection) -> (i64, i64) {
         let coll_id = collections::create_collection(conn, "Nintendo - NES", "nointro").unwrap();
-        let version_id = collections::add_version(conn, coll_id, "20231215", "/path/to.dat", true).unwrap();
+        let version_id =
+            collections::add_version(conn, coll_id, "20231215", "/path/to.dat", true).unwrap();
         (coll_id, version_id)
     }
 
@@ -609,16 +613,31 @@ mod tests {
         let conn = db.conn();
         let (_, version_id) = create_test_collection_version(conn);
         let node_id = create_node(conn, version_id, None, "root", "dat", "root").unwrap();
-        let game_id = create_game(conn, node_id, "crcgame", None, None, false, false, false).unwrap();
+        let game_id =
+            create_game(conn, node_id, "crcgame", None, None, false, false, false).unwrap();
         // A DAT entry with only a CRC32 and size — no SHA1. Previously dropped
         // from requirements entirely, which let a game falsely read "complete".
-        create_rom(conn, game_id, "a.rom", 1024, None, None, Some("DEADBEEF"), "good", None).unwrap();
+        create_rom(
+            conn,
+            game_id,
+            "a.rom",
+            1024,
+            None,
+            None,
+            Some("DEADBEEF"),
+            "good",
+            None,
+        )
+        .unwrap();
 
         // It is now a requirement, keyed on CRC + size.
         let reqs =
             calculate_rom_requirements(conn, version_id, MergeMode::NonMerged, false).unwrap();
         let game = reqs.iter().find(|r| r.game_name == "crcgame").unwrap();
-        assert_eq!(game.required_roms, vec![RomKey::CrcSize("DEADBEEF".to_string(), 1024)]);
+        assert_eq!(
+            game.required_roms,
+            vec![RomKey::CrcSize("DEADBEEF".to_string(), 1024)]
+        );
 
         // Not owned yet: counted as required, not as have.
         let stats =
@@ -645,7 +664,15 @@ mod tests {
         let conn = db.conn();
         let (_, version_id) = create_test_collection_version(conn);
 
-        let node_id = create_node(conn, version_id, None, "Nintendo - NES", "root", "Nintendo - NES").unwrap();
+        let node_id = create_node(
+            conn,
+            version_id,
+            None,
+            "Nintendo - NES",
+            "root",
+            "Nintendo - NES",
+        )
+        .unwrap();
         assert!(node_id > 0);
     }
 
@@ -657,8 +684,24 @@ mod tests {
 
         // Create hierarchy: TOSEC > Commodore > Amiga
         let root = create_node(conn, version_id, None, "TOSEC", "root", "TOSEC").unwrap();
-        let manufacturer = create_node(conn, version_id, Some(root), "Commodore", "manufacturer", "TOSEC/Commodore").unwrap();
-        let system = create_node(conn, version_id, Some(manufacturer), "Amiga", "system", "TOSEC/Commodore/Amiga").unwrap();
+        let manufacturer = create_node(
+            conn,
+            version_id,
+            Some(root),
+            "Commodore",
+            "manufacturer",
+            "TOSEC/Commodore",
+        )
+        .unwrap();
+        let system = create_node(
+            conn,
+            version_id,
+            Some(manufacturer),
+            "Amiga",
+            "system",
+            "TOSEC/Commodore/Amiga",
+        )
+        .unwrap();
 
         assert!(root > 0);
         assert!(manufacturer > 0);
@@ -682,7 +725,8 @@ mod tests {
             false,
             false,
             false,
-        ).unwrap();
+        )
+        .unwrap();
 
         assert!(game_id > 0);
     }
@@ -696,7 +740,17 @@ mod tests {
         let node_id = create_node(conn, version_id, None, "NES", "root", "NES").unwrap();
 
         // Parent game
-        create_game(conn, node_id, "Super Mario Bros. (World)", None, None, false, false, false).unwrap();
+        create_game(
+            conn,
+            node_id,
+            "Super Mario Bros. (World)",
+            None,
+            None,
+            false,
+            false,
+            false,
+        )
+        .unwrap();
 
         // Clone
         let clone_id = create_game(
@@ -708,7 +762,8 @@ mod tests {
             false,
             false,
             false,
-        ).unwrap();
+        )
+        .unwrap();
 
         assert!(clone_id > 0);
     }
@@ -727,10 +782,11 @@ mod tests {
             "neogeo",
             Some("Neo-Geo BIOS"),
             None,
-            true,  // is_bios
+            true, // is_bios
             false,
             false,
-        ).unwrap();
+        )
+        .unwrap();
 
         assert!(bios_id > 0);
     }
@@ -742,7 +798,17 @@ mod tests {
         let (_, version_id) = create_test_collection_version(conn);
 
         let node_id = create_node(conn, version_id, None, "NES", "root", "NES").unwrap();
-        let game_id = create_game(conn, node_id, "Super Mario Bros.", None, None, false, false, false).unwrap();
+        let game_id = create_game(
+            conn,
+            node_id,
+            "Super Mario Bros.",
+            None,
+            None,
+            false,
+            false,
+            false,
+        )
+        .unwrap();
 
         let rom_id = create_rom(
             conn,
@@ -754,7 +820,8 @@ mod tests {
             Some("3337EC46"),
             "good",
             None,
-        ).unwrap();
+        )
+        .unwrap();
 
         assert!(rom_id > 0);
     }
@@ -766,7 +833,8 @@ mod tests {
         let (_, version_id) = create_test_collection_version(conn);
 
         let node_id = create_node(conn, version_id, None, "MAME", "root", "MAME").unwrap();
-        let game_id = create_game(conn, node_id, "pacman", None, None, false, false, false).unwrap();
+        let game_id =
+            create_game(conn, node_id, "pacman", None, None, false, false, false).unwrap();
 
         let rom_id = create_rom(
             conn,
@@ -778,7 +846,8 @@ mod tests {
             Some("12345678"),
             "good",
             Some("puckman"), // merge tag for merged sets
-        ).unwrap();
+        )
+        .unwrap();
 
         assert!(rom_id > 0);
     }
@@ -811,11 +880,45 @@ mod tests {
         let (_, version_id) = create_test_collection_version(conn);
 
         let node_id = create_node(conn, version_id, None, "MAME", "root", "MAME").unwrap();
-        let game_id = create_game(conn, node_id, "pacman", None, None, false, false, false).unwrap();
+        let game_id =
+            create_game(conn, node_id, "pacman", None, None, false, false, false).unwrap();
 
-        create_rom(conn, game_id, "pacman.6e", 4096, Some("SHA1_A"), None, None, "good", None).unwrap();
-        create_rom(conn, game_id, "pacman.6f", 4096, Some("SHA1_B"), None, None, "good", None).unwrap();
-        create_rom(conn, game_id, "pacman.6h", 4096, Some("SHA1_C"), None, None, "good", None).unwrap();
+        create_rom(
+            conn,
+            game_id,
+            "pacman.6e",
+            4096,
+            Some("SHA1_A"),
+            None,
+            None,
+            "good",
+            None,
+        )
+        .unwrap();
+        create_rom(
+            conn,
+            game_id,
+            "pacman.6f",
+            4096,
+            Some("SHA1_B"),
+            None,
+            None,
+            "good",
+            None,
+        )
+        .unwrap();
+        create_rom(
+            conn,
+            game_id,
+            "pacman.6h",
+            4096,
+            Some("SHA1_C"),
+            None,
+            None,
+            "good",
+            None,
+        )
+        .unwrap();
 
         let roms = get_roms_for_game(conn, game_id).unwrap();
         assert_eq!(roms.len(), 3);
@@ -838,9 +941,42 @@ mod tests {
         let game1 = create_game(conn, node_id, "Game1", None, None, false, false, false).unwrap();
         let game2 = create_game(conn, node_id, "Game2", None, None, false, false, false).unwrap();
 
-        create_rom(conn, game1, "game1.nes", 1000, Some("SHA1"), None, None, "good", None).unwrap();
-        create_rom(conn, game2, "game2a.nes", 2000, Some("SHA2"), None, None, "good", None).unwrap();
-        create_rom(conn, game2, "game2b.nes", 3000, Some("SHA3"), None, None, "good", None).unwrap();
+        create_rom(
+            conn,
+            game1,
+            "game1.nes",
+            1000,
+            Some("SHA1"),
+            None,
+            None,
+            "good",
+            None,
+        )
+        .unwrap();
+        create_rom(
+            conn,
+            game2,
+            "game2a.nes",
+            2000,
+            Some("SHA2"),
+            None,
+            None,
+            "good",
+            None,
+        )
+        .unwrap();
+        create_rom(
+            conn,
+            game2,
+            "game2b.nes",
+            3000,
+            Some("SHA3"),
+            None,
+            None,
+            "good",
+            None,
+        )
+        .unwrap();
 
         let (games, roms) = count_games_and_roms(conn, version_id).unwrap();
         assert_eq!(games, 2);
@@ -857,7 +993,18 @@ mod tests {
         let game_id = create_game(conn, node_id, "Mario", None, None, false, false, false).unwrap();
 
         let target_sha1 = "FACEE9C577A5262DBE33AC4930BB0B58C8C037F7";
-        create_rom(conn, game_id, "mario.nes", 40976, Some(target_sha1), None, None, "good", None).unwrap();
+        create_rom(
+            conn,
+            game_id,
+            "mario.nes",
+            40976,
+            Some(target_sha1),
+            None,
+            None,
+            "good",
+            None,
+        )
+        .unwrap();
 
         let found = find_rom_by_sha1(conn, version_id, target_sha1).unwrap();
         assert!(found.is_some());
@@ -891,7 +1038,18 @@ mod tests {
         let node1 = create_node(conn, version1, None, "NES", "root", "NES").unwrap();
         let game1 = create_game(conn, node1, "Mario", None, None, false, false, false).unwrap();
         let sha1 = "ABC123";
-        create_rom(conn, game1, "mario.nes", 1000, Some(sha1), None, None, "good", None).unwrap();
+        create_rom(
+            conn,
+            game1,
+            "mario.nes",
+            1000,
+            Some(sha1),
+            None,
+            None,
+            "good",
+            None,
+        )
+        .unwrap();
 
         // Should find in version1
         assert!(find_rom_by_sha1(conn, version1, sha1).unwrap().is_some());
@@ -905,19 +1063,96 @@ mod tests {
         let node_id = create_node(conn, version_id, None, "MAME", "root", "MAME").unwrap();
 
         // Parent game: pacman
-        let parent_id = create_game(conn, node_id, "pacman", None, None, false, false, false).unwrap();
+        let parent_id =
+            create_game(conn, node_id, "pacman", None, None, false, false, false).unwrap();
         // Parent ROMs
-        create_rom(conn, parent_id, "pacman.5e", 4096, Some("SHA1_PACMAN_5E"), None, None, "good", None).unwrap();
-        create_rom(conn, parent_id, "pacman.5f", 4096, Some("SHA1_PACMAN_5F"), None, None, "good", None).unwrap();
-        create_rom(conn, parent_id, "prom.7f", 256, Some("SHA1_PROM"), None, None, "good", None).unwrap();
+        create_rom(
+            conn,
+            parent_id,
+            "pacman.5e",
+            4096,
+            Some("SHA1_PACMAN_5E"),
+            None,
+            None,
+            "good",
+            None,
+        )
+        .unwrap();
+        create_rom(
+            conn,
+            parent_id,
+            "pacman.5f",
+            4096,
+            Some("SHA1_PACMAN_5F"),
+            None,
+            None,
+            "good",
+            None,
+        )
+        .unwrap();
+        create_rom(
+            conn,
+            parent_id,
+            "prom.7f",
+            256,
+            Some("SHA1_PROM"),
+            None,
+            None,
+            "good",
+            None,
+        )
+        .unwrap();
 
         // Clone game: mspacman (clones from pacman)
-        let clone_id = create_game(conn, node_id, "mspacman", None, Some("pacman"), false, false, false).unwrap();
+        let clone_id = create_game(
+            conn,
+            node_id,
+            "mspacman",
+            None,
+            Some("pacman"),
+            false,
+            false,
+            false,
+        )
+        .unwrap();
         // Clone's unique ROMs
-        create_rom(conn, clone_id, "mspacman.5e", 4096, Some("SHA1_MSPACMAN_5E"), None, None, "good", None).unwrap();
-        create_rom(conn, clone_id, "mspacman.5f", 4096, Some("SHA1_MSPACMAN_5F"), None, None, "good", None).unwrap();
+        create_rom(
+            conn,
+            clone_id,
+            "mspacman.5e",
+            4096,
+            Some("SHA1_MSPACMAN_5E"),
+            None,
+            None,
+            "good",
+            None,
+        )
+        .unwrap();
+        create_rom(
+            conn,
+            clone_id,
+            "mspacman.5f",
+            4096,
+            Some("SHA1_MSPACMAN_5F"),
+            None,
+            None,
+            "good",
+            None,
+        )
+        .unwrap();
         // Clone's inherited ROM (has merge tag pointing to parent)
-        create_rom(conn, clone_id, "prom.7f", 256, Some("SHA1_PROM"), None, None, "good", Some("prom.7f")).unwrap();
+        create_rom(
+            conn,
+            clone_id,
+            "prom.7f",
+            256,
+            Some("SHA1_PROM"),
+            None,
+            None,
+            "good",
+            Some("prom.7f"),
+        )
+        .unwrap();
 
         (parent_id, clone_id)
     }
@@ -929,14 +1164,21 @@ mod tests {
         let (_, version_id) = create_test_collection_version(conn);
         create_mame_structure(conn, version_id);
 
-        let requirements = calculate_rom_requirements(conn, version_id, MergeMode::NonMerged, false).unwrap();
+        let requirements =
+            calculate_rom_requirements(conn, version_id, MergeMode::NonMerged, false).unwrap();
 
         // Should have 2 games
         assert_eq!(requirements.len(), 2);
 
         // Find parent and clone
-        let parent = requirements.iter().find(|r| r.game_name == "pacman").unwrap();
-        let clone = requirements.iter().find(|r| r.game_name == "mspacman").unwrap();
+        let parent = requirements
+            .iter()
+            .find(|r| r.game_name == "pacman")
+            .unwrap();
+        let clone = requirements
+            .iter()
+            .find(|r| r.game_name == "mspacman")
+            .unwrap();
 
         // Parent needs 3 ROMs
         assert_eq!(parent.required_roms.len(), 3);
@@ -945,7 +1187,11 @@ mod tests {
         // Clone ALSO needs 3 ROMs (including the shared prom.7f)
         assert_eq!(clone.required_roms.len(), 3);
         assert!(clone.is_clone);
-        assert!(clone.required_roms.contains(&RomKey::Sha1("SHA1_PROM".to_string())));
+        assert!(
+            clone
+                .required_roms
+                .contains(&RomKey::Sha1("SHA1_PROM".to_string()))
+        );
     }
 
     #[test]
@@ -955,22 +1201,41 @@ mod tests {
         let (_, version_id) = create_test_collection_version(conn);
         create_mame_structure(conn, version_id);
 
-        let requirements = calculate_rom_requirements(conn, version_id, MergeMode::Split, false).unwrap();
+        let requirements =
+            calculate_rom_requirements(conn, version_id, MergeMode::Split, false).unwrap();
 
         // Should have 2 games
         assert_eq!(requirements.len(), 2);
 
-        let parent = requirements.iter().find(|r| r.game_name == "pacman").unwrap();
-        let clone = requirements.iter().find(|r| r.game_name == "mspacman").unwrap();
+        let parent = requirements
+            .iter()
+            .find(|r| r.game_name == "pacman")
+            .unwrap();
+        let clone = requirements
+            .iter()
+            .find(|r| r.game_name == "mspacman")
+            .unwrap();
 
         // Parent still needs all 3 ROMs
         assert_eq!(parent.required_roms.len(), 3);
 
         // Clone only needs 2 ROMs (excluding inherited prom.7f with merge_tag)
         assert_eq!(clone.required_roms.len(), 2);
-        assert!(clone.required_roms.contains(&RomKey::Sha1("SHA1_MSPACMAN_5E".to_string())));
-        assert!(clone.required_roms.contains(&RomKey::Sha1("SHA1_MSPACMAN_5F".to_string())));
-        assert!(!clone.required_roms.contains(&RomKey::Sha1("SHA1_PROM".to_string())));
+        assert!(
+            clone
+                .required_roms
+                .contains(&RomKey::Sha1("SHA1_MSPACMAN_5E".to_string()))
+        );
+        assert!(
+            clone
+                .required_roms
+                .contains(&RomKey::Sha1("SHA1_MSPACMAN_5F".to_string()))
+        );
+        assert!(
+            !clone
+                .required_roms
+                .contains(&RomKey::Sha1("SHA1_PROM".to_string()))
+        );
     }
 
     #[test]
@@ -980,7 +1245,8 @@ mod tests {
         let (_, version_id) = create_test_collection_version(conn);
         create_mame_structure(conn, version_id);
 
-        let requirements = calculate_rom_requirements(conn, version_id, MergeMode::Merged, false).unwrap();
+        let requirements =
+            calculate_rom_requirements(conn, version_id, MergeMode::Merged, false).unwrap();
 
         // Should only have 1 game (parent only, clone doesn't exist as separate archive)
         assert_eq!(requirements.len(), 1);
@@ -991,11 +1257,31 @@ mod tests {
         // Parent needs all ROMs including clone's unique ROMs
         // 3 parent ROMs + 2 unique clone ROMs = 5 (but SHA1_PROM is shared, so still 5)
         assert_eq!(parent.required_roms.len(), 5);
-        assert!(parent.required_roms.contains(&RomKey::Sha1("SHA1_PACMAN_5E".to_string())));
-        assert!(parent.required_roms.contains(&RomKey::Sha1("SHA1_PACMAN_5F".to_string())));
-        assert!(parent.required_roms.contains(&RomKey::Sha1("SHA1_PROM".to_string())));
-        assert!(parent.required_roms.contains(&RomKey::Sha1("SHA1_MSPACMAN_5E".to_string())));
-        assert!(parent.required_roms.contains(&RomKey::Sha1("SHA1_MSPACMAN_5F".to_string())));
+        assert!(
+            parent
+                .required_roms
+                .contains(&RomKey::Sha1("SHA1_PACMAN_5E".to_string()))
+        );
+        assert!(
+            parent
+                .required_roms
+                .contains(&RomKey::Sha1("SHA1_PACMAN_5F".to_string()))
+        );
+        assert!(
+            parent
+                .required_roms
+                .contains(&RomKey::Sha1("SHA1_PROM".to_string()))
+        );
+        assert!(
+            parent
+                .required_roms
+                .contains(&RomKey::Sha1("SHA1_MSPACMAN_5E".to_string()))
+        );
+        assert!(
+            parent
+                .required_roms
+                .contains(&RomKey::Sha1("SHA1_MSPACMAN_5F".to_string()))
+        );
     }
 
     #[test]
@@ -1005,14 +1291,41 @@ mod tests {
         let (_, version_id) = create_test_collection_version(conn);
 
         let node_id = create_node(conn, version_id, None, "MAME", "root", "MAME").unwrap();
-        let game_id = create_game(conn, node_id, "testgame", None, None, false, false, false).unwrap();
+        let game_id =
+            create_game(conn, node_id, "testgame", None, None, false, false, false).unwrap();
 
         // 2 good ROMs, 1 nodump
-        create_rom(conn, game_id, "rom1.bin", 1000, Some("SHA1_ROM1"), None, None, "good", None).unwrap();
-        create_rom(conn, game_id, "rom2.bin", 1000, Some("SHA1_ROM2"), None, None, "good", None).unwrap();
-        create_rom(conn, game_id, "pal.bin", 256, None, None, None, "nodump", None).unwrap();
+        create_rom(
+            conn,
+            game_id,
+            "rom1.bin",
+            1000,
+            Some("SHA1_ROM1"),
+            None,
+            None,
+            "good",
+            None,
+        )
+        .unwrap();
+        create_rom(
+            conn,
+            game_id,
+            "rom2.bin",
+            1000,
+            Some("SHA1_ROM2"),
+            None,
+            None,
+            "good",
+            None,
+        )
+        .unwrap();
+        create_rom(
+            conn, game_id, "pal.bin", 256, None, None, None, "nodump", None,
+        )
+        .unwrap();
 
-        let requirements = calculate_rom_requirements(conn, version_id, MergeMode::NonMerged, false).unwrap();
+        let requirements =
+            calculate_rom_requirements(conn, version_id, MergeMode::NonMerged, false).unwrap();
 
         assert_eq!(requirements.len(), 1);
         let req = &requirements[0];
@@ -1032,19 +1345,44 @@ mod tests {
 
         // Regular game
         let game1 = create_game(conn, node_id, "pacman", None, None, false, false, false).unwrap();
-        create_rom(conn, game1, "pacman.bin", 1000, Some("SHA1_PACMAN"), None, None, "good", None).unwrap();
+        create_rom(
+            conn,
+            game1,
+            "pacman.bin",
+            1000,
+            Some("SHA1_PACMAN"),
+            None,
+            None,
+            "good",
+            None,
+        )
+        .unwrap();
 
         // Mechanical game (slot machine)
-        let game2 = create_game(conn, node_id, "slotmachine", None, None, false, false, true).unwrap();
-        create_rom(conn, game2, "slot.bin", 1000, Some("SHA1_SLOT"), None, None, "good", None).unwrap();
+        let game2 =
+            create_game(conn, node_id, "slotmachine", None, None, false, false, true).unwrap();
+        create_rom(
+            conn,
+            game2,
+            "slot.bin",
+            1000,
+            Some("SHA1_SLOT"),
+            None,
+            None,
+            "good",
+            None,
+        )
+        .unwrap();
 
         // With exclude_mechanical = true
-        let requirements = calculate_rom_requirements(conn, version_id, MergeMode::NonMerged, true).unwrap();
+        let requirements =
+            calculate_rom_requirements(conn, version_id, MergeMode::NonMerged, true).unwrap();
         assert_eq!(requirements.len(), 1);
         assert_eq!(requirements[0].game_name, "pacman");
 
         // With exclude_mechanical = false
-        let requirements = calculate_rom_requirements(conn, version_id, MergeMode::NonMerged, false).unwrap();
+        let requirements =
+            calculate_rom_requirements(conn, version_id, MergeMode::NonMerged, false).unwrap();
         assert_eq!(requirements.len(), 2);
     }
 
@@ -1068,12 +1406,13 @@ mod tests {
         let _ = source_id; // unused, just need files in db
 
         // Non-merged: need all 6 unique ROMs (3 parent + 3 clone, but SHA1_PROM shared = 5)
-        let stats = calculate_merge_mode_stats(conn, version_id, MergeMode::NonMerged, false).unwrap();
+        let stats =
+            calculate_merge_mode_stats(conn, version_id, MergeMode::NonMerged, false).unwrap();
         assert_eq!(stats.total_games, 2);
         assert_eq!(stats.total_roms, 5); // 5 unique SHA1s
-        assert_eq!(stats.have_roms, 3);  // We have 3 ROMs
-        assert_eq!(stats.complete_games, 1);  // Parent is complete
-        assert_eq!(stats.partial_games, 1);   // Clone has prom but missing unique ROMs
+        assert_eq!(stats.have_roms, 3); // We have 3 ROMs
+        assert_eq!(stats.complete_games, 1); // Parent is complete
+        assert_eq!(stats.partial_games, 1); // Clone has prom but missing unique ROMs
 
         // Split mode: clone only needs unique ROMs (2)
         let stats = calculate_merge_mode_stats(conn, version_id, MergeMode::Split, false).unwrap();
@@ -1081,15 +1420,15 @@ mod tests {
         // Total unique required: parent 3 + clone 2 = 5
         assert_eq!(stats.total_roms, 5);
         assert_eq!(stats.have_roms, 3);
-        assert_eq!(stats.complete_games, 1);  // Parent is complete
-        assert_eq!(stats.missing_games, 1);   // Clone is missing (0 of its 2 unique)
+        assert_eq!(stats.complete_games, 1); // Parent is complete
+        assert_eq!(stats.missing_games, 1); // Clone is missing (0 of its 2 unique)
 
         // Merged mode: only parent, needs all ROMs
         let stats = calculate_merge_mode_stats(conn, version_id, MergeMode::Merged, false).unwrap();
         assert_eq!(stats.total_games, 1);
-        assert_eq!(stats.total_roms, 5);  // Parent needs all 5 unique
+        assert_eq!(stats.total_roms, 5); // Parent needs all 5 unique
         assert_eq!(stats.have_roms, 3);
-        assert_eq!(stats.partial_games, 1);  // Parent is partial (missing clone ROMs)
+        assert_eq!(stats.partial_games, 1); // Parent is partial (missing clone ROMs)
     }
 
     #[test]
@@ -1102,17 +1441,51 @@ mod tests {
 
         // Regular game
         let game1 = create_game(conn, node_id, "mslug", None, None, false, false, false).unwrap();
-        create_rom(conn, game1, "mslug.bin", 1000, Some("SHA1_MSLUG"), None, None, "good", None).unwrap();
+        create_rom(
+            conn,
+            game1,
+            "mslug.bin",
+            1000,
+            Some("SHA1_MSLUG"),
+            None,
+            None,
+            "good",
+            None,
+        )
+        .unwrap();
 
         // BIOS set
         let bios = create_game(conn, node_id, "neogeo", None, None, true, false, false).unwrap();
-        create_rom(conn, bios, "neogeo.bin", 2000, Some("SHA1_NEOGEO"), None, None, "good", None).unwrap();
+        create_rom(
+            conn,
+            bios,
+            "neogeo.bin",
+            2000,
+            Some("SHA1_NEOGEO"),
+            None,
+            None,
+            "good",
+            None,
+        )
+        .unwrap();
 
         // Device set
         let device = create_game(conn, node_id, "ymz280b", None, None, false, true, false).unwrap();
-        create_rom(conn, device, "ymz.bin", 500, Some("SHA1_YMZ"), None, None, "good", None).unwrap();
+        create_rom(
+            conn,
+            device,
+            "ymz.bin",
+            500,
+            Some("SHA1_YMZ"),
+            None,
+            None,
+            "good",
+            None,
+        )
+        .unwrap();
 
-        let stats = calculate_merge_mode_stats(conn, version_id, MergeMode::NonMerged, false).unwrap();
+        let stats =
+            calculate_merge_mode_stats(conn, version_id, MergeMode::NonMerged, false).unwrap();
 
         assert_eq!(stats.total_games, 3);
         assert_eq!(stats.bios_sets, 1);
@@ -1131,15 +1504,48 @@ mod tests {
 
         // Regular game
         let game1 = create_game(conn, node_id, "mslug", None, None, false, false, false).unwrap();
-        create_rom(conn, game1, "mslug.bin", 1000, Some("SHA1_MSLUG"), None, None, "good", None).unwrap();
+        create_rom(
+            conn,
+            game1,
+            "mslug.bin",
+            1000,
+            Some("SHA1_MSLUG"),
+            None,
+            None,
+            "good",
+            None,
+        )
+        .unwrap();
 
         // BIOS set
         let bios = create_game(conn, node_id, "neogeo", None, None, true, false, false).unwrap();
-        create_rom(conn, bios, "neogeo.bin", 2000, Some("SHA1_NEOGEO"), None, None, "good", None).unwrap();
+        create_rom(
+            conn,
+            bios,
+            "neogeo.bin",
+            2000,
+            Some("SHA1_NEOGEO"),
+            None,
+            None,
+            "good",
+            None,
+        )
+        .unwrap();
 
         // Device set
         let device = create_game(conn, node_id, "ymz280b", None, None, false, true, false).unwrap();
-        create_rom(conn, device, "ymz.bin", 500, Some("SHA1_YMZ"), None, None, "good", None).unwrap();
+        create_rom(
+            conn,
+            device,
+            "ymz.bin",
+            500,
+            Some("SHA1_YMZ"),
+            None,
+            None,
+            "good",
+            None,
+        )
+        .unwrap();
 
         // Without exclusions: 3 games
         let requirements = calculate_rom_requirements_with_options(
@@ -1147,7 +1553,8 @@ mod tests {
             version_id,
             MergeMode::NonMerged,
             &RequirementOptions::default(),
-        ).unwrap();
+        )
+        .unwrap();
         assert_eq!(requirements.len(), 3);
 
         // With BIOS exclusion: 2 games
@@ -1159,7 +1566,8 @@ mod tests {
                 exclude_bios: true,
                 ..Default::default()
             },
-        ).unwrap();
+        )
+        .unwrap();
         assert_eq!(requirements.len(), 2);
         assert!(!requirements.iter().any(|r| r.game_name == "neogeo"));
 
@@ -1172,7 +1580,8 @@ mod tests {
                 exclude_devices: true,
                 ..Default::default()
             },
-        ).unwrap();
+        )
+        .unwrap();
         assert_eq!(requirements.len(), 2);
         assert!(!requirements.iter().any(|r| r.game_name == "ymz280b"));
 
@@ -1186,7 +1595,8 @@ mod tests {
                 exclude_devices: true,
                 ..Default::default()
             },
-        ).unwrap();
+        )
+        .unwrap();
         assert_eq!(requirements.len(), 1);
         assert_eq!(requirements[0].game_name, "mslug");
     }

@@ -142,8 +142,11 @@ pub fn run(
             writeln!(writer, "Collection: {}", coll.name)?;
             writeln!(writer, "Version: {}", version.version)?;
             writeln!(writer, "Games: {}", games.len())?;
-            writeln!(writer, "ROMs: {} total, {} have, {} missing ({:.1}%)",
-                total_roms, have_count, missing_count, completion)?;
+            writeln!(
+                writer,
+                "ROMs: {} total, {} have, {} missing ({:.1}%)",
+                total_roms, have_count, missing_count, completion
+            )?;
             writeln!(writer)?;
 
             if have_only {
@@ -170,7 +173,9 @@ pub fn run(
         ExportFormat::Csv => {
             writeln!(writer, "game,rom,sha1,have,source_path")?;
             for s in &filtered {
-                writeln!(writer, "\"{}\",\"{}\",{},{},\"{}\"",
+                writeln!(
+                    writer,
+                    "\"{}\",\"{}\",{},{},\"{}\"",
                     s.game.replace('"', "\"\""),
                     s.rom.replace('"', "\"\""),
                     s.sha1,

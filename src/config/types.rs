@@ -190,7 +190,10 @@ mod tests {
         let toml_str = toml::to_string_pretty(&original).unwrap();
         let deserialized: Config = toml::from_str(&toml_str).unwrap();
 
-        assert_eq!(original.default_output_format, deserialized.default_output_format);
+        assert_eq!(
+            original.default_output_format,
+            deserialized.default_output_format
+        );
         assert_eq!(original.default_merge_mode, deserialized.default_merge_mode);
     }
 

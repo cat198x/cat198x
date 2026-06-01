@@ -1,9 +1,13 @@
 use anyhow::Result;
 use clap::{CommandFactory, Parser, Subcommand};
-use clap_complete::{generate, Shell};
+use clap_complete::{Shell, generate};
 use std::io;
 
-use cat198x::cli::{apply as apply_cmd, config as config_cmd, dat as dat_cmd, doctor as doctor_cmd, export as export_cmd, init, plan as plan_cmd, quarantine as quarantine_cmd, scan, source, stats as stats_cmd, status, torrent as torrent_cmd, update as update_cmd};
+use cat198x::cli::{
+    apply as apply_cmd, config as config_cmd, dat as dat_cmd, doctor as doctor_cmd,
+    export as export_cmd, init, plan as plan_cmd, quarantine as quarantine_cmd, scan, source,
+    stats as stats_cmd, status, torrent as torrent_cmd, update as update_cmd,
+};
 use cat198x::{ConfigCommands, DatCommands, QuarantineCommands, SourceCommands, TorrentCommands};
 
 /// Cat198x - A cross-platform CLI for managing retro gaming ROM collections
@@ -193,7 +197,12 @@ fn main() -> Result<()> {
         Commands::Stats => stats_cmd::run(cli.data_dir),
         Commands::Config(cmd) => config_cmd::run(cmd, cli.data_dir),
         Commands::Plan { dat } => plan_cmd::run(dat, cli.data_dir),
-        Commands::Apply { dry_run, skip_space_check, rollback, continue_rollback } => {
+        Commands::Apply {
+            dry_run,
+            skip_space_check,
+            rollback,
+            continue_rollback,
+        } => {
             if rollback {
                 apply_cmd::run_rollback(dry_run, continue_rollback, cli.data_dir)
             } else {
@@ -203,9 +212,20 @@ fn main() -> Result<()> {
         Commands::Quarantine(cmd) => quarantine_cmd::run(cmd, cli.data_dir),
         Commands::Torrent(cmd) => torrent_cmd::run(cmd),
         Commands::Doctor { fix } => doctor_cmd::run(fix, cli.data_dir),
-        Commands::Export { collection, output, format, have, missing } => {
-            export_cmd::run(&collection, output, format.as_deref(), have, missing, cli.data_dir)
-        }
+        Commands::Export {
+            collection,
+            output,
+            format,
+            have,
+            missing,
+        } => export_cmd::run(
+            &collection,
+            output,
+            format.as_deref(),
+            have,
+            missing,
+            cli.data_dir,
+        ),
         Commands::Completions { shell } => {
             generate(shell, &mut Cli::command(), "cat198x", &mut io::stdout());
             Ok(())

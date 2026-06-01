@@ -157,19 +157,23 @@ fn parse_paren_content(content: &str, result: &mut ParsedGameName) {
     }
 
     // Check for TOSEC-style ISO country codes
-    if content.len() == 2 && content.chars().all(|c| c.is_ascii_uppercase())
-        && let Some(region) = iso_to_region(content) {
-            result.regions.push(region.to_string());
-            return;
-        }
+    if content.len() == 2
+        && content.chars().all(|c| c.is_ascii_uppercase())
+        && let Some(region) = iso_to_region(content)
+    {
+        result.regions.push(region.to_string());
+        return;
+    }
 
     // Check for multi-country TOSEC (e.g., "US-EU")
     if content.contains('-') && content.len() <= 8 {
         for part in content.split('-') {
-            if part.len() == 2 && part.chars().all(|c| c.is_ascii_uppercase())
-                && let Some(region) = iso_to_region(part) {
-                    result.regions.push(region.to_string());
-                }
+            if part.len() == 2
+                && part.chars().all(|c| c.is_ascii_uppercase())
+                && let Some(region) = iso_to_region(part)
+            {
+                result.regions.push(region.to_string());
+            }
         }
         if !result.regions.is_empty() {
             return;
