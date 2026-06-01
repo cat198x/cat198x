@@ -183,25 +183,29 @@ fn find_matched_roms(
     version_id: i64,
     collection_name: &str,
 ) -> Result<Vec<MatchedRom>> {
-    // Query: join dat_roms with files and file_locations via SHA1
-    // Only include ROMs where we have a matching file
+    // Match each DAT ROM to a file we hold. A DAT SHA1 may be the headered or
+    // headerless form, so match either of the file's hashes; a SHA1-less DAT
+    // entry matches on CRC + size. We select the *file's* sha1 and size (not
+    // the DAT's), because that's the true content placed at the destination and
+    // what `is_file_correct_at_dest` re-hashes to verify.
     let mut stmt = conn.prepare(
         "SELECT
             g.name as game_name,
             r.name as rom_name,
-            r.sha1,
-            r.size,
+            f.sha1,
+            f.size,
             fl.path as source_path,
             s.path as source_root,
             fl.archive_path
          FROM dat_roms r
          JOIN dat_games g ON r.game_id = g.id
          JOIN dat_nodes n ON g.node_id = n.id
-         JOIN files f ON r.sha1 = f.sha1
+         JOIN files f ON
+                (r.sha1 IS NOT NULL AND (f.sha1 = r.sha1 OR f.sha1_no_header = r.sha1))
+             OR (r.sha1 IS NULL AND r.crc32 IS NOT NULL AND f.crc32 = r.crc32 AND f.size = r.size)
          JOIN file_locations fl ON f.sha1 = fl.sha1
          JOIN sources s ON fl.source_id = s.id
          WHERE n.version_id = ?
-           AND r.sha1 IS NOT NULL
            AND r.status != 'nodump'
          ORDER BY g.name, r.name",
     )?;
@@ -343,11 +347,14 @@ pub fn count_missing_roms(conn: &Connection, version_id: i64) -> Result<i64> {
         "SELECT COUNT(*) FROM dat_roms r
          JOIN dat_games g ON r.game_id = g.id
          JOIN dat_nodes n ON g.node_id = n.id
-         LEFT JOIN files f ON r.sha1 = f.sha1
          WHERE n.version_id = ?
-           AND r.sha1 IS NOT NULL
            AND r.status != 'nodump'
-           AND f.sha1 IS NULL",
+           AND (r.sha1 IS NOT NULL OR r.crc32 IS NOT NULL)
+           AND NOT EXISTS (
+               SELECT 1 FROM files f
+               WHERE (r.sha1 IS NOT NULL AND (f.sha1 = r.sha1 OR f.sha1_no_header = r.sha1))
+                  OR (r.sha1 IS NULL AND f.crc32 = r.crc32 AND f.size = r.size)
+           )",
         [version_id],
         |row| row.get(0),
     )?;
