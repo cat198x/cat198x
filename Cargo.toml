@@ -14,7 +14,7 @@ clap = { version = "4", features = ["derive", "env"] }
 clap_complete = "4"
 
 # Database
-rusqlite = { version = "0.31", features = ["bundled"] }
+rusqlite = { version = "0.40", features = ["bundled"] }
 
 # XML parsing (streaming for large DAT files)
 quick-xml = "0.40"
