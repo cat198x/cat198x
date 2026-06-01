@@ -564,8 +564,17 @@ fn execute_rollback_move(source: &str, dest: &str, expected_sha1: &str) -> Resul
 
         // Move the file
         fs::rename(source_path, dest_path).or_else(|_| {
-            // If rename fails (cross-device), copy + delete
+            // Cross-device: copy, re-verify the copy, flush it to disk, and
+            // only then delete the source — so a corrupt or unflushed copy
+            // can't lose the very file we're trying to restore.
             fs::copy(source_path, dest_path)?;
+            if !verify_sha1(dest_path, expected_sha1)? {
+                let _ = fs::remove_file(dest_path);
+                anyhow::bail!("Rollback copy verification failed for {}", dest);
+            }
+            std::fs::File::open(dest_path)
+                .and_then(|f| f.sync_all())
+                .with_context(|| format!("Failed to flush restored file: {}", dest))?;
             fs::remove_file(source_path)?;
             Ok::<_, anyhow::Error>(())
         })?;
