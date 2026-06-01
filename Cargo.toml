@@ -39,7 +39,7 @@ walkdir = "2"
 rayon = "1.10"
 
 # Progress indication
-indicatif = "0.17"
+indicatif = "0.18"
 
 # Error handling
 thiserror = "2"
