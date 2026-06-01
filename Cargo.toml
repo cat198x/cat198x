@@ -8,6 +8,9 @@ repository = "https://github.com/cat198x/cat198x"
 keywords = ["rom", "retro", "gaming", "dat", "mame"]
 categories = ["command-line-utilities", "games"]
 
+[lints]
+workspace = true
+
 [dependencies]
 # CLI framework
 clap = { version = "4", features = ["derive", "env"] }
@@ -71,16 +74,52 @@ directories = "6"
 # Temp directory for archive extraction
 tempfile = "3"
 
+# Cross-platform free-disk-space query (wraps statvfs / GetDiskFreeSpaceExW
+# without unsafe in our code, so the crate keeps unsafe_code = "forbid").
+fs4 = "1"
+
 # Logging
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
-# Platform-specific
-[target.'cfg(unix)'.dependencies]
-libc = "0.2"
-
-[target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.52", features = ["Win32_Storage_FileSystem"] }
-
 [dev-dependencies]
 tempfile = "3"
+
+# --- 198x standard project skeleton (see ../../decisions/project-skeleton-standard.md) ---
+# Single-package workspace root: the skeleton's quality gates, profiles, and
+# release config live in workspace tables so this crate matches the rest of the
+# 198x family and can grow into a multi-crate workspace later.
+[workspace]
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+unused_must_use = "deny"
+
+[workspace.lints.clippy]
+dbg_macro = "deny"
+unwrap_used = "deny"
+
+[profile.dev]
+# Line tables give backtraces without the full-debuginfo link tax — the
+# biggest cargo test cost once a workspace grows many test binaries.
+debug = "line-tables-only"
+split-debuginfo = "unpacked"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+
+# cargo-dist release configuration. On a `v*` tag push (created by release-plz
+# when its release PR merges), .github/workflows/release.yml builds the cat198x
+# CLI for each target and attaches archives to a GitHub Release. Regenerate that
+# workflow with `dist generate` after editing this section.
+[workspace.metadata.dist]
+cargo-dist-version = "0.32.0"
+ci = "github"
+installers = []
+targets = ["aarch64-apple-darwin", "x86_64-apple-darwin", "x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc"]
+pr-run-mode = "plan"
+
+[profile.dist]
+inherits = "release"
+lto = "thin"

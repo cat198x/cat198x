@@ -842,9 +842,9 @@ fn create_test_zip(dir: &std::path::Path, zip_name: &str, entry_name: &str, cont
 
     let options = zip::write::SimpleFileOptions::default()
         .compression_method(zip::CompressionMethod::Stored);
-    zip.start_file(entry_name, options).unwrap();
-    zip.write_all(content).unwrap();
-    zip.finish().unwrap();
+    zip.start_file(entry_name, options).expect("start ZIP entry");
+    zip.write_all(content).expect("write ZIP entry");
+    zip.finish().expect("finish ZIP archive");
 
     zip_path
 }

@@ -131,7 +131,6 @@ pub fn run(
     };
 
     // Output
-    let output_to_file = output.is_some();
     let mut writer: Box<dyn Write> = if let Some(path) = &output {
         Box::new(BufWriter::new(File::create(path)?))
     } else {
@@ -212,8 +211,8 @@ pub fn run(
 
     writer.flush()?;
 
-    if output_to_file {
-        println!("Exported {} ROMs to {:?}", filtered.len(), output.unwrap());
+    if let Some(path) = output {
+        println!("Exported {} ROMs to {:?}", filtered.len(), path);
     }
 
     Ok(())

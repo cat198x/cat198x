@@ -182,7 +182,7 @@ fn scan_source(
     pb.set_style(
         ProgressStyle::default_bar()
             .template("  [{bar:40.cyan/blue}] {pos}/{len} {msg}")
-            .unwrap()
+            .expect("progress-bar template is a valid literal")
             .progress_chars("=>-"),
     );
 

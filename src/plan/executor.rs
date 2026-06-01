@@ -469,7 +469,8 @@ pub fn check_disk_space(plan: &Plan) -> Result<()> {
 
 /// Get available disk space for a path (in bytes)
 fn get_available_space(path: &str) -> Result<u64> {
-    // Find an existing parent directory to stat
+    // Find an existing parent directory to stat — the destination itself may
+    // not exist yet (we're about to create it).
     let mut check_path = Path::new(path).to_path_buf();
     while !check_path.exists() {
         check_path = match check_path.parent() {
@@ -478,65 +479,11 @@ fn get_available_space(path: &str) -> Result<u64> {
         };
     }
 
-    // Use statvfs on Unix systems
-    #[cfg(unix)]
-    {
-        use std::ffi::CString;
-        use std::mem::MaybeUninit;
-
-        let path_cstr = CString::new(check_path.to_string_lossy().as_bytes())
-            .context("Invalid path for statvfs")?;
-
-        let mut stat: MaybeUninit<libc::statvfs> = MaybeUninit::uninit();
-
-        let result = unsafe { libc::statvfs(path_cstr.as_ptr(), stat.as_mut_ptr()) };
-
-        if result != 0 {
-            anyhow::bail!("Failed to get disk space for '{}'", path);
-        }
-
-        let stat = unsafe { stat.assume_init() };
-        let available = stat.f_bavail as u64 * stat.f_frsize;
-        Ok(available)
-    }
-
-    #[cfg(windows)]
-    {
-        use std::ffi::OsStr;
-        use std::os::windows::ffi::OsStrExt;
-
-        // Convert path to wide string for Windows API
-        let wide_path: Vec<u16> = OsStr::new(&check_path)
-            .encode_wide()
-            .chain(std::iter::once(0))
-            .collect();
-
-        let mut free_bytes_available: u64 = 0;
-        let mut total_bytes: u64 = 0;
-        let mut total_free_bytes: u64 = 0;
-
-        // SAFETY: We're calling GetDiskFreeSpaceExW with valid pointers and a null-terminated wide string
-        let result = unsafe {
-            windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW(
-                wide_path.as_ptr(),
-                &mut free_bytes_available,
-                &mut total_bytes,
-                &mut total_free_bytes,
-            )
-        };
-
-        if result == 0 {
-            anyhow::bail!("Failed to get disk space for '{}'", path);
-        }
-
-        Ok(free_bytes_available)
-    }
-
-    #[cfg(not(any(unix, windows)))]
-    {
-        // On other platforms, return a large value to skip the check
-        Ok(u64::MAX)
-    }
+    // fs4 wraps statvfs / GetDiskFreeSpaceExW, returning the space available to
+    // non-privileged users (matching the old f_bavail-based result) with no
+    // unsafe FFI on our side, so the crate keeps unsafe_code = "forbid".
+    fs4::available_space(&check_path)
+        .with_context(|| format!("Failed to get disk space for '{}'", path))
 }
 
 #[cfg(test)]
