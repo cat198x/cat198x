@@ -142,6 +142,19 @@ pub fn has_matching_file(conn: &Connection, dat_sha1: &str) -> Result<bool> {
     Ok(exists)
 }
 
+/// Does the inventory contain a file matching this CRC32 + size?
+///
+/// For DAT entries that carry only a CRC (no SHA1). Size is required alongside
+/// the CRC because CRC32 collides far more readily than SHA1.
+pub fn has_matching_crc_size(conn: &Connection, crc32: &str, size: i64) -> Result<bool> {
+    let exists: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM files WHERE crc32 = ?1 AND size = ?2)",
+        params![crc32, size],
+        |row| row.get(0),
+    )?;
+    Ok(exists)
+}
+
 /// Get a file by SHA1
 pub fn get_file_by_sha1(conn: &Connection, sha1: &str) -> Result<Option<File>> {
     let mut stmt = conn.prepare(

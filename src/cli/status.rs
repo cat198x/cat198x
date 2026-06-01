@@ -155,13 +155,11 @@ fn show_detailed_status(conn: &rusqlite::Connection, version_id: i64, mode: Merg
     println!("  Games:");
     for req in &requirements {
         // Count how many required ROMs we have
-        let have_count: usize = req.required_sha1s.iter()
-            .filter(|sha1| {
-                crate::db::files::has_matching_file(conn, sha1.as_str()).unwrap_or(false)
-            })
+        let have_count: usize = req.required_roms.iter()
+            .filter(|key| crate::db::dats::rom_present(conn, key).unwrap_or(false))
             .count();
 
-        let total = req.required_sha1s.len();
+        let total = req.required_roms.len();
 
         let status = if total == 0 || have_count == total {
             complete_count += 1;

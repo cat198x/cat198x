@@ -305,6 +305,37 @@ pub fn get_roms_for_version(conn: &Connection, version_id: i64) -> Result<Vec<(S
     Ok(roms)
 }
 
+/// How a required ROM is identified for "do we have it?" matching.
+///
+/// SHA1 is preferred — it's collision-proof and matches either the headered or
+/// the headerless form of a file. When a DAT entry carries no SHA1 we fall back
+/// to CRC32 + size (size guards CRC's higher collision rate). Entries with
+/// neither are unverifiable and are dropped from requirements.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum RomKey {
+    Sha1(String),
+    CrcSize(String, i64),
+}
+
+/// Build the match key for a DAT ROM, or `None` if it carries no usable hash.
+fn rom_key(rom: &DatRom) -> Option<RomKey> {
+    if let Some(sha1) = &rom.sha1 {
+        Some(RomKey::Sha1(sha1.clone()))
+    } else {
+        rom.crc32
+            .as_ref()
+            .map(|crc| RomKey::CrcSize(crc.clone(), rom.size))
+    }
+}
+
+/// Is a required ROM present in the file inventory?
+pub fn rom_present(conn: &Connection, key: &RomKey) -> Result<bool> {
+    match key {
+        RomKey::Sha1(sha1) => crate::db::files::has_matching_file(conn, sha1),
+        RomKey::CrcSize(crc, size) => crate::db::files::has_matching_crc_size(conn, crc, *size),
+    }
+}
+
 /// ROM requirement for a game, accounting for merge mode
 #[derive(Debug, Clone)]
 pub struct GameRomRequirements {
@@ -316,9 +347,9 @@ pub struct GameRomRequirements {
     pub is_bios: bool,
     /// Is this game a device set
     pub is_device: bool,
-    /// SHA1 hashes of ROMs required for this game to be complete
-    /// In split mode, this excludes ROMs that should come from parent
-    pub required_sha1s: Vec<String>,
+    /// Match keys of the ROMs required for this game to be complete.
+    /// In split mode, this excludes ROMs that should come from the parent.
+    pub required_roms: Vec<RomKey>,
     /// Number of ROMs with nodump status (excluded from completeness)
     pub nodump_count: usize,
 }
@@ -400,7 +431,7 @@ pub fn calculate_rom_requirements_with_options(
         let roms = game_roms.get(&game.id).cloned().unwrap_or_default();
         let is_clone = game.parent_name.is_some();
 
-        let mut required_sha1s = Vec::new();
+        let mut required_roms = Vec::new();
         let mut nodump_count = 0;
 
         for rom in &roms {
@@ -416,9 +447,10 @@ pub fn calculate_rom_requirements_with_options(
                 continue;
             }
 
-            // Need a SHA1 to match against our file inventory
-            if let Some(ref sha1) = rom.sha1 {
-                required_sha1s.push(sha1.clone());
+            // SHA1, or CRC32 + size for SHA1-less DAT entries; ROMs with no
+            // usable hash are unverifiable and dropped.
+            if let Some(key) = rom_key(rom) {
+                required_roms.push(key);
             }
         }
 
@@ -433,10 +465,10 @@ pub fn calculate_rom_requirements_with_options(
                             nodump_count += 1;
                             continue;
                         }
-                        if let Some(ref sha1) = rom.sha1 {
+                        if let Some(key) = rom_key(rom) {
                             // Avoid duplicates (merged ROMs)
-                            if !required_sha1s.contains(sha1) {
-                                required_sha1s.push(sha1.clone());
+                            if !required_roms.contains(&key) {
+                                required_roms.push(key);
                             }
                         }
                     }
@@ -449,7 +481,7 @@ pub fn calculate_rom_requirements_with_options(
             is_clone,
             is_bios: game.is_bios,
             is_device: game.is_device,
-            required_sha1s,
+            required_roms,
             nodump_count,
         });
     }
@@ -489,15 +521,15 @@ pub fn calculate_merge_mode_stats(
 ) -> Result<MergeModeStats> {
     let requirements = calculate_rom_requirements(conn, version_id, merge_mode, exclude_mechanical)?;
 
-    // Collect all unique SHA1s we need and count BIOS/device sets
-    let mut all_required: HashSet<String> = HashSet::new();
+    // Collect all unique required ROMs and count BIOS/device sets
+    let mut all_required: HashSet<RomKey> = HashSet::new();
     let mut total_nodump = 0;
     let mut bios_count = 0;
     let mut device_count = 0;
 
     for req in &requirements {
-        for sha1 in &req.required_sha1s {
-            all_required.insert(sha1.clone());
+        for key in &req.required_roms {
+            all_required.insert(key.clone());
         }
         total_nodump += req.nodump_count;
 
@@ -510,10 +542,10 @@ pub fn calculate_merge_mode_stats(
     }
 
     // Count how many we have
-    let mut have_sha1s: HashSet<String> = HashSet::new();
-    for sha1 in &all_required {
-        if crate::db::files::has_matching_file(conn, sha1)? {
-            have_sha1s.insert(sha1.clone());
+    let mut have: HashSet<RomKey> = HashSet::new();
+    for key in &all_required {
+        if rom_present(conn, key)? {
+            have.insert(key.clone());
         }
     }
 
@@ -523,17 +555,17 @@ pub fn calculate_merge_mode_stats(
     let mut missing = 0;
 
     for req in &requirements {
-        if req.required_sha1s.is_empty() {
+        if req.required_roms.is_empty() {
             // Game has no ROMs (or all nodump) - consider it complete
             complete += 1;
             continue;
         }
 
-        let have_count = req.required_sha1s.iter()
-            .filter(|sha1| have_sha1s.contains(*sha1))
+        let have_count = req.required_roms.iter()
+            .filter(|key| have.contains(*key))
             .count();
 
-        if have_count == req.required_sha1s.len() {
+        if have_count == req.required_roms.len() {
             complete += 1;
         } else if have_count > 0 {
             partial += 1;
@@ -548,7 +580,7 @@ pub fn calculate_merge_mode_stats(
         partial_games: partial,
         missing_games: missing,
         total_roms: all_required.len(),
-        have_roms: have_sha1s.len(),
+        have_roms: have.len(),
         nodump_roms: total_nodump,
         bios_sets: bios_count,
         device_sets: device_count,
@@ -569,6 +601,42 @@ mod tests {
         let coll_id = collections::create_collection(conn, "Nintendo - NES", "nointro").unwrap();
         let version_id = collections::add_version(conn, coll_id, "20231215", "/path/to.dat", true).unwrap();
         (coll_id, version_id)
+    }
+
+    #[test]
+    fn test_crc_only_dat_entry_is_required_and_matched_by_crc_size() {
+        let db = setup_db();
+        let conn = db.conn();
+        let (_, version_id) = create_test_collection_version(conn);
+        let node_id = create_node(conn, version_id, None, "root", "dat", "root").unwrap();
+        let game_id = create_game(conn, node_id, "crcgame", None, None, false, false, false).unwrap();
+        // A DAT entry with only a CRC32 and size — no SHA1. Previously dropped
+        // from requirements entirely, which let a game falsely read "complete".
+        create_rom(conn, game_id, "a.rom", 1024, None, None, Some("DEADBEEF"), "good", None).unwrap();
+
+        // It is now a requirement, keyed on CRC + size.
+        let reqs =
+            calculate_rom_requirements(conn, version_id, MergeMode::NonMerged, false).unwrap();
+        let game = reqs.iter().find(|r| r.game_name == "crcgame").unwrap();
+        assert_eq!(game.required_roms, vec![RomKey::CrcSize("DEADBEEF".to_string(), 1024)]);
+
+        // Not owned yet: counted as required, not as have.
+        let stats =
+            calculate_merge_mode_stats(conn, version_id, MergeMode::NonMerged, false).unwrap();
+        assert_eq!(stats.total_roms, 1);
+        assert_eq!(stats.have_roms, 0);
+        assert_eq!(stats.complete_games, 0);
+
+        // A file with a matching CRC + size makes it present (no SHA1 needed).
+        crate::db::files::upsert_file(conn, "SHA1_OF_FILE", None, None, Some("DEADBEEF"), 1024)
+            .unwrap();
+        let stats =
+            calculate_merge_mode_stats(conn, version_id, MergeMode::NonMerged, false).unwrap();
+        assert_eq!(stats.have_roms, 1);
+        assert_eq!(stats.complete_games, 1);
+
+        // Right CRC but wrong size must NOT match — size guards CRC collisions.
+        assert!(!crate::db::files::has_matching_crc_size(conn, "DEADBEEF", 2048).unwrap());
     }
 
     #[test]
@@ -871,13 +939,13 @@ mod tests {
         let clone = requirements.iter().find(|r| r.game_name == "mspacman").unwrap();
 
         // Parent needs 3 ROMs
-        assert_eq!(parent.required_sha1s.len(), 3);
+        assert_eq!(parent.required_roms.len(), 3);
         assert!(!parent.is_clone);
 
         // Clone ALSO needs 3 ROMs (including the shared prom.7f)
-        assert_eq!(clone.required_sha1s.len(), 3);
+        assert_eq!(clone.required_roms.len(), 3);
         assert!(clone.is_clone);
-        assert!(clone.required_sha1s.contains(&"SHA1_PROM".to_string()));
+        assert!(clone.required_roms.contains(&RomKey::Sha1("SHA1_PROM".to_string())));
     }
 
     #[test]
@@ -896,13 +964,13 @@ mod tests {
         let clone = requirements.iter().find(|r| r.game_name == "mspacman").unwrap();
 
         // Parent still needs all 3 ROMs
-        assert_eq!(parent.required_sha1s.len(), 3);
+        assert_eq!(parent.required_roms.len(), 3);
 
         // Clone only needs 2 ROMs (excluding inherited prom.7f with merge_tag)
-        assert_eq!(clone.required_sha1s.len(), 2);
-        assert!(clone.required_sha1s.contains(&"SHA1_MSPACMAN_5E".to_string()));
-        assert!(clone.required_sha1s.contains(&"SHA1_MSPACMAN_5F".to_string()));
-        assert!(!clone.required_sha1s.contains(&"SHA1_PROM".to_string()));
+        assert_eq!(clone.required_roms.len(), 2);
+        assert!(clone.required_roms.contains(&RomKey::Sha1("SHA1_MSPACMAN_5E".to_string())));
+        assert!(clone.required_roms.contains(&RomKey::Sha1("SHA1_MSPACMAN_5F".to_string())));
+        assert!(!clone.required_roms.contains(&RomKey::Sha1("SHA1_PROM".to_string())));
     }
 
     #[test]
@@ -922,12 +990,12 @@ mod tests {
 
         // Parent needs all ROMs including clone's unique ROMs
         // 3 parent ROMs + 2 unique clone ROMs = 5 (but SHA1_PROM is shared, so still 5)
-        assert_eq!(parent.required_sha1s.len(), 5);
-        assert!(parent.required_sha1s.contains(&"SHA1_PACMAN_5E".to_string()));
-        assert!(parent.required_sha1s.contains(&"SHA1_PACMAN_5F".to_string()));
-        assert!(parent.required_sha1s.contains(&"SHA1_PROM".to_string()));
-        assert!(parent.required_sha1s.contains(&"SHA1_MSPACMAN_5E".to_string()));
-        assert!(parent.required_sha1s.contains(&"SHA1_MSPACMAN_5F".to_string()));
+        assert_eq!(parent.required_roms.len(), 5);
+        assert!(parent.required_roms.contains(&RomKey::Sha1("SHA1_PACMAN_5E".to_string())));
+        assert!(parent.required_roms.contains(&RomKey::Sha1("SHA1_PACMAN_5F".to_string())));
+        assert!(parent.required_roms.contains(&RomKey::Sha1("SHA1_PROM".to_string())));
+        assert!(parent.required_roms.contains(&RomKey::Sha1("SHA1_MSPACMAN_5E".to_string())));
+        assert!(parent.required_roms.contains(&RomKey::Sha1("SHA1_MSPACMAN_5F".to_string())));
     }
 
     #[test]
@@ -950,7 +1018,7 @@ mod tests {
         let req = &requirements[0];
 
         // Only 2 required ROMs (nodump excluded)
-        assert_eq!(req.required_sha1s.len(), 2);
+        assert_eq!(req.required_roms.len(), 2);
         assert_eq!(req.nodump_count, 1);
     }
 
