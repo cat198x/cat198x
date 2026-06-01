@@ -1404,7 +1404,7 @@ mod tests {
         let file = File::open(&dest_path).unwrap();
         let mut archive = zip::ZipArchive::new(file).unwrap();
         let entry = archive.by_index(0).unwrap();
-        let datetime = entry.last_modified();
+        let datetime = entry.last_modified().expect("entry has a last-modified time");
         assert_eq!(datetime.year(), 1996);
         assert_eq!(datetime.month(), 12);
         assert_eq!(datetime.day(), 24);
@@ -1575,7 +1575,7 @@ mod tests {
         {
             let file = fs::File::create(&zip_path).unwrap();
             let mut zip = zip::ZipWriter::new(file);
-            let options = zip::write::FileOptions::default()
+            let options = zip::write::SimpleFileOptions::default()
                 .compression_method(zip::CompressionMethod::Stored);
             zip.start_file("test.rom", options).unwrap();
             std::io::Write::write_all(&mut zip, b"hello").unwrap();

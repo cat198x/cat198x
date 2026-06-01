@@ -840,7 +840,7 @@ fn create_test_zip(dir: &std::path::Path, zip_name: &str, entry_name: &str, cont
     let file = fs::File::create(&zip_path).expect("Failed to create ZIP file");
     let mut zip = zip::ZipWriter::new(file);
 
-    let options = zip::write::FileOptions::default()
+    let options = zip::write::SimpleFileOptions::default()
         .compression_method(zip::CompressionMethod::Stored);
     zip.start_file(entry_name, options).unwrap();
     zip.write_all(content).unwrap();

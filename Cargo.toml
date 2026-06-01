@@ -26,7 +26,7 @@ md-5 = "0.10"
 crc32fast = "1.4"
 
 # Archive support
-zip = "0.6"
+zip = "8"
 sevenz-rust = "0.5"
 
 # File system

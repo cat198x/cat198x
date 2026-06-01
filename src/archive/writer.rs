@@ -5,7 +5,7 @@ use sha1::Digest as Sha1Digest;
 use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::path::Path;
-use zip::write::FileOptions;
+use zip::write::SimpleFileOptions;
 use zip::CompressionMethod;
 use zip::DateTime;
 
@@ -15,7 +15,7 @@ pub struct ZipWriterOptions {
     /// Compression method to use
     pub compression: CompressionMethod,
     /// Compression level (0-9, higher = more compression)
-    pub compression_level: Option<i32>,
+    pub compression_level: Option<i64>,
 }
 
 impl Default for ZipWriterOptions {
@@ -75,7 +75,8 @@ impl ZipWriter {
         let sha1 = format!("{:X}", hash);
 
         // Build file options
-        let mut file_options = FileOptions::default().compression_method(self.options.compression);
+        let mut file_options =
+            SimpleFileOptions::default().compression_method(self.options.compression);
 
         if let Some(level) = self.options.compression_level {
             file_options = file_options.compression_level(Some(level));
@@ -107,7 +108,7 @@ impl ZipWriter {
     }
 
     /// Finalise the ZIP archive
-    pub fn finish(mut self) -> Result<std::path::PathBuf> {
+    pub fn finish(self) -> Result<std::path::PathBuf> {
         self.inner
             .finish()
             .context("Failed to finalise ZIP archive")?;
@@ -213,7 +214,7 @@ impl TorrentZipWriter {
         let mut zip = zip::ZipWriter::new(file);
 
         // TorrentZIP file options: DEFLATE level 9, fixed timestamp
-        let options = FileOptions::default()
+        let options = SimpleFileOptions::default()
             .compression_method(CompressionMethod::Deflated)
             .compression_level(Some(9))
             .last_modified_time(torrentzip_datetime());
@@ -602,7 +603,7 @@ mod tests {
         let mut archive = zip::ZipArchive::new(file).unwrap();
         let entry = archive.by_index(0).unwrap();
 
-        let datetime = entry.last_modified();
+        let datetime = entry.last_modified().expect("entry has a last-modified time");
         assert_eq!(datetime.year(), 1996);
         assert_eq!(datetime.month(), 12);
         assert_eq!(datetime.day(), 24);
