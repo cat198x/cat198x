@@ -339,7 +339,7 @@ pub fn move_to_quarantine(
     reason: db_quarantine::QuarantineReason,
     collection_name: Option<&str>,
     data_dir: Option<PathBuf>,
-) -> Result<()> {
+) -> Result<String> {
     let data_dir_path = get_data_dir(data_dir.clone())?;
     let quarantine_dir = data_dir_path.join("quarantine");
 
@@ -393,7 +393,9 @@ pub fn move_to_quarantine(
         collection_name,
     )?;
 
-    Ok(())
+    // Return the quarantine file path so the caller can journal the move and
+    // reverse it (restore to the original path) on rollback.
+    Ok(quarantine_path.to_string_lossy().into_owned())
 }
 
 /// Format bytes as human-readable string

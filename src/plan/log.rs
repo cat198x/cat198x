@@ -55,6 +55,13 @@ pub enum LoggedOperation {
         sources: Vec<String>,
         dest: String,
     },
+    /// Quarantine operation — a file moved into the quarantine store. Its
+    /// reverse is a Move back to `original_path`.
+    Quarantine {
+        original_path: String,
+        quarantine_path: String,
+        sha1: String,
+    },
 }
 
 /// An operation log containing all entries for an apply session
@@ -192,6 +199,46 @@ impl OperationLog {
         });
     }
 
+    /// Add a completed quarantine operation
+    pub fn log_quarantine(
+        &mut self,
+        operation_id: u64,
+        original_path: &str,
+        quarantine_path: &str,
+        sha1: &str,
+        success: bool,
+    ) {
+        let forward = LoggedOperation::Quarantine {
+            original_path: original_path.to_string(),
+            quarantine_path: quarantine_path.to_string(),
+            sha1: sha1.to_string(),
+        };
+
+        // Reverse of QUARANTINE is a MOVE back from the quarantine store, which
+        // rollback already knows how to execute (and verify).
+        let reverse = if success {
+            Some(LoggedOperation::Move {
+                source: quarantine_path.to_string(),
+                dest: original_path.to_string(),
+                sha1: sha1.to_string(),
+            })
+        } else {
+            None
+        };
+
+        self.entries.push(LogEntry {
+            operation_id,
+            executed_at: chrono_now(),
+            forward,
+            reverse,
+            status: if success {
+                LogStatus::Completed
+            } else {
+                LogStatus::Failed
+            },
+        });
+    }
+
     /// Mark the log as complete
     pub fn complete(&mut self) {
         self.completed_at = Some(chrono_now());
@@ -299,6 +346,23 @@ mod tests {
             }
             _ => panic!("Expected Move reverse operation"),
         }
+    }
+
+    #[test]
+    fn test_log_quarantine_reverses_with_move_back() {
+        let mut log = OperationLog::new("abc123".to_string());
+        log.log_quarantine(1, "/roms/game.rom", "/data/quarantine/h_game.rom", "HASH", true);
+
+        // The reverse of a quarantine restores the original from the store.
+        match log.entries[0].reverse.as_ref().unwrap() {
+            LoggedOperation::Move { source, dest, sha1 } => {
+                assert_eq!(source, "/data/quarantine/h_game.rom");
+                assert_eq!(dest, "/roms/game.rom");
+                assert_eq!(sha1, "HASH");
+            }
+            other => panic!("expected Move reverse, got {:?}", other),
+        }
+        assert_eq!(log.entries[0].status, LogStatus::Completed);
     }
 
     #[test]

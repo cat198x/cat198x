@@ -253,15 +253,25 @@ pub fn run(dry_run: bool, skip_space_check: bool, data_dir: Option<std::path::Pa
                 let reason_enum = QuarantineReason::parse(reason)
                     .unwrap_or(QuarantineReason::PathChanged);
 
-                match move_to_quarantine(
+                let result = move_to_quarantine(
                     path,
                     sha1,
                     *size as i64,
                     reason_enum,
                     collection.as_deref(),
                     data_dir.clone(),
-                ) {
-                    Ok(()) => {
+                );
+
+                // Journal the quarantine so it can be rolled back: its reverse
+                // is a Move restoring the original from the quarantine store.
+                // Without this, a quarantine was silently irreversible.
+                if let Some(ref mut log) = op_log {
+                    let quarantine_path = result.as_deref().unwrap_or("");
+                    log.log_quarantine(op.id, path, quarantine_path, sha1, result.is_ok());
+                }
+
+                match result {
+                    Ok(_) => {
                         op.status = OperationStatus::Completed;
                         success_count += 1;
                     }
@@ -505,6 +515,13 @@ pub fn run_rollback(dry_run: bool, continue_rollback: bool, data_dir: Option<std
                         error_count += 1;
                     }
                 }
+            }
+            LoggedOperation::Quarantine { .. } => {
+                // A quarantine never appears as a reverse op — its reverse is a
+                // Move (restore from quarantine), handled by the Move arm above.
+                // Present only for match exhaustiveness.
+                eprintln!("[{}] unexpected quarantine reverse op, skipping", operation_id);
+                error_count += 1;
             }
         }
     }
