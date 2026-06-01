@@ -1,5 +1,6 @@
 //! Plan generation and management
 
+pub mod executor;
 pub mod generator;
 pub mod log;
 pub mod types;
