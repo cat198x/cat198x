@@ -21,7 +21,7 @@ pub fn parse_dat_file(path: &Path) -> Result<(DatHeader, Vec<DatGameEntry>)> {
 /// Parse DAT content from a string
 pub fn parse_dat(xml: &str) -> Result<(DatHeader, Vec<DatGameEntry>)> {
     let mut reader = Reader::from_str(xml);
-    reader.trim_text(true);
+    reader.config_mut().trim_text(true);
 
     let mut header = DatHeader::default();
     let mut games = Vec::new();
@@ -68,7 +68,7 @@ fn parse_header(reader: &mut Reader<&[u8]>) -> Result<DatHeader> {
             }
             Ok(Event::Text(e)) => {
                 if let Some(ref tag) = current_tag {
-                    let text = e.unescape()?.to_string();
+                    let text = text_value(&e)?;
                     match tag.as_str() {
                         "name" => header.name = text,
                         "description" => header.description = Some(text),
@@ -117,9 +117,9 @@ fn parse_game(
     // Parse attributes
     for attr in start.attributes().flatten() {
         match attr.key.as_ref() {
-            b"name" => game.name = attr.unescape_value()?.to_string(),
-            b"cloneof" => game.clone_of = Some(attr.unescape_value()?.to_string()),
-            b"romof" => game.rom_of = Some(attr.unescape_value()?.to_string()),
+            b"name" => game.name = attr_value(&attr)?.to_string(),
+            b"cloneof" => game.clone_of = Some(attr_value(&attr)?.to_string()),
+            b"romof" => game.rom_of = Some(attr_value(&attr)?.to_string()),
             b"isbios" => game.is_bios = attr.value.as_ref() == b"yes",
             b"isdevice" => game.is_device = attr.value.as_ref() == b"yes",
             b"ismechanical" => game.is_mechanical = attr.value.as_ref() == b"yes",
@@ -150,7 +150,7 @@ fn parse_game(
             }
             Ok(Event::Text(e)) => {
                 if let Some(ref tag) = current_tag {
-                    let text = e.unescape()?.to_string();
+                    let text = text_value(&e)?;
                     if tag == "description" {
                         game.description = Some(text);
                     }
@@ -190,7 +190,7 @@ fn handle_game_child(
         b"device_ref" => {
             for attr in e.attributes().flatten() {
                 if attr.key.as_ref() == b"name" {
-                    game.devices.push(attr.unescape_value()?.to_string());
+                    game.devices.push(attr_value(&attr)?.to_string());
                 }
             }
             Ok(true)
@@ -213,18 +213,36 @@ fn parse_rom_attrs(e: &quick_xml::events::BytesStart) -> Result<DatRomEntry> {
 
     for attr in e.attributes().flatten() {
         match attr.key.as_ref() {
-            b"name" => rom.name = attr.unescape_value()?.to_string(),
-            b"size" => rom.size = attr.unescape_value()?.parse().unwrap_or(0),
-            b"crc" => rom.crc32 = Some(attr.unescape_value()?.to_uppercase()),
-            b"md5" => rom.md5 = Some(attr.unescape_value()?.to_uppercase()),
-            b"sha1" => rom.sha1 = Some(attr.unescape_value()?.to_uppercase()),
-            b"status" => rom.status = RomStatus::parse(&attr.unescape_value()?),
-            b"merge" => rom.merge = Some(attr.unescape_value()?.to_string()),
+            b"name" => rom.name = attr_value(&attr)?.to_string(),
+            b"size" => rom.size = attr_value(&attr)?.parse().unwrap_or(0),
+            b"crc" => rom.crc32 = Some(attr_value(&attr)?.to_uppercase()),
+            b"md5" => rom.md5 = Some(attr_value(&attr)?.to_uppercase()),
+            b"sha1" => rom.sha1 = Some(attr_value(&attr)?.to_uppercase()),
+            b"status" => rom.status = RomStatus::parse(&attr_value(&attr)?),
+            b"merge" => rom.merge = Some(attr_value(&attr)?.to_string()),
             _ => {}
         }
     }
 
     Ok(rom)
+}
+
+/// Decode and unescape an attribute value.
+///
+/// DAT files are UTF-8, so we decode the raw bytes directly and resolve the
+/// predefined XML entities — matching the behaviour of quick-xml's former
+/// `Attribute::unescape_value`, without the whitespace normalisation that
+/// `normalized_value` would now introduce.
+fn attr_value(attr: &quick_xml::events::attributes::Attribute) -> Result<String> {
+    let raw = std::str::from_utf8(&attr.value).context("attribute value is not valid UTF-8")?;
+    Ok(quick_xml::escape::unescape(raw)?.to_string())
+}
+
+/// Decode and unescape the text content of an element, matching quick-xml's
+/// former `BytesText::unescape`.
+fn text_value(e: &quick_xml::events::BytesText) -> Result<String> {
+    let decoded = e.decode()?;
+    Ok(quick_xml::escape::unescape(&decoded)?.to_string())
 }
 
 #[cfg(test)]
