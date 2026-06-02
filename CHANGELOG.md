@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0](https://github.com/cat198x/cat198x/releases/tag/v0.2.0) - 2026-06-01
+
+### Added
+
+- **`dat add --recursive`** — point it at a directory and every `.dat`/`.xml`
+  underneath is imported. Each DAT imports in its own transaction, so one
+  malformed file is reported and skipped without losing the batch; the database
+  is opened once for the whole run. `--collection` is ignored in recursive mode
+  (each DAT names its own collection).
+- **Textual scan progress off a terminal.** When stderr is not a TTY (piped,
+  redirected, backgrounded, CI), `scan` now logs `hashing N files`, periodic
+  `hashed X/Y (N%)` lines, and the database-write phase, where before it printed
+  nothing until the end. Interactive runs keep the live progress bar.
+
 ## [0.1.0](https://github.com/cat198x/cat198x/releases/tag/v0.1.0) - 2026-06-01
 
 Initial release of Cat198x — the 198x family's binary-asset cataloguing tool,
