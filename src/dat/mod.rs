@@ -9,6 +9,7 @@
 pub mod clrmamepro;
 pub mod parser;
 pub mod types;
+pub mod zxdb;
 
 pub use clrmamepro::*;
 pub use parser::*;

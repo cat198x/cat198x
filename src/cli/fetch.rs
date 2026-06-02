@@ -3,7 +3,7 @@
 use anyhow::{Context, Result};
 use std::fs::{self, File};
 use std::io::{BufWriter, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Known DAT sources
 #[derive(Debug, Clone)]
@@ -39,6 +39,18 @@ pub const KNOWN_SOURCES: &[DatSource] = &[
         description: "FinalBurn Neo DAT",
         url_pattern: "https://github.com/libretro/FBNeo/raw/master/dats/FinalBurn%20Neo%20(ClrMame%20Pro%20XML%2C%20Arcade%20only).dat",
         source_type: "mame",
+    },
+    DatSource {
+        name: "zxdb",
+        description: "ZXDB (Sinclair) — MD5 DAT generated from the canonical database; covers WoS + Spectrum Computing where TOSEC is thin",
+        url_pattern: "https://github.com/zxdb/ZXDB/raw/master/ZXDB_mysql.sql.zip",
+        source_type: "zxdb",
+    },
+    DatSource {
+        name: "tosec",
+        description: "TOSEC complete DAT pack (guided — no stable auto-URL; download then `dat add -r`)",
+        url_pattern: "https://www.tosecdev.org/downloads",
+        source_type: "manual",
     },
 ];
 
@@ -78,6 +90,13 @@ pub fn run(
                 )
             })?;
 
+        // Some sources have no stable auto-download URL (TOSEC's dated portal,
+        // No-Intro's auth wall) — guide the user instead of fetching a rot-prone
+        // link.
+        if source.source_type == "manual" {
+            return print_manual_source_help(source);
+        }
+
         // Determine output path
         let output_path = output.unwrap_or_else(|| {
             let data_dir = data_dir
@@ -104,9 +123,16 @@ pub fn run(
 
         download_dat(source.url_pattern, &output_path)?;
 
+        // ZXDB ships as a MySQL dump, not a DAT — generate a Logiqx DAT from it.
+        let import_path = if source.source_type == "zxdb" {
+            generate_zxdb_dat(&output_path)?
+        } else {
+            output_path
+        };
+
         println!();
         println!("To import this DAT, run:");
-        println!("  cat198x dat add {:?}", output_path);
+        println!("  cat198x dat add {:?}", import_path);
 
         return Ok(());
     }
@@ -197,13 +223,65 @@ fn download_dat(url: &str, output_path: &PathBuf) -> Result<()> {
 
     println!("Downloaded {} successfully", size_str);
 
-    // If it's a zip, offer to extract
-    if output_path.extension().is_some_and(|ext| ext == "zip") {
-        println!();
-        println!("Note: Downloaded file is a ZIP archive.");
-        println!("Extract it manually or use: unzip {:?}", output_path);
-    }
+    Ok(())
+}
 
+/// Generate a Logiqx DAT from a downloaded ZXDB MySQL dump zip.
+///
+/// Unzips the `.sql` dump beside the download, parses its `downloads` table,
+/// and writes `zxdb.dat` alongside. Returns the path to the generated DAT.
+fn generate_zxdb_dat(zip_path: &Path) -> Result<PathBuf> {
+    println!();
+    println!("Extracting ZXDB dump...");
+    let sql_path = unzip_first_sql(zip_path)?;
+
+    let dat_path = zip_path.with_file_name("zxdb.dat");
+    println!("Generating MD5 DAT from the ZXDB downloads table...");
+    let count = crate::dat::zxdb::generate_dat(&sql_path, &dat_path)?;
+    println!("Wrote {} verifiable entries to {:?}", count, dat_path);
+
+    Ok(dat_path)
+}
+
+/// Extract the first `.sql` entry from `zip_path` to a file beside it.
+fn unzip_first_sql(zip_path: &Path) -> Result<PathBuf> {
+    let file =
+        File::open(zip_path).with_context(|| format!("Failed to open ZXDB zip: {:?}", zip_path))?;
+    let mut archive = zip::ZipArchive::new(file).context("Failed to read ZXDB zip")?;
+
+    for i in 0..archive.len() {
+        let mut entry = archive.by_index(i)?;
+        if entry.name().to_ascii_lowercase().ends_with(".sql") {
+            // Basename only, to avoid zip-slip into a parent directory.
+            let name = Path::new(entry.name())
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "zxdb.sql".to_string());
+            let out_path = zip_path.with_file_name(name);
+            let mut out_file = File::create(&out_path)
+                .with_context(|| format!("Failed to create {:?}", out_path))?;
+            std::io::copy(&mut entry, &mut out_file).context("Failed to extract .sql")?;
+            return Ok(out_path);
+        }
+    }
+    anyhow::bail!("No .sql file found inside the ZXDB zip")
+}
+
+/// Print guidance for a source that can't be auto-downloaded (no stable URL or
+/// an auth wall), rather than fetching a link that will rot.
+fn print_manual_source_help(source: &DatSource) -> Result<()> {
+    println!(
+        "'{}' has no stable auto-download URL — fetch it manually:",
+        source.name
+    );
+    println!();
+    println!("  1. Open {}", source.url_pattern);
+    println!("  2. Download the latest complete DAT pack and unzip it");
+    println!("  3. Import the whole tree at once:");
+    println!("       cat198x dat add -r <unzipped-dat-pack-dir>");
+    println!();
+    println!("If you already have a direct URL to a single DAT file:");
+    println!("       cat198x dat fetch --url <URL>");
     Ok(())
 }
 
