@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.1](https://github.com/cat198x/cat198x/compare/v0.2.0...v0.2.1) - 2026-06-02
+
+### Other
+
+- *(release-plz)* enable git_only to bump versions from git tags
+
 ## [0.2.0](https://github.com/cat198x/cat198x/releases/tag/v0.2.0) - 2026-06-01
 
 ### Added
