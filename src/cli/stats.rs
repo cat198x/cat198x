@@ -4,6 +4,7 @@ use anyhow::Result;
 use std::path::PathBuf;
 
 use super::open_database;
+use crate::db::dats::{MergeMode, calculate_merge_mode_stats};
 use crate::db::{collections, files};
 
 /// Collection statistics
@@ -83,54 +84,21 @@ fn get_collection_stats(
     collection_name: &str,
     version_id: i64,
 ) -> Result<CollectionStats> {
-    // Count total games (excluding BIOS and devices)
-    let total_games: i64 = conn.query_row(
-        "SELECT COUNT(DISTINCT g.id)
-         FROM dat_games g
-         JOIN dat_nodes n ON g.node_id = n.id
-         WHERE n.version_id = ?
-         AND g.is_bios = 0
-         AND g.is_device = 0",
-        [version_id],
-        |row| row.get(0),
-    )?;
-
-    // Count total ROMs and their size (excluding nodump)
-    let (total_roms, total_size): (i64, i64) = conn.query_row(
-        "SELECT COUNT(*), COALESCE(SUM(r.size), 0)
-         FROM dat_roms r
-         JOIN dat_games g ON r.game_id = g.id
-         JOIN dat_nodes n ON g.node_id = n.id
-         WHERE n.version_id = ?
-         AND r.status != 'nodump'
-         AND g.is_bios = 0
-         AND g.is_device = 0",
-        [version_id],
-        |row| Ok((row.get(0)?, row.get(1)?)),
-    )?;
-
-    // Count ROMs we have (matched by SHA1)
-    let (have_roms, have_size): (i64, i64) = conn.query_row(
-        "SELECT COUNT(*), COALESCE(SUM(r.size), 0)
-         FROM dat_roms r
-         JOIN dat_games g ON r.game_id = g.id
-         JOIN dat_nodes n ON g.node_id = n.id
-         WHERE n.version_id = ?
-         AND r.status != 'nodump'
-         AND g.is_bios = 0
-         AND g.is_device = 0
-         AND r.sha1 IN (SELECT sha1 FROM files)",
-        [version_id],
-        |row| Ok((row.get(0)?, row.get(1)?)),
-    )?;
+    // Use the same merge-mode-aware computation as `status`, so the two
+    // commands can never disagree. The previous bespoke query here matched ROMs
+    // by SHA1 only (`r.sha1 IN (SELECT sha1 FROM files)`), so CRC-only DATs —
+    // all of FinalBurn Neo, older MAME — counted zero and read as 0% complete
+    // even when fully present. calculate_merge_mode_stats matches by SHA1 or
+    // CRC+size and counts unique ROMs.
+    let s = calculate_merge_mode_stats(conn, version_id, MergeMode::NonMerged, true)?;
 
     Ok(CollectionStats {
         name: collection_name.to_string(),
-        total_games,
-        total_roms,
-        have_roms,
-        total_size,
-        have_size,
+        total_games: s.total_games as i64,
+        total_roms: s.total_roms as i64,
+        have_roms: s.have_roms as i64,
+        total_size: s.total_bytes as i64,
+        have_size: s.have_bytes as i64,
     })
 }
 

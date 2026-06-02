@@ -351,6 +351,38 @@ pub fn rom_present(conn: &Connection, key: &RomKey) -> Result<bool> {
     }
 }
 
+/// Map each ROM match key in a version to its size, so byte totals can be
+/// summed over the same unique keys used for completeness counting.
+fn rom_sizes_by_key(conn: &Connection, version_id: i64) -> Result<HashMap<RomKey, i64>> {
+    let mut stmt = conn.prepare(
+        "SELECT r.sha1, r.crc32, r.size
+         FROM dat_roms r
+         JOIN dat_games g ON r.game_id = g.id
+         JOIN dat_nodes n ON g.node_id = n.id
+         WHERE n.version_id = ?",
+    )?;
+    let rows = stmt.query_map([version_id], |row| {
+        Ok((
+            row.get::<_, Option<String>>(0)?,
+            row.get::<_, Option<String>>(1)?,
+            row.get::<_, i64>(2)?,
+        ))
+    })?;
+    let mut map = HashMap::new();
+    for row in rows {
+        let (sha1, crc32, size) = row?;
+        let key = if let Some(s) = sha1 {
+            RomKey::Sha1(s)
+        } else if let Some(c) = crc32 {
+            RomKey::CrcSize(c, size)
+        } else {
+            continue;
+        };
+        map.entry(key).or_insert(size);
+    }
+    Ok(map)
+}
+
 /// ROM requirement for a game, accounting for merge mode
 #[derive(Debug, Clone)]
 pub struct GameRomRequirements {
@@ -525,6 +557,10 @@ pub struct MergeModeStats {
     pub bios_sets: usize,
     /// Number of device sets included in counts
     pub device_sets: usize,
+    /// Total size in bytes of the unique required ROMs
+    pub total_bytes: u64,
+    /// Total size in bytes of the required ROMs we have
+    pub have_bytes: u64,
 }
 
 /// Calculate merge-mode aware completeness statistics
@@ -565,6 +601,18 @@ pub fn calculate_merge_mode_stats(
         }
     }
 
+    // Byte totals over the same unique ROM keys, so size and count stay
+    // consistent and `stats` can report GB without a second matching path.
+    let size_by_key = rom_sizes_by_key(conn, version_id)?;
+    let sum_bytes = |keys: &HashSet<RomKey>| -> u64 {
+        keys.iter()
+            .filter_map(|k| size_by_key.get(k))
+            .map(|&s| s.max(0) as u64)
+            .sum()
+    };
+    let total_bytes = sum_bytes(&all_required);
+    let have_bytes = sum_bytes(&have);
+
     // Calculate per-game stats
     let mut complete = 0;
     let mut partial = 0;
@@ -602,6 +650,8 @@ pub fn calculate_merge_mode_stats(
         nodump_roms: total_nodump,
         bios_sets: bios_count,
         device_sets: device_count,
+        total_bytes,
+        have_bytes,
     })
 }
 
@@ -660,6 +710,10 @@ mod tests {
         assert_eq!(stats.total_roms, 1);
         assert_eq!(stats.have_roms, 0);
         assert_eq!(stats.complete_games, 0);
+        // Byte totals follow the same CRC-only key: required but not yet had.
+        // (This is what `stats` reports as GB; the SHA1-only path showed zero.)
+        assert_eq!(stats.total_bytes, 1024);
+        assert_eq!(stats.have_bytes, 0);
 
         // A file with a matching CRC + size makes it present (no SHA1 needed).
         crate::db::files::upsert_file(conn, "SHA1_OF_FILE", None, None, Some("DEADBEEF"), 1024)
@@ -668,6 +722,7 @@ mod tests {
             calculate_merge_mode_stats(conn, version_id, MergeMode::NonMerged, false).unwrap();
         assert_eq!(stats.have_roms, 1);
         assert_eq!(stats.complete_games, 1);
+        assert_eq!(stats.have_bytes, 1024);
 
         // Right CRC but wrong size must NOT match — size guards CRC collisions.
         assert!(!crate::db::files::has_matching_crc_size(conn, "DEADBEEF", 2048).unwrap());
