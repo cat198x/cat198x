@@ -103,11 +103,26 @@ pub fn create_rom(
     status: &str,
     merge_tag: Option<&str>,
 ) -> Result<i64> {
-    conn.execute(
-        "INSERT INTO dat_roms (game_id, name, size, sha1, md5, crc32, status, merge_tag)
+    // INSERT OR IGNORE because a game can legitimately list the same ROM name
+    // twice — MAME/FBNeo arcade and console DATs repeat a shared BIOS/merge ROM
+    // (identical name, size and CRC) across a parent and its merge entries. A
+    // plain INSERT trips the UNIQUE(game_id, name) constraint and aborts the
+    // whole DAT import (this silently dropped FBNeo's arcade.dat and msx.dat).
+    // The duplicate is the same file, so skipping it leaves completeness correct.
+    let inserted = conn.execute(
+        "INSERT OR IGNORE INTO dat_roms (game_id, name, size, sha1, md5, crc32, status, merge_tag)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
         params![game_id, name, size, sha1, md5, crc32, status, merge_tag],
     )?;
+    if inserted == 0 {
+        // Already present — return the existing row's id, not a stale
+        // last_insert_rowid from an unrelated prior insert.
+        return Ok(conn.query_row(
+            "SELECT id FROM dat_roms WHERE game_id = ? AND name = ?",
+            params![game_id, name],
+            |row| row.get(0),
+        )?);
+    }
     Ok(conn.last_insert_rowid())
 }
 
@@ -824,6 +839,39 @@ mod tests {
         .unwrap();
 
         assert!(rom_id > 0);
+    }
+
+    #[test]
+    fn test_create_rom_duplicate_name_is_deduped_not_an_error() {
+        // MAME/FBNeo DATs list a shared BIOS/merge ROM twice within a game
+        // (same name, size, CRC). Importing it must not abort on the
+        // UNIQUE(game_id, name) constraint — the duplicate is skipped and the
+        // existing row id returned, so the whole DAT still imports.
+        let db = setup_db();
+        let conn = db.conn();
+        let (_, version_id) = create_test_collection_version(conn);
+        let node_id = create_node(conn, version_id, None, "MSX", "root", "MSX").unwrap();
+        let game_id = create_game(conn, node_id, "zoom909k", None, None, false, false, false).unwrap();
+
+        let first = create_rom(
+            conn, game_id, "msx.rom", 32768, None, None, Some("a317e6b4"), "good", Some("msx.rom"),
+        )
+        .unwrap();
+        // Same name again (the merge duplicate) — must not error.
+        let second = create_rom(
+            conn, game_id, "msx.rom", 32768, None, None, Some("a317e6b4"), "good", None,
+        )
+        .unwrap();
+
+        assert_eq!(first, second, "duplicate should return the existing row id");
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM dat_roms WHERE game_id = ? AND name = ?",
+                params![game_id, "msx.rom"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1, "duplicate ROM name should be stored once");
     }
 
     #[test]
