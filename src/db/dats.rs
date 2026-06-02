@@ -324,11 +324,13 @@ pub fn get_roms_for_version(conn: &Connection, version_id: i64) -> Result<Vec<(S
 ///
 /// SHA1 is preferred — it's collision-proof and matches either the headered or
 /// the headerless form of a file. When a DAT entry carries no SHA1 we fall back
-/// to CRC32 + size (size guards CRC's higher collision rate). Entries with
-/// neither are unverifiable and are dropped from requirements.
+/// to MD5 (also collision-proof — the ZXDB-derived Spectrum DAT records only
+/// `file_md5`), then to CRC32 + size (size guards CRC's higher collision rate).
+/// Entries with none of these are unverifiable and are dropped from requirements.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum RomKey {
     Sha1(String),
+    Md5(String),
     CrcSize(String, i64),
 }
 
@@ -336,6 +338,8 @@ pub enum RomKey {
 fn rom_key(rom: &DatRom) -> Option<RomKey> {
     if let Some(sha1) = &rom.sha1 {
         Some(RomKey::Sha1(sha1.clone()))
+    } else if let Some(md5) = &rom.md5 {
+        Some(RomKey::Md5(md5.clone()))
     } else {
         rom.crc32
             .as_ref()
@@ -347,6 +351,7 @@ fn rom_key(rom: &DatRom) -> Option<RomKey> {
 pub fn rom_present(conn: &Connection, key: &RomKey) -> Result<bool> {
     match key {
         RomKey::Sha1(sha1) => crate::db::files::has_matching_file(conn, sha1),
+        RomKey::Md5(md5) => crate::db::files::has_matching_md5(conn, md5),
         RomKey::CrcSize(crc, size) => crate::db::files::has_matching_crc_size(conn, crc, *size),
     }
 }
@@ -355,7 +360,7 @@ pub fn rom_present(conn: &Connection, key: &RomKey) -> Result<bool> {
 /// summed over the same unique keys used for completeness counting.
 fn rom_sizes_by_key(conn: &Connection, version_id: i64) -> Result<HashMap<RomKey, i64>> {
     let mut stmt = conn.prepare(
-        "SELECT r.sha1, r.crc32, r.size
+        "SELECT r.sha1, r.md5, r.crc32, r.size
          FROM dat_roms r
          JOIN dat_games g ON r.game_id = g.id
          JOIN dat_nodes n ON g.node_id = n.id
@@ -365,14 +370,17 @@ fn rom_sizes_by_key(conn: &Connection, version_id: i64) -> Result<HashMap<RomKey
         Ok((
             row.get::<_, Option<String>>(0)?,
             row.get::<_, Option<String>>(1)?,
-            row.get::<_, i64>(2)?,
+            row.get::<_, Option<String>>(2)?,
+            row.get::<_, i64>(3)?,
         ))
     })?;
     let mut map = HashMap::new();
     for row in rows {
-        let (sha1, crc32, size) = row?;
+        let (sha1, md5, crc32, size) = row?;
         let key = if let Some(s) = sha1 {
             RomKey::Sha1(s)
+        } else if let Some(m) = md5 {
+            RomKey::Md5(m)
         } else if let Some(c) = crc32 {
             RomKey::CrcSize(c, size)
         } else {
@@ -906,15 +914,32 @@ mod tests {
         let conn = db.conn();
         let (_, version_id) = create_test_collection_version(conn);
         let node_id = create_node(conn, version_id, None, "MSX", "root", "MSX").unwrap();
-        let game_id = create_game(conn, node_id, "zoom909k", None, None, false, false, false).unwrap();
+        let game_id =
+            create_game(conn, node_id, "zoom909k", None, None, false, false, false).unwrap();
 
         let first = create_rom(
-            conn, game_id, "msx.rom", 32768, None, None, Some("a317e6b4"), "good", Some("msx.rom"),
+            conn,
+            game_id,
+            "msx.rom",
+            32768,
+            None,
+            None,
+            Some("a317e6b4"),
+            "good",
+            Some("msx.rom"),
         )
         .unwrap();
         // Same name again (the merge duplicate) — must not error.
         let second = create_rom(
-            conn, game_id, "msx.rom", 32768, None, None, Some("a317e6b4"), "good", None,
+            conn,
+            game_id,
+            "msx.rom",
+            32768,
+            None,
+            None,
+            Some("a317e6b4"),
+            "good",
+            None,
         )
         .unwrap();
 

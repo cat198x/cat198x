@@ -155,6 +155,21 @@ pub fn has_matching_crc_size(conn: &Connection, crc32: &str, size: i64) -> Resul
     Ok(exists)
 }
 
+/// Does the inventory contain a file matching this DAT MD5?
+///
+/// For DAT entries that carry an MD5 but no SHA1 — notably the ZXDB-derived
+/// Spectrum DAT, whose `downloads` table records only `file_md5`. MD5 is
+/// collision-resistant enough to key on directly, like SHA1, so no size guard
+/// is needed (unlike CRC32). Stored MD5s are uppercase, as are DAT MD5s.
+pub fn has_matching_md5(conn: &Connection, md5: &str) -> Result<bool> {
+    let exists: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM files WHERE md5 = ?1)",
+        [md5],
+        |row| row.get(0),
+    )?;
+    Ok(exists)
+}
+
 /// Get a file by SHA1
 pub fn get_file_by_sha1(conn: &Connection, sha1: &str) -> Result<Option<File>> {
     let mut stmt =
@@ -266,6 +281,34 @@ mod tests {
             "headerless DAT hash"
         );
         assert!(!has_matching_file(conn, "NOPE").unwrap(), "unknown hash");
+    }
+
+    #[test]
+    fn test_has_matching_md5() {
+        let db = setup_db();
+        let conn = db.conn();
+        // A file the scanner recorded with an MD5 (e.g. from a WoS/ZXDB-sourced
+        // scan whose only shared hash with the DAT is md5).
+        upsert_file(
+            conn,
+            "SOMESHA1",
+            None,
+            Some("85A60F488607FFB0DBAC35ECE7F3E79C"),
+            None,
+            14245,
+        )
+        .unwrap();
+
+        // A ZXDB-derived DAT carries only md5; it must find the file by md5
+        // alone, and an unrelated md5 must not.
+        assert!(
+            has_matching_md5(conn, "85A60F488607FFB0DBAC35ECE7F3E79C").unwrap(),
+            "md5-only DAT entry matches by md5"
+        );
+        assert!(
+            !has_matching_md5(conn, "00000000000000000000000000000000").unwrap(),
+            "unknown md5"
+        );
     }
 
     // === Source tests ===
