@@ -2,3 +2,6 @@
 **/*.rs.bk
 *.bin
 .DS_Store
+
+# Vale synced package
+.vale/
