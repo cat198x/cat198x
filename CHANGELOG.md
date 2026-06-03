@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0](https://github.com/cat198x/cat198x/compare/v0.2.1...v0.3.0) - 2026-06-03
+
+### Added
+
+- *(fetch)* generate a ZXDB DAT and add a guided TOSEC source
+- *(dat)* match ROMs by MD5 as a fallback hash key
+
+### Fixed
+
+- *(stats)* match ROMs by SHA1 or CRC so CRC-only sets aren't reported as 0%
+- *(dat)* dedupe duplicate ROM names within a game instead of aborting import
+
+### Other
+
+- *(scanner)* decode 7z via the system binary, falling back to Rust
+
 ## [0.2.1](https://github.com/cat198x/cat198x/compare/v0.2.0...v0.2.1) - 2026-06-02
 
 ### Other
