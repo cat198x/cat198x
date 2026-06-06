@@ -2236,3 +2236,57 @@ fn test_zip_output_format_plans_applies_and_converges() {
         "an already-correct archive should not be repacked again"
     );
 }
+
+/// The plan records a per-collection tally (feeding the by-set breakdown).
+#[test]
+fn test_plan_records_per_collection_breakdown() {
+    use cat198x::config::OutputFormat;
+    use cat198x::plan::generate_plan_filtered;
+    use cat198x::{DatCommands, SourceCommands};
+    use sha1::Digest;
+
+    let env = TestEnv::new();
+    env.init();
+
+    let content = b"hello";
+    let sha1_hash = cat198x::util::hex_upper(sha1::Sha1::digest(content));
+    let dat = create_matching_dat(env.temp_dir.path(), "Breakdown Test", &sha1_hash);
+    cli::dat::run(
+        DatCommands::Add {
+            path: dat,
+            collection: None,
+            recursive: false,
+        },
+        env.data_dir_opt(),
+    )
+    .unwrap();
+
+    fs::write(env.roms_dir.join("test.rom"), content).unwrap();
+    cli::source::run(
+        SourceCommands::Add {
+            path: env.roms_dir.clone(),
+        },
+        env.data_dir_opt(),
+    )
+    .unwrap();
+    cli::scan::run(None, false, env.data_dir_opt()).unwrap();
+
+    let dest = env.temp_dir.path().join("out");
+    let db = env.db();
+    let plan = generate_plan_filtered(
+        db.conn(),
+        None,
+        Some(&dest.to_string_lossy()),
+        OutputFormat::Loose,
+    )
+    .unwrap();
+
+    let stat = plan
+        .per_collection
+        .iter()
+        .find(|c| c.name == "Breakdown Test")
+        .expect("collection should appear in the per-collection breakdown");
+    assert_eq!(stat.to_write, 1, "one ROM to copy");
+    assert_eq!(stat.already_correct, 0);
+    assert!(stat.bytes > 0);
+}

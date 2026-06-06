@@ -80,6 +80,9 @@ pub fn run(dat_filter: Option<String>, data_dir: Option<PathBuf>) -> Result<()> 
         "  {} bytes to transfer",
         format_bytes(plan.summary.total_bytes)
     );
+
+    print_breakdown_by_set(&plan);
+
     println!();
     println!("Plan saved to: {}", plan_path.display());
     println!();
@@ -87,6 +90,34 @@ pub fn run(dat_filter: Option<String>, data_dir: Option<PathBuf>) -> Result<()> 
     println!("  cat198x apply");
 
     Ok(())
+}
+
+/// Print a breakdown of pending operations rolled up by set (the top segment of
+/// each collection's library path), so a large plan is reviewable at a glance.
+/// Only sets with operations to perform are shown.
+fn print_breakdown_by_set(plan: &Plan) {
+    use std::collections::BTreeMap;
+
+    let mut by_set: BTreeMap<&str, (usize, u64)> = BTreeMap::new();
+    for c in &plan.per_collection {
+        if c.to_write == 0 {
+            continue;
+        }
+        let set = c.node_path.split('/').next().unwrap_or(&c.node_path);
+        let entry = by_set.entry(set).or_default();
+        entry.0 += c.to_write;
+        entry.1 += c.bytes;
+    }
+
+    if by_set.is_empty() {
+        return;
+    }
+
+    println!();
+    println!("By set (operations pending):");
+    for (set, (count, bytes)) in &by_set {
+        println!("  {:30}  {} to write, {}", set, count, format_bytes(*bytes));
+    }
 }
 
 /// Load the most recent plan from disk

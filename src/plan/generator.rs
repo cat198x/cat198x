@@ -6,7 +6,7 @@ use sha2::{Digest as Sha2Digest, Sha256};
 use std::collections::HashMap;
 use std::path::Path;
 
-use super::{Plan, SourceRef};
+use super::{CollectionPlanStat, Plan, SourceRef};
 use crate::config::OutputFormat;
 use crate::db::{collections, config as db_config, dats};
 use crate::filter::{RomCandidate, parse_game_name, select_preferred};
@@ -130,6 +130,8 @@ pub fn generate_plan_filtered(
         );
 
         let mut already_correct = 0;
+        let mut to_write = 0;
+        let mut bytes = 0u64;
 
         match archive_format_tag(format) {
             None => {
@@ -141,7 +143,6 @@ pub fn generate_plan_filtered(
                     *roms_per_game.entry(m.game_name.clone()).or_insert(0) += 1;
                 }
 
-                let mut copy_count = 0;
                 for m in matches {
                     let multi_rom = roms_per_game.get(&m.game_name).copied().unwrap_or(1) > 1;
                     let dest = build_dest_path(&dest_root, &m.game_name, &m.rom_name, multi_rom);
@@ -152,6 +153,7 @@ pub fn generate_plan_filtered(
                     }
 
                     let full_source = format!("{}/{}", m.source_root, m.source_path);
+                    bytes += m.size as u64;
                     plan.add_copy(
                         SourceRef {
                             path: full_source,
@@ -162,11 +164,11 @@ pub fn generate_plan_filtered(
                         dest,
                         m.size as u64,
                     );
-                    copy_count += 1;
+                    to_write += 1;
                 }
                 println!(
                     "  {} already correct, {} to copy",
-                    already_correct, copy_count
+                    already_correct, to_write
                 );
             }
             Some(tag) => {
@@ -174,7 +176,6 @@ pub fn generate_plan_filtered(
                 // with entries carrying canonical ROM names.
                 let games = group_for_archive(matches);
 
-                let mut repack_count = 0;
                 for game in games {
                     let dest = format!("{}/{}.zip", dest_root.trim_end_matches('/'), game.name);
 
@@ -183,17 +184,25 @@ pub fn generate_plan_filtered(
                         continue;
                     }
 
+                    bytes += game.size;
                     plan.add_repack(game.sources, dest, tag.to_string(), game.size);
-                    repack_count += 1;
+                    to_write += 1;
                 }
                 println!(
                     "  {} ROMs already archived, {} archive(s) to build",
-                    already_correct, repack_count
+                    already_correct, to_write
                 );
             }
         }
 
         plan.summary.already_correct += already_correct;
+        plan.per_collection.push(CollectionPlanStat {
+            name: collection.name.clone(),
+            node_path: hierarchy,
+            to_write,
+            already_correct,
+            bytes,
+        });
     }
 
     // Never skip silently: report collections left out because no destination

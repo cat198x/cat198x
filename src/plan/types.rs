@@ -17,6 +17,20 @@ pub struct Plan {
     /// (not part of the persisted plan) — surfaced to the user after planning.
     #[serde(skip)]
     pub skipped_no_dest: Vec<String>,
+    /// Per-collection operation tallies, for a reviewable breakdown. Transient.
+    #[serde(skip)]
+    pub per_collection: Vec<CollectionPlanStat>,
+}
+
+/// A single collection's contribution to a plan, for the by-group breakdown.
+#[derive(Debug, Clone, Default)]
+pub struct CollectionPlanStat {
+    pub name: String,
+    /// The collection's library path (carries the set as its top segment).
+    pub node_path: String,
+    pub to_write: usize,
+    pub already_correct: usize,
+    pub bytes: u64,
 }
 
 /// Summary of planned operations
@@ -116,6 +130,7 @@ impl Plan {
             operations: Vec::new(),
             summary: PlanSummary::default(),
             skipped_no_dest: Vec::new(),
+            per_collection: Vec::new(),
         }
     }
 
