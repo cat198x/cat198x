@@ -48,6 +48,13 @@ pub enum DatCommands {
         all_versions: bool,
     },
 
+    /// Re-point registrations whose DAT file has moved, by finding a same-named
+    /// DAT under the given directory
+    Relink {
+        /// Directory to search for the moved DAT files (searched recursively)
+        dir: std::path::PathBuf,
+    },
+
     /// List imported DAT files
     List {
         /// Show all versions, not just active

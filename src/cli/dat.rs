@@ -1,6 +1,7 @@
 //! DAT file management commands
 
 use anyhow::{Context, Result};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
 
@@ -28,6 +29,7 @@ pub fn run(cmd: DatCommands, data_dir: Option<PathBuf>) -> Result<()> {
             target,
             all_versions,
         } => remove_dat(&target, all_versions, data_dir),
+        DatCommands::Relink { dir } => relink_dats(&dir, data_dir),
         DatCommands::List { all } => list_dats(all, data_dir),
         DatCommands::Activate {
             collection,
@@ -360,6 +362,89 @@ fn collect_dat_files(dir: &Path) -> Vec<PathBuf> {
         .collect();
     files.sort();
     files
+}
+
+/// Re-point registrations whose recorded DAT file no longer exists, by finding a
+/// same-named DAT under `search_dir`. Matching is by file name, which stays
+/// stable when a DAT is moved or a pack is reorganised (e.g. Downloads →
+/// DatRoot). A unique match updates the recorded path; an absent or ambiguous
+/// one is reported and left untouched. Versions whose file is still present are
+/// skipped.
+fn relink_dats(search_dir: &Path, data_dir: Option<PathBuf>) -> Result<()> {
+    if !search_dir.is_dir() {
+        anyhow::bail!("--relink expects a directory: {}", search_dir.display());
+    }
+
+    // Index candidate DATs under search_dir by file name.
+    let mut by_name: HashMap<String, Vec<PathBuf>> = HashMap::new();
+    for file in collect_dat_files(search_dir) {
+        if let Some(name) = file.file_name().and_then(|n| n.to_str()) {
+            by_name.entry(name.to_string()).or_default().push(file);
+        }
+    }
+
+    let db = open_database(data_dir)?;
+    let conn = db.conn();
+
+    let mut relinked = 0usize;
+    let mut still_missing = 0usize;
+    let mut ambiguous = 0usize;
+
+    for collection in collections::list_collections(conn)? {
+        for version in collections::list_versions(conn, collection.id)? {
+            // Only act on registrations whose recorded file is gone.
+            if Path::new(&version.dat_path).is_file() {
+                continue;
+            }
+
+            let basename = Path::new(&version.dat_path)
+                .file_name()
+                .and_then(|n| n.to_str());
+
+            match basename.and_then(|n| by_name.get(n)).map(Vec::as_slice) {
+                Some([found]) => {
+                    let new_path = found.to_string_lossy();
+                    collections::update_dat_path(conn, version.id, &new_path)?;
+                    println!(
+                        "  relinked  {} v{}  ->  {}",
+                        collection.name, version.version, new_path
+                    );
+                    relinked += 1;
+                }
+                Some(multiple) => {
+                    println!(
+                        "  ambiguous {} v{}: {} files named '{}' under the search dir",
+                        collection.name,
+                        version.version,
+                        multiple.len(),
+                        basename.unwrap_or_default()
+                    );
+                    ambiguous += 1;
+                }
+                None => {
+                    println!(
+                        "  missing   {} v{}: no '{}' under {}",
+                        collection.name,
+                        version.version,
+                        basename.unwrap_or("?"),
+                        search_dir.display()
+                    );
+                    still_missing += 1;
+                }
+            }
+        }
+    }
+
+    println!();
+    if relinked == 0 && still_missing == 0 && ambiguous == 0 {
+        println!("All registered DAT files are present; nothing to relink.");
+    } else {
+        println!(
+            "Relinked {}, {} still missing, {} ambiguous.",
+            relinked, still_missing, ambiguous
+        );
+    }
+    Ok(())
 }
 
 fn remove_dat(target: &str, all_versions: bool, data_dir: Option<PathBuf>) -> Result<()> {

@@ -125,6 +125,16 @@ pub fn get_active_version(
     }
 }
 
+/// Update the on-disk DAT path recorded for a version (used by `dat relink`
+/// when a DAT file has moved). Returns true if a row was updated.
+pub fn update_dat_path(conn: &Connection, version_id: i64, new_path: &str) -> Result<bool> {
+    let changed = conn.execute(
+        "UPDATE collection_versions SET dat_path = ? WHERE id = ?",
+        params![new_path, version_id],
+    )?;
+    Ok(changed > 0)
+}
+
 /// Activate a specific version
 pub fn activate_version(conn: &Connection, collection_id: i64, version: &str) -> Result<bool> {
     // Deactivate all versions

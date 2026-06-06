@@ -2078,3 +2078,63 @@ fn test_recursive_add_plans_into_hierarchical_destination() {
         plan_json
     );
 }
+
+/// `dat relink` re-points a registration whose DAT file has moved to a
+/// same-named DAT found under the search directory.
+#[test]
+fn test_dat_relink_repoints_moved_dat() {
+    use cat198x::DatCommands;
+    use cat198x::db::collections;
+
+    let env = TestEnv::new();
+    env.init();
+
+    // Import a DAT from its original location.
+    let orig_dir = env.temp_dir.path().join("orig");
+    fs::create_dir_all(&orig_dir).unwrap();
+    let dat = create_matching_dat(&orig_dir, "Relink Test", "ABC123");
+    cli::dat::run(
+        DatCommands::Add {
+            path: dat.clone(),
+            collection: None,
+            recursive: false,
+        },
+        env.data_dir_opt(),
+    )
+    .unwrap();
+
+    // Move the DAT elsewhere, leaving the recorded path dangling.
+    let moved_dir = env.temp_dir.path().join("moved/sub");
+    fs::create_dir_all(&moved_dir).unwrap();
+    let new_dat = moved_dir.join("Relink Test.dat");
+    fs::rename(&dat, &new_dat).unwrap();
+
+    // Relink against the new tree.
+    cli::dat::run(
+        DatCommands::Relink {
+            dir: env.temp_dir.path().join("moved"),
+        },
+        env.data_dir_opt(),
+    )
+    .unwrap();
+
+    // The recorded path now resolves to the moved file.
+    let db = env.db();
+    let conn = db.conn();
+    let coll = collections::get_collection_by_name(conn, "Relink Test")
+        .unwrap()
+        .expect("collection exists");
+    let version = collections::get_active_version(conn, coll.id)
+        .unwrap()
+        .expect("active version");
+    assert!(
+        std::path::Path::new(&version.dat_path).is_file(),
+        "relinked dat_path should point at an existing file: {}",
+        version.dat_path
+    );
+    assert!(
+        version.dat_path.ends_with("Relink Test.dat") && version.dat_path.contains("moved"),
+        "dat_path should be the moved file, was: {}",
+        version.dat_path
+    );
+}
