@@ -37,6 +37,20 @@ pub fn run(dat_filter: Option<String>, data_dir: Option<PathBuf>) -> Result<()> 
         file_config.default_output_format,
     )?;
 
+    let data_dir = get_data_dir(data_dir)?;
+
+    // Write the skipped-collection list (no destination resolved) for review,
+    // even when there are no operations to perform.
+    if !plan.skipped_no_dest.is_empty() {
+        let skipped_path = data_dir.join("skipped-no-destination.txt");
+        let mut names = plan.skipped_no_dest.clone();
+        names.sort();
+        names.push(String::new()); // trailing newline
+        fs::write(&skipped_path, names.join("\n"))
+            .context("Failed to write skipped-collection list")?;
+        println!("  Full list written to: {}", skipped_path.display());
+    }
+
     if plan.is_empty() {
         println!();
         println!("No operations needed.");
@@ -44,7 +58,6 @@ pub fn run(dat_filter: Option<String>, data_dir: Option<PathBuf>) -> Result<()> 
     }
 
     // Save the plan
-    let data_dir = get_data_dir(data_dir)?;
     let plans_dir = data_dir.join("objects/plans");
     fs::create_dir_all(&plans_dir).context("Failed to create plans directory")?;
 

@@ -63,7 +63,7 @@ pub fn generate_plan_filtered(
 
     let mut planned_any = false;
     let mut filter_matched_any = false;
-    let mut skipped_no_dest = 0usize;
+    let mut skipped_no_dest: Vec<String> = Vec::new();
 
     for collection in &all_collections {
         if let Some(pattern) = dat_filter
@@ -90,8 +90,8 @@ pub fn generate_plan_filtered(
         let dest_root = match resolve_dest_root(explicit, default_dest, &hierarchy) {
             Some(root) => root,
             None => {
-                // No destination resolved — counted and reported, never silent.
-                skipped_no_dest += 1;
+                // No destination resolved — recorded and reported, never silent.
+                skipped_no_dest.push(collection.name.clone());
                 continue;
             }
         };
@@ -197,25 +197,27 @@ pub fn generate_plan_filtered(
     }
 
     // Never skip silently: report collections left out because no destination
-    // could be resolved, and how to include them.
-    if skipped_no_dest > 0 {
+    // could be resolved, and how to include them. The full list rides on the
+    // plan so the caller can write it out for review.
+    if !skipped_no_dest.is_empty() {
         println!();
         println!(
             "{} collection(s) skipped — no destination resolved.",
-            skipped_no_dest
+            skipped_no_dest.len()
         );
         println!("  Set one per collection:  cat198x config set <collection> dest_path <path>");
-        println!("  or library-wide:         default_dest_path in config.toml");
+        println!("  or library-wide:         cat198x config set-default dest_path <path>");
     }
 
     if let Some(pattern) = dat_filter
         && !filter_matched_any
     {
         println!("No collections match the filter: {}", pattern);
-    } else if !planned_any && skipped_no_dest == 0 {
+    } else if !planned_any && skipped_no_dest.is_empty() {
         println!("No collections with an active version to plan.");
     }
 
+    plan.skipped_no_dest = skipped_no_dest;
     Ok(plan)
 }
 
@@ -620,6 +622,21 @@ mod tests {
 
         let plan = generate_plan(conn).unwrap();
         assert!(plan.is_empty());
+    }
+
+    #[test]
+    fn plan_records_collections_skipped_for_no_destination() {
+        let db = setup_db();
+        let conn = db.conn();
+
+        // A collection with an active version but no dest_path and no default.
+        let cid = collections::create_collection(conn, "No Dest Coll", "tosec").unwrap();
+        let vid = collections::add_version(conn, cid, "1.0", "/tmp/x.dat", true).unwrap();
+        dats::create_node(conn, vid, None, "No Dest Coll", "dat", "No Dest Coll").unwrap();
+
+        let plan = generate_plan_filtered(conn, None, None, OutputFormat::Loose).unwrap();
+        assert!(plan.is_empty(), "no destination → no operations");
+        assert_eq!(plan.skipped_no_dest, vec!["No Dest Coll".to_string()]);
     }
 
     #[test]

@@ -13,6 +13,10 @@ pub struct Plan {
     pub operations: Vec<Operation>,
     /// Summary statistics
     pub summary: PlanSummary,
+    /// Collections skipped because no destination could be resolved. Transient
+    /// (not part of the persisted plan) — surfaced to the user after planning.
+    #[serde(skip)]
+    pub skipped_no_dest: Vec<String>,
 }
 
 /// Summary of planned operations
@@ -111,6 +115,7 @@ impl Plan {
             created_at: now,
             operations: Vec::new(),
             summary: PlanSummary::default(),
+            skipped_no_dest: Vec::new(),
         }
     }
 
