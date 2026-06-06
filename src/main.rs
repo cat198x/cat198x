@@ -78,7 +78,12 @@ enum Commands {
     },
 
     /// Show overall statistics across all collections
-    Stats,
+    Stats {
+        /// Roll collections up by their leading name segment (e.g. all
+        /// "Sinclair ZX Spectrum - *" as one row)
+        #[arg(short, long)]
+        group: bool,
+    },
 
     /// Configure collection settings (destination path, output format)
     #[command(subcommand)]
@@ -194,7 +199,7 @@ fn main() -> Result<()> {
             detailed,
             merge_mode,
         } => status::run(collection, detailed, merge_mode, cli.data_dir),
-        Commands::Stats => stats_cmd::run(cli.data_dir),
+        Commands::Stats { group } => stats_cmd::run(group, cli.data_dir),
         Commands::Config(cmd) => config_cmd::run(cmd, cli.data_dir),
         Commands::Plan { dat } => plan_cmd::run(dat, cli.data_dir),
         Commands::Apply {
