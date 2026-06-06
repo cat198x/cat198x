@@ -7,6 +7,7 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use super::{Plan, SourceRef};
+use crate::config::OutputFormat;
 use crate::db::{collections, config as db_config, dats};
 use crate::filter::{RomCandidate, parse_game_name, select_preferred};
 
@@ -36,7 +37,7 @@ pub struct MatchedRom {
 /// If `dat_filter` is provided, only collections matching the glob pattern
 /// will be included in the plan.
 pub fn generate_plan(conn: &Connection) -> Result<Plan> {
-    generate_plan_filtered(conn, None, None)
+    generate_plan_filtered(conn, None, None, OutputFormat::Loose)
 }
 
 /// Generate a plan with optional collection name filtering
@@ -49,6 +50,7 @@ pub fn generate_plan_filtered(
     conn: &Connection,
     dat_filter: Option<&str>,
     default_dest: Option<&str>,
+    default_format: OutputFormat,
 ) -> Result<Plan> {
     // Calculate state hash
     let state_hash = compute_state_hash(conn)?;
@@ -119,49 +121,79 @@ pub fn generate_plan_filtered(
             _ => matches,
         };
 
+        // The effective output format: per-collection setting, else the
+        // library-wide default. Loose copies each ROM into place; zip/torrentzip
+        // packs each game into one archive.
+        let format = resolve_output_format(
+            cfg.as_ref().and_then(|c| c.output_format.as_deref()),
+            default_format,
+        );
+
         let mut already_correct = 0;
-        let mut copy_count = 0;
 
-        // ROMs per game: a single-ROM game is laid out flat (dest/rom), a
-        // multi-ROM game gets its own folder (dest/game/rom). Counted up front
-        // so the by-value loop below can still move each match into the plan.
-        let mut roms_per_game: HashMap<String, usize> = HashMap::new();
-        for m in &matches {
-            *roms_per_game.entry(m.game_name.clone()).or_insert(0) += 1;
-        }
+        match archive_format_tag(format) {
+            None => {
+                // LOOSE: one file per ROM. A single-ROM game stays flat
+                // (dest/rom); a multi-ROM game gets a folder (dest/game/rom),
+                // so count ROMs per game up front.
+                let mut roms_per_game: HashMap<String, usize> = HashMap::new();
+                for m in &matches {
+                    *roms_per_game.entry(m.game_name.clone()).or_insert(0) += 1;
+                }
 
-        for m in matches {
-            let multi_rom = roms_per_game.get(&m.game_name).copied().unwrap_or(1) > 1;
-            let dest = build_dest_path(&dest_root, &m.game_name, &m.rom_name, multi_rom);
+                let mut copy_count = 0;
+                for m in matches {
+                    let multi_rom = roms_per_game.get(&m.game_name).copied().unwrap_or(1) > 1;
+                    let dest = build_dest_path(&dest_root, &m.game_name, &m.rom_name, multi_rom);
 
-            // Check if file already exists at destination with correct hash
-            if is_file_correct_at_dest(&dest, &m.sha1)? {
-                already_correct += 1;
-                continue;
+                    if is_file_correct_at_dest(&dest, &m.sha1)? {
+                        already_correct += 1;
+                        continue;
+                    }
+
+                    let full_source = format!("{}/{}", m.source_root, m.source_path);
+                    plan.add_copy(
+                        SourceRef {
+                            path: full_source,
+                            archive_path: m.archive_path,
+                            sha1: m.sha1,
+                            entry_name: None,
+                        },
+                        dest,
+                        m.size as u64,
+                    );
+                    copy_count += 1;
+                }
+                println!(
+                    "  {} already correct, {} to copy",
+                    already_correct, copy_count
+                );
             }
+            Some(tag) => {
+                // ARCHIVE: one archive per game, named <dest_root>/<game>.zip,
+                // with entries carrying canonical ROM names.
+                let games = group_for_archive(matches);
 
-            // Build full source path
-            let full_source = format!("{}/{}", m.source_root, m.source_path);
+                let mut repack_count = 0;
+                for game in games {
+                    let dest = format!("{}/{}.zip", dest_root.trim_end_matches('/'), game.name);
 
-            plan.add_copy(
-                SourceRef {
-                    path: full_source,
-                    archive_path: m.archive_path,
-                    sha1: m.sha1,
-                    entry_name: None,
-                },
-                dest,
-                m.size as u64,
-            );
-            copy_count += 1;
+                    if is_archive_correct_at_dest(&dest, &game.expected)? {
+                        already_correct += game.expected.len();
+                        continue;
+                    }
+
+                    plan.add_repack(game.sources, dest, tag.to_string(), game.size);
+                    repack_count += 1;
+                }
+                println!(
+                    "  {} ROMs already archived, {} archive(s) to build",
+                    already_correct, repack_count
+                );
+            }
         }
 
         plan.summary.already_correct += already_correct;
-
-        println!(
-            "  {} already correct, {} to copy",
-            already_correct, copy_count
-        );
     }
 
     // Never skip silently: report collections left out because no destination
@@ -239,6 +271,89 @@ fn find_matched_roms(
 }
 
 /// Build destination path for a ROM
+/// The effective output format: an explicit per-collection setting wins,
+/// otherwise the library-wide default. An unrecognised string falls back to the
+/// default rather than failing the whole plan.
+fn resolve_output_format(explicit: Option<&str>, default: OutputFormat) -> OutputFormat {
+    match explicit.map(str::to_ascii_lowercase).as_deref() {
+        Some("loose") => OutputFormat::Loose,
+        Some("zip") => OutputFormat::Zip,
+        Some("torrentzip") => OutputFormat::TorrentZip,
+        _ => default,
+    }
+}
+
+/// The repack format tag for an archive format, or `None` for loose (which is
+/// copied, not repacked).
+fn archive_format_tag(format: OutputFormat) -> Option<&'static str> {
+    match format {
+        OutputFormat::Loose => None,
+        OutputFormat::Zip => Some("zip"),
+        OutputFormat::TorrentZip => Some("torrentzip"),
+    }
+}
+
+/// A game's ROMs gathered for a single archive.
+struct ArchiveGame {
+    name: String,
+    sources: Vec<SourceRef>,
+    /// (entry name, sha1) pairs, used to check an existing archive is correct.
+    expected: Vec<(String, String)>,
+    size: u64,
+}
+
+/// Group matched ROMs by game for archive output — one [`ArchiveGame`] per game,
+/// sorted by name for stable plans. Each source carries its canonical ROM name
+/// as the archive entry name.
+fn group_for_archive(matches: Vec<MatchedRom>) -> Vec<ArchiveGame> {
+    use std::collections::BTreeMap;
+
+    let mut games: BTreeMap<String, ArchiveGame> = BTreeMap::new();
+    for m in matches {
+        let game = games
+            .entry(m.game_name.clone())
+            .or_insert_with(|| ArchiveGame {
+                name: m.game_name.clone(),
+                sources: Vec::new(),
+                expected: Vec::new(),
+                size: 0,
+            });
+        game.expected.push((m.rom_name.clone(), m.sha1.clone()));
+        game.size += m.size as u64;
+        game.sources.push(SourceRef {
+            path: format!("{}/{}", m.source_root, m.source_path),
+            archive_path: m.archive_path,
+            sha1: m.sha1,
+            entry_name: Some(m.rom_name),
+        });
+    }
+    games.into_values().collect()
+}
+
+/// Whether the archive at `dest` already holds exactly the expected entries
+/// (matching names and SHA1s). A missing or differing archive returns `false`,
+/// so it is (re)built; an exact match is left untouched, keeping re-runs no-ops.
+fn is_archive_correct_at_dest(dest: &str, expected: &[(String, String)]) -> Result<bool> {
+    let path = Path::new(dest);
+    if !path.exists() {
+        return Ok(false);
+    }
+
+    let mut have: HashMap<String, String> = HashMap::new();
+    for entry in crate::scanner::archive::hash_archive_entries(path)? {
+        if let Some(hashes) = entry.hashes {
+            have.insert(entry.name, hashes.sha1);
+        }
+    }
+
+    if have.len() != expected.len() {
+        return Ok(false);
+    }
+    Ok(expected
+        .iter()
+        .all(|(name, sha1)| have.get(name).is_some_and(|h| h.eq_ignore_ascii_case(sha1))))
+}
+
 /// Resolve a collection's destination root, in order of precedence:
 ///   1. an explicit per-collection `dest_path`, used as-is;
 ///   2. otherwise the library-wide `default_dest` joined with the collection's
@@ -534,6 +649,82 @@ mod tests {
     fn resolve_dest_root_is_none_without_explicit_or_default() {
         // Neither an explicit path nor a default: no destination, caller skips.
         assert_eq!(resolve_dest_root(None, None, "Acorn/BBC"), None);
+    }
+
+    #[test]
+    fn resolve_output_format_prefers_explicit() {
+        assert_eq!(
+            resolve_output_format(Some("zip"), OutputFormat::Loose),
+            OutputFormat::Zip
+        );
+        assert_eq!(
+            resolve_output_format(Some("TorrentZip"), OutputFormat::Loose),
+            OutputFormat::TorrentZip
+        );
+        assert_eq!(
+            resolve_output_format(Some("loose"), OutputFormat::Zip),
+            OutputFormat::Loose
+        );
+    }
+
+    #[test]
+    fn resolve_output_format_falls_back_to_default() {
+        assert_eq!(
+            resolve_output_format(None, OutputFormat::TorrentZip),
+            OutputFormat::TorrentZip
+        );
+        // Unrecognised value falls back rather than failing the plan.
+        assert_eq!(
+            resolve_output_format(Some("rar"), OutputFormat::Zip),
+            OutputFormat::Zip
+        );
+    }
+
+    #[test]
+    fn archive_format_tag_maps_formats() {
+        assert_eq!(archive_format_tag(OutputFormat::Loose), None);
+        assert_eq!(archive_format_tag(OutputFormat::Zip), Some("zip"));
+        assert_eq!(
+            archive_format_tag(OutputFormat::TorrentZip),
+            Some("torrentzip")
+        );
+    }
+
+    #[test]
+    fn group_for_archive_collects_roms_per_game_with_canonical_entry_names() {
+        let matches = vec![
+            MatchedRom {
+                collection: "C".into(),
+                game_name: "Game".into(),
+                rom_name: "disk1.img".into(),
+                sha1: "AAA".into(),
+                size: 10,
+                source_path: "src/a.img".into(),
+                source_root: "/roms".into(),
+                archive_path: None,
+            },
+            MatchedRom {
+                collection: "C".into(),
+                game_name: "Game".into(),
+                rom_name: "disk2.img".into(),
+                sha1: "BBB".into(),
+                size: 20,
+                source_path: "src/b.img".into(),
+                source_root: "/roms".into(),
+                archive_path: None,
+            },
+        ];
+
+        let games = group_for_archive(matches);
+        assert_eq!(games.len(), 1);
+        let g = &games[0];
+        assert_eq!(g.name, "Game");
+        assert_eq!(g.size, 30);
+        assert_eq!(g.sources.len(), 2);
+        // Sources carry canonical ROM names as their archive entry names.
+        assert_eq!(g.sources[0].entry_name.as_deref(), Some("disk1.img"));
+        assert_eq!(g.sources[0].path, "/roms/src/a.img");
+        assert_eq!(g.expected.len(), 2);
     }
 
     #[test]

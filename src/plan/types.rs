@@ -126,6 +126,23 @@ impl Plan {
         self.summary.total_bytes += size;
     }
 
+    /// Add a repack operation: one archive containing a game's ROMs. `size` is
+    /// the total uncompressed bytes, used for the plan summary and space check.
+    pub fn add_repack(&mut self, sources: Vec<SourceRef>, dest: String, format: String, size: u64) {
+        let id = self.operations.len() as u64;
+        self.operations.push(Operation {
+            id,
+            status: OperationStatus::Pending,
+            kind: OperationKind::Repack {
+                sources,
+                dest,
+                format,
+            },
+        });
+        self.summary.repack_count += 1;
+        self.summary.total_bytes += size;
+    }
+
     /// Add a quarantine operation
     pub fn add_quarantine(
         &mut self,

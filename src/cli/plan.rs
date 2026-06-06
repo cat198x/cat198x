@@ -34,6 +34,7 @@ pub fn run(dat_filter: Option<String>, data_dir: Option<PathBuf>) -> Result<()> 
         conn,
         dat_filter.as_deref(),
         file_config.default_dest_path.as_deref(),
+        file_config.default_output_format,
     )?;
 
     if plan.is_empty() {

@@ -2138,3 +2138,101 @@ fn test_dat_relink_repoints_moved_dat() {
         version.dat_path
     );
 }
+
+/// End-to-end archive output: a zip-format collection plans one archive per game,
+/// `apply` builds it with canonical entry names, and a re-plan converges to a
+/// no-op because the archive is already correct.
+#[test]
+fn test_zip_output_format_plans_applies_and_converges() {
+    use cat198x::config::OutputFormat;
+    use cat198x::plan::generate_plan_filtered;
+    use cat198x::{ConfigCommands, DatCommands, SourceCommands};
+    use sha1::Digest;
+
+    let env = TestEnv::new();
+    env.init();
+
+    let content = b"hello";
+    let sha1_hash = cat198x::util::hex_upper(sha1::Sha1::digest(content));
+    let dat = create_matching_dat(env.temp_dir.path(), "Zip Test", &sha1_hash);
+    cli::dat::run(
+        DatCommands::Add {
+            path: dat,
+            collection: None,
+            recursive: false,
+        },
+        env.data_dir_opt(),
+    )
+    .unwrap();
+
+    // The matching source file (entry should be named "test.rom" from the DAT).
+    fs::write(env.roms_dir.join("test.rom"), content).unwrap();
+    cli::source::run(
+        SourceCommands::Add {
+            path: env.roms_dir.clone(),
+        },
+        env.data_dir_opt(),
+    )
+    .unwrap();
+    cli::scan::run(None, false, env.data_dir_opt()).unwrap();
+
+    // Library-wide defaults: a destination and zip output.
+    let dest_root = env.temp_dir.path().join("library");
+    for (k, v) in [
+        ("dest_path", dest_root.to_string_lossy().into_owned()),
+        ("output_format", "zip".to_string()),
+    ] {
+        cli::config::run(
+            ConfigCommands::SetDefault {
+                key: k.to_string(),
+                value: v,
+            },
+            env.data_dir_opt(),
+        )
+        .unwrap();
+    }
+
+    // Plan: one repack to an archive named after the game.
+    cli::plan::run(None, env.data_dir_opt()).unwrap();
+    let plans_dir = env.data_dir.join("objects/plans");
+    let plan_file = fs::read_dir(&plans_dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .find(|p| p.extension().map(|x| x == "json").unwrap_or(false))
+        .expect("a plan file should have been written");
+    let plan_json = fs::read_to_string(&plan_file).unwrap();
+    assert!(
+        plan_json.contains("\"type\": \"repack\""),
+        "zip output should produce a repack op, plan was:\n{plan_json}"
+    );
+    // Non-recursive add → flat node path "Zip Test", so the collection's root is
+    // <library>/Zip Test and the archive is named after the game within it.
+    let expected_archive = dest_root.join("Zip Test").join("Test Game.zip");
+    assert!(
+        plan_json.contains(&expected_archive.to_string_lossy().into_owned()),
+        "archive should be named after the game; plan was:\n{plan_json}"
+    );
+
+    // Apply builds the archive.
+    cli::apply::run(false, true, env.data_dir_opt()).unwrap();
+    assert!(
+        expected_archive.is_file(),
+        "apply should have created {}",
+        expected_archive.display()
+    );
+
+    // Re-plan converges: the archive is already correct, so no repack.
+    let db = env.db();
+    let plan = generate_plan_filtered(
+        db.conn(),
+        None,
+        Some(&dest_root.to_string_lossy()),
+        OutputFormat::Zip,
+    )
+    .unwrap();
+    assert_eq!(
+        plan.summary.repack_count, 0,
+        "an already-correct archive should not be repacked again"
+    );
+}
