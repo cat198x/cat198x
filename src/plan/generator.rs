@@ -140,10 +140,17 @@ pub fn generate_plan_filtered(conn: &Connection, dat_filter: Option<&str>) -> Re
         let mut already_correct = 0;
         let mut copy_count = 0;
 
+        // ROMs per game: a single-ROM game is laid out flat (dest/rom), a
+        // multi-ROM game gets its own folder (dest/game/rom). Counted up front
+        // so the by-value loop below can still move each match into the plan.
+        let mut roms_per_game: HashMap<String, usize> = HashMap::new();
+        for m in &matches {
+            *roms_per_game.entry(m.game_name.clone()).or_insert(0) += 1;
+        }
+
         for m in matches {
-            // Build destination path: dest_path/game_name/rom_name
-            // For single-ROM games, just use: dest_path/rom_name
-            let dest = build_dest_path(dest_path, &m.game_name, &m.rom_name);
+            let multi_rom = roms_per_game.get(&m.game_name).copied().unwrap_or(1) > 1;
+            let dest = build_dest_path(dest_path, &m.game_name, &m.rom_name, multi_rom);
 
             // Check if file already exists at destination with correct hash
             if is_file_correct_at_dest(&dest, &m.sha1)? {
@@ -229,10 +236,20 @@ fn find_matched_roms(
 }
 
 /// Build destination path for a ROM
-fn build_dest_path(dest_root: &str, _game_name: &str, rom_name: &str) -> String {
-    // For now, use flat structure: dest_root/rom_name
-    // Phase 2 will add proper game folder structure based on output_format
-    format!("{}/{}", dest_root.trim_end_matches('/'), rom_name)
+/// Build the on-disk destination for one ROM under its collection's root.
+///
+/// Loose layout: a single-ROM game is placed flat as `dest_root/rom_name` — the
+/// common TOSEC case, where one "game" is one file and a wrapping folder would
+/// just be noise. A multi-ROM game gets its own folder,
+/// `dest_root/game_name/rom_name`, so its parts stay together and don't collide
+/// with other games' files.
+fn build_dest_path(dest_root: &str, game_name: &str, rom_name: &str, multi_rom: bool) -> String {
+    let root = dest_root.trim_end_matches('/');
+    if multi_rom {
+        format!("{}/{}/{}", root, game_name, rom_name)
+    } else {
+        format!("{}/{}", root, rom_name)
+    }
 }
 
 /// Check if a file at the destination already has the correct hash
@@ -437,15 +454,28 @@ mod tests {
     }
 
     #[test]
-    fn test_build_dest_path() {
+    fn test_build_dest_path_single_rom_is_flat() {
+        // A single-ROM game is placed flat, with no redundant game folder.
         assert_eq!(
-            build_dest_path("/roms/nes", "Super Mario Bros", "mario.nes"),
+            build_dest_path("/roms/nes", "Super Mario Bros", "mario.nes", false),
             "/roms/nes/mario.nes"
         );
-
+        // A trailing slash on the root is normalised away.
         assert_eq!(
-            build_dest_path("/roms/nes/", "Game", "game.rom"),
+            build_dest_path("/roms/nes/", "Game", "game.rom", false),
             "/roms/nes/game.rom"
+        );
+    }
+
+    #[test]
+    fn test_build_dest_path_multi_rom_gets_game_folder() {
+        assert_eq!(
+            build_dest_path("/roms/nes", "Multi Disk Game", "disk1.img", true),
+            "/roms/nes/Multi Disk Game/disk1.img"
+        );
+        assert_eq!(
+            build_dest_path("/roms/nes", "Multi Disk Game", "disk2.img", true),
+            "/roms/nes/Multi Disk Game/disk2.img"
         );
     }
 
