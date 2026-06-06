@@ -2000,3 +2000,81 @@ fn test_stats_command() {
     // Stats should run without error
     cli::stats::run(env.data_dir_opt()).expect("Stats command failed");
 }
+
+/// End-to-end: a recursive add over a nested DAT tree, a library-wide default
+/// destination, and a plan that lays the matched ROM out under its hierarchy —
+/// the whole layout-engine chain (M1 + M2 + M3 + set-default) composed.
+#[test]
+fn test_recursive_add_plans_into_hierarchical_destination() {
+    use cat198x::{ConfigCommands, DatCommands, SourceCommands};
+    use sha1::Digest;
+
+    let env = TestEnv::new();
+    env.init();
+
+    // A file with known content, and a DAT — nested under a set tree like the
+    // canonical DatRoot — that expects exactly its SHA1.
+    let content = b"hello";
+    let sha1_hash = cat198x::util::hex_upper(sha1::Sha1::digest(content));
+
+    let dats_root = env.temp_dir.path().join("dats");
+    let coll_dir = dats_root.join("Acorn/BBC/Magazines/Laserbug");
+    fs::create_dir_all(&coll_dir).unwrap();
+    create_matching_dat(&coll_dir, "Acorn BBC - Magazines - Laserbug", &sha1_hash);
+
+    // Recursive add records the nested path on the collection's node.
+    cli::dat::run(
+        DatCommands::Add {
+            path: dats_root.clone(),
+            collection: None,
+            recursive: true,
+        },
+        env.data_dir_opt(),
+    )
+    .unwrap();
+
+    // A source holding the matching file, scanned.
+    fs::write(env.roms_dir.join("test.rom"), content).unwrap();
+    cli::source::run(
+        SourceCommands::Add {
+            path: env.roms_dir.clone(),
+        },
+        env.data_dir_opt(),
+    )
+    .unwrap();
+    cli::scan::run(None, false, env.data_dir_opt()).unwrap();
+
+    // A library-wide default destination — no per-collection config at all.
+    let dest_root = env.temp_dir.path().join("library");
+    cli::config::run(
+        ConfigCommands::SetDefault {
+            key: "dest_path".to_string(),
+            value: dest_root.to_string_lossy().into_owned(),
+        },
+        env.data_dir_opt(),
+    )
+    .unwrap();
+
+    // Plan, then read the saved plan and assert the destination is hierarchical.
+    cli::plan::run(None, env.data_dir_opt()).unwrap();
+
+    let plans_dir = env.data_dir.join("objects/plans");
+    let plan_file = fs::read_dir(&plans_dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .find(|p| p.extension().map(|x| x == "json").unwrap_or(false))
+        .expect("a plan file should have been written");
+    let plan_json = fs::read_to_string(&plan_file).unwrap();
+
+    let expected = format!(
+        "{}/Acorn/BBC/Magazines/Laserbug/test.rom",
+        dest_root.to_string_lossy()
+    );
+    assert!(
+        plan_json.contains(&expected),
+        "plan should place the ROM at its hierarchical destination '{}'.\nPlan was:\n{}",
+        expected,
+        plan_json
+    );
+}
