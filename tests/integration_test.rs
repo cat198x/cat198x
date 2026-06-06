@@ -1998,7 +1998,7 @@ fn test_stats_command() {
     cli::scan::run(None, false, env.data_dir_opt()).unwrap();
 
     // Stats should run without error
-    cli::stats::run(false, env.data_dir_opt()).expect("Stats command failed");
+    cli::stats::run(None, env.data_dir_opt()).expect("Stats command failed");
 }
 
 /// End-to-end: a recursive add over a nested DAT tree, a library-wide default

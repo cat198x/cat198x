@@ -5,13 +5,34 @@ use std::path::PathBuf;
 
 use super::open_database;
 use crate::db::dats::{MergeMode, calculate_merge_mode_stats};
-use crate::db::{collections, files};
+use crate::db::{collections, dats, files};
+
+/// Dimension to roll collections up by.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GroupBy {
+    /// Leading name segment, e.g. "Sinclair ZX Spectrum - *" → "Sinclair ZX Spectrum".
+    System,
+    /// Top of the library path, e.g. "TOSEC-PIX/Acorn/..." → "TOSEC-PIX".
+    Set,
+}
+
+impl GroupBy {
+    fn parse(s: &str) -> Result<Self> {
+        match s.to_ascii_lowercase().as_str() {
+            "system" => Ok(GroupBy::System),
+            "set" => Ok(GroupBy::Set),
+            _ => anyhow::bail!("Unknown group-by '{}' (use 'system' or 'set')", s),
+        }
+    }
+}
 
 /// Collection statistics
 #[derive(Debug)]
 #[allow(dead_code)] // total_games reserved for future "games complete" display
 struct CollectionStats {
     name: String,
+    /// The collection's library path (set by recursive `dat add`), or its name.
+    node_path: String,
     total_games: i64,
     total_roms: i64,
     have_roms: i64,
@@ -30,13 +51,15 @@ struct OverallStats {
 }
 
 /// Run the stats command
-pub fn run(grouped: bool, data_dir: Option<PathBuf>) -> Result<()> {
+pub fn run(group_by: Option<&str>, data_dir: Option<PathBuf>) -> Result<()> {
+    let group_by = group_by.map(GroupBy::parse).transpose()?;
+
     let db = open_database(data_dir)?;
     let conn = db.conn();
 
     let stats = gather_stats(conn)?;
 
-    print_stats(&stats, grouped);
+    print_stats(&stats, group_by);
 
     Ok(())
 }
@@ -92,8 +115,12 @@ fn get_collection_stats(
     // CRC+size and counts unique ROMs.
     let s = calculate_merge_mode_stats(conn, version_id, MergeMode::NonMerged, true)?;
 
+    let node_path =
+        dats::primary_node_path(conn, version_id)?.unwrap_or_else(|| collection_name.to_string());
+
     Ok(CollectionStats {
         name: collection_name.to_string(),
+        node_path,
         total_games: s.total_games as i64,
         total_roms: s.total_roms as i64,
         have_roms: s.have_roms as i64,
@@ -102,28 +129,34 @@ fn get_collection_stats(
     })
 }
 
-/// The rollup key for a collection: the segment before the first " - ".
-/// "Sinclair ZX Spectrum - Applications - [TAP]" -> "Sinclair ZX Spectrum".
-/// A name with no " - " is its own group.
-fn group_key(name: &str) -> &str {
-    match name.split_once(" - ") {
-        Some((head, _)) => head,
-        None => name,
+/// The rollup key for a collection under a grouping dimension.
+/// - System: the segment before the first " - " ("Sinclair ZX Spectrum - … →
+///   "Sinclair ZX Spectrum"); a name with no " - " is its own group.
+/// - Set: the top segment of the library path ("TOSEC-PIX/Acorn/… → "TOSEC-PIX");
+///   a flat path (no recursive add yet) is its own group.
+fn group_key(c: &CollectionStats, by: GroupBy) -> &str {
+    match by {
+        GroupBy::System => match c.name.split_once(" - ") {
+            Some((head, _)) => head,
+            None => &c.name,
+        },
+        GroupBy::Set => c.node_path.split('/').next().unwrap_or(&c.node_path),
     }
 }
 
 /// Roll collections up by [`group_key`], summing their totals. Returns one
 /// `CollectionStats` per group, sorted by group name.
-fn group_collections(collections: &[CollectionStats]) -> Vec<CollectionStats> {
+fn group_collections(collections: &[CollectionStats], by: GroupBy) -> Vec<CollectionStats> {
     use std::collections::BTreeMap;
 
     let mut groups: BTreeMap<String, CollectionStats> = BTreeMap::new();
     for c in collections {
-        let key = group_key(&c.name).to_string();
+        let key = group_key(c, by).to_string();
         let entry = groups
             .entry(key.clone())
             .or_insert_with(|| CollectionStats {
-                name: key,
+                name: key.clone(),
+                node_path: key,
                 total_games: 0,
                 total_roms: 0,
                 have_roms: 0,
@@ -170,7 +203,7 @@ fn print_rows(heading: &str, rows: &[CollectionStats]) {
 }
 
 /// Print statistics to stdout
-fn print_stats(stats: &OverallStats, grouped: bool) {
+fn print_stats(stats: &OverallStats, group_by: Option<GroupBy>) {
     println!("Cat198x Statistics");
     println!("===================");
     println!();
@@ -197,11 +230,19 @@ fn print_stats(stats: &OverallStats, grouped: bool) {
     );
     println!();
 
-    // Per-collection (or, with --group, per-group) breakdown.
-    if grouped {
-        let groups = group_collections(&stats.collections);
+    // Per-collection (or, with --group-by, per-group) breakdown.
+    if let Some(by) = group_by {
+        let groups = group_collections(&stats.collections, by);
+        let label = match by {
+            GroupBy::System => "system",
+            GroupBy::Set => "set",
+        };
         print_rows(
-            &format!("Groups ({} collections rolled up)", stats.collections.len()),
+            &format!(
+                "Groups by {} ({} collections rolled up)",
+                label,
+                stats.collections.len()
+            ),
             &groups,
         );
     } else {
@@ -258,23 +299,10 @@ mod tests {
         assert_eq!(progress_bar(25, 20), "[█████░░░░░░░░░░░░░░░]");
     }
 
-    #[test]
-    fn group_key_takes_segment_before_first_dash() {
-        assert_eq!(
-            group_key("Sinclair ZX Spectrum - Applications - [TAP]"),
-            "Sinclair ZX Spectrum"
-        );
-        assert_eq!(group_key("Acorn BBC - Magazines - Laserbug"), "Acorn BBC");
-    }
-
-    #[test]
-    fn group_key_without_dash_is_whole_name() {
-        assert_eq!(group_key("MAME 0.261"), "MAME 0.261");
-    }
-
-    fn stat(name: &str, have: i64, total: i64) -> CollectionStats {
+    fn stat(name: &str, node_path: &str, have: i64, total: i64) -> CollectionStats {
         CollectionStats {
             name: name.to_string(),
+            node_path: node_path.to_string(),
             total_games: total,
             total_roms: total,
             have_roms: have,
@@ -284,22 +312,78 @@ mod tests {
     }
 
     #[test]
-    fn group_collections_sums_by_key_and_sorts() {
+    fn group_by_parses_known_dimensions_only() {
+        assert_eq!(GroupBy::parse("system").unwrap(), GroupBy::System);
+        assert_eq!(GroupBy::parse("Set").unwrap(), GroupBy::Set);
+        assert!(GroupBy::parse("publisher").is_err());
+    }
+
+    #[test]
+    fn group_key_system_uses_segment_before_first_dash() {
+        let c = stat(
+            "Sinclair ZX Spectrum - Applications - [TAP]",
+            "TOSEC/Sinclair/ZX Spectrum",
+            1,
+            1,
+        );
+        assert_eq!(group_key(&c, GroupBy::System), "Sinclair ZX Spectrum");
+        // No " - " → its own group.
+        let m = stat("MAME 0.261", "MAME 0.261", 1, 1);
+        assert_eq!(group_key(&m, GroupBy::System), "MAME 0.261");
+    }
+
+    #[test]
+    fn group_key_set_uses_top_of_library_path() {
+        let c = stat(
+            "Acorn BBC - Magazines - Laserbug",
+            "TOSEC-PIX/Acorn/BBC/Magazines/Laserbug",
+            1,
+            1,
+        );
+        assert_eq!(group_key(&c, GroupBy::Set), "TOSEC-PIX");
+        // Flat path (no recursive add yet) → its own group.
+        let f = stat("Flat Coll", "Flat Coll", 1, 1);
+        assert_eq!(group_key(&f, GroupBy::Set), "Flat Coll");
+    }
+
+    #[test]
+    fn group_collections_by_system_sums_and_sorts() {
         let rows = vec![
-            stat("Sinclair ZX Spectrum - Applications - [TAP]", 3, 4),
-            stat("Sinclair ZX Spectrum - Games - [TAP]", 5, 10),
-            stat("Acorn BBC - Magazines - Laserbug", 2, 2),
+            stat("Sinclair ZX Spectrum - Applications", "p", 3, 4),
+            stat("Sinclair ZX Spectrum - Games", "p", 5, 10),
+            stat("Acorn BBC - Magazines", "p", 2, 2),
         ];
-
-        let grouped = group_collections(&rows);
-
+        let grouped = group_collections(&rows, GroupBy::System);
         assert_eq!(grouped.len(), 2);
-        // BTreeMap order: "Acorn BBC" before "Sinclair ZX Spectrum".
-        assert_eq!(grouped[0].name, "Acorn BBC");
-        assert_eq!(grouped[0].have_roms, 2);
-        assert_eq!(grouped[0].total_roms, 2);
+        assert_eq!(grouped[0].name, "Acorn BBC"); // BTreeMap order
         assert_eq!(grouped[1].name, "Sinclair ZX Spectrum");
         assert_eq!(grouped[1].have_roms, 8);
         assert_eq!(grouped[1].total_roms, 14);
+    }
+
+    #[test]
+    fn group_collections_by_set_rolls_up_whole_set() {
+        let rows = vec![
+            stat(
+                "Acorn BBC - Magazines",
+                "TOSEC-PIX/Acorn/BBC/Magazines",
+                1,
+                2,
+            ),
+            stat("Sony - Books", "TOSEC-PIX/Sony/Books", 3, 3),
+            stat(
+                "Sinclair ZX Spectrum - Games",
+                "TOSEC/Sinclair/ZX Spectrum",
+                4,
+                8,
+            ),
+        ];
+        let grouped = group_collections(&rows, GroupBy::Set);
+        assert_eq!(grouped.len(), 2);
+        assert_eq!(grouped[0].name, "TOSEC"); // BTreeMap: TOSEC before TOSEC-PIX
+        assert_eq!(grouped[0].have_roms, 4);
+        assert_eq!(grouped[1].name, "TOSEC-PIX");
+        assert_eq!(grouped[1].have_roms, 4);
+        assert_eq!(grouped[1].total_roms, 5);
     }
 }
