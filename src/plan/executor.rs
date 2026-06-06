@@ -286,8 +286,15 @@ fn execute_repack_torrentzip(sources: &[SourceRef], dest: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Get the entry name for a source file
+/// Get the entry name for a source file.
+///
+/// Prefers an explicit `entry_name` (the DAT-canonical ROM name set by the
+/// planner), so a repacked archive uses canonical names rather than whatever the
+/// source file happened to be called. Falls back to the source's own name.
 fn get_entry_name(source: &SourceRef) -> &str {
+    if let Some(name) = source.entry_name.as_deref() {
+        return name;
+    }
     source
         .archive_path
         .as_ref()
@@ -498,6 +505,30 @@ mod tests {
     use tempfile::TempDir;
 
     #[test]
+    fn get_entry_name_prefers_canonical_entry_name() {
+        // An explicit entry_name (the DAT rom name) wins over the source's own
+        // file name, so repacked archives carry canonical names.
+        let source = SourceRef {
+            path: "/sources/whatever-it-was-called.bin".to_string(),
+            archive_path: None,
+            sha1: "ABC123".to_string(),
+            entry_name: Some("Canonical Name.rom".to_string()),
+        };
+        assert_eq!(get_entry_name(&source), "Canonical Name.rom");
+    }
+
+    #[test]
+    fn get_entry_name_falls_back_to_source_file_name() {
+        let source = SourceRef {
+            path: "/sources/game.rom".to_string(),
+            archive_path: None,
+            sha1: "ABC123".to_string(),
+            entry_name: None,
+        };
+        assert_eq!(get_entry_name(&source), "game.rom");
+    }
+
+    #[test]
     fn test_truncate_path_short() {
         assert_eq!(truncate_path("/short/path", 50), "/short/path");
     }
@@ -701,11 +732,13 @@ mod tests {
                 path: src1.to_str().unwrap().to_string(),
                 archive_path: None,
                 sha1: "76218C22675632AEF6A27578DD0A2C6471D995D5".to_string(), // SHA1 of "cpu data"
+                entry_name: None,
             },
             SourceRef {
                 path: src2.to_str().unwrap().to_string(),
                 archive_path: None,
                 sha1: "75BF07C00E138F33E12904F575641F0C06CBB838".to_string(), // SHA1 of "graphics data"
+                entry_name: None,
             },
         ];
 
@@ -751,11 +784,13 @@ mod tests {
                 path: src1.to_str().unwrap().to_string(),
                 archive_path: None,
                 sha1: "FC19318DD13128CE14344D066510A982269C241B".to_string(), // SHA1 of "good"
+                entry_name: None,
             },
             SourceRef {
                 path: src2.to_str().unwrap().to_string(),
                 archive_path: None,
                 sha1: "0000000000000000000000000000000000000000".to_string(), // Wrong hash
+                entry_name: None,
             },
         ];
 
@@ -787,6 +822,7 @@ mod tests {
             path: src.to_str().unwrap().to_string(),
             archive_path: None,
             sha1: "A17C9AAA61E80A1BF71D0D850AF4E5BAA9800BBD".to_string(), // SHA1 of "data"
+            entry_name: None,
         }];
 
         let result = execute_repack(&sources, dest_path.to_str().unwrap(), "7z");
@@ -825,11 +861,13 @@ mod tests {
                 path: src1.to_str().unwrap().to_string(),
                 archive_path: None,
                 sha1: sha1_z,
+                entry_name: None,
             },
             SourceRef {
                 path: src2.to_str().unwrap().to_string(),
                 archive_path: None,
                 sha1: sha1_a,
+                entry_name: None,
             },
         ];
 
@@ -982,6 +1020,7 @@ mod tests {
                     path: "/source/file.rom".to_string(),
                     archive_path: None,
                     sha1: "ABC123".to_string(),
+                    entry_name: None,
                 },
                 dest: "/tmp/test_dest/file.rom".to_string(),
                 size: 1024, // 1 KB

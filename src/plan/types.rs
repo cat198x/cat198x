@@ -95,6 +95,11 @@ pub struct SourceRef {
     pub archive_path: Option<String>,
     /// SHA1 hash of the content
     pub sha1: String,
+    /// Desired entry name when this source is written into an archive (the
+    /// DAT-canonical ROM name). `None` falls back to the source file's own name.
+    /// Irrelevant to Copy/Move, which carry the full destination path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entry_name: Option<String>,
 }
 
 impl Plan {
@@ -192,6 +197,7 @@ mod tests {
                 path: "/source/game.rom".to_string(),
                 archive_path: None,
                 sha1: "ABC123".to_string(),
+                entry_name: None,
             },
             "/dest/game.rom".to_string(),
             1024,
@@ -211,6 +217,7 @@ mod tests {
                 path: "/src/rom.nes".to_string(),
                 archive_path: None,
                 sha1: "SHA1HASH".to_string(),
+                entry_name: None,
             },
             "/dest/rom.nes".to_string(),
             2048,
@@ -267,6 +274,7 @@ mod tests {
                 path: "/src".to_string(),
                 archive_path: None,
                 sha1: "hash".to_string(),
+                entry_name: None,
             },
             dest: "/dest".to_string(),
             size: 100,
@@ -284,11 +292,13 @@ mod tests {
                     path: "/src/a.rom".to_string(),
                     archive_path: None,
                     sha1: "hash1".to_string(),
+                    entry_name: None,
                 },
                 SourceRef {
                     path: "/src/b.rom".to_string(),
                     archive_path: None,
                     sha1: "hash2".to_string(),
+                    entry_name: None,
                 },
             ],
             dest: "/dest/game.zip".to_string(),

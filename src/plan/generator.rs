@@ -148,6 +148,7 @@ pub fn generate_plan_filtered(
                     path: full_source,
                     archive_path: m.archive_path,
                     sha1: m.sha1,
+                    entry_name: None,
                 },
                 dest,
                 m.size as u64,
