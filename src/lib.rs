@@ -148,6 +148,15 @@ pub enum ConfigCommands {
         value: String,
     },
 
+    /// Set a library-wide default (applies to collections without their own value)
+    SetDefault {
+        /// Configuration key (dest_path, output_format, merge_mode)
+        key: String,
+
+        /// Value to set
+        value: String,
+    },
+
     /// Get a configuration value for a collection
     Get {
         /// Collection name

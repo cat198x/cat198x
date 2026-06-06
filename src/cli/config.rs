@@ -4,9 +4,10 @@ use anyhow::Result;
 use std::path::PathBuf;
 
 use crate::ConfigCommands;
+use crate::config::{Config, MergeMode, OutputFormat};
 use crate::db::config as db_config;
 
-use super::open_database;
+use super::{get_data_dir, open_database};
 
 /// Run a config subcommand
 pub fn run(cmd: ConfigCommands, data_dir: Option<PathBuf>) -> Result<()> {
@@ -16,11 +17,71 @@ pub fn run(cmd: ConfigCommands, data_dir: Option<PathBuf>) -> Result<()> {
             key,
             value,
         } => set_config(&collection, &key, &value, data_dir),
+        ConfigCommands::SetDefault { key, value } => set_default(&key, &value, data_dir),
         ConfigCommands::Get { collection, key } => {
             get_config(&collection, key.as_deref(), data_dir)
         }
         ConfigCommands::List { collection } => list_config(collection.as_deref(), data_dir),
     }
+}
+
+/// Apply a library-wide default to the in-memory `Config`, validating the key
+/// and value. Pure (no I/O) so the key/value mapping is unit-testable.
+fn set_default_field(config: &mut Config, key: &str, value: &str) -> Result<()> {
+    match key {
+        "dest_path" => config.default_dest_path = Some(value.to_string()),
+        "output_format" => {
+            config.default_output_format = match value.to_lowercase().as_str() {
+                "loose" => OutputFormat::Loose,
+                "zip" => OutputFormat::Zip,
+                "torrentzip" => OutputFormat::TorrentZip,
+                _ => anyhow::bail!(
+                    "Invalid output_format: '{}'\n  Valid options: loose, zip, torrentzip",
+                    value
+                ),
+            };
+        }
+        "merge_mode" => {
+            config.default_merge_mode = match value.to_lowercase().as_str() {
+                "non-merged" => MergeMode::NonMerged,
+                "merged" => MergeMode::Merged,
+                "split" => MergeMode::Split,
+                _ => anyhow::bail!(
+                    "Invalid merge_mode: '{}'\n  Valid options: non-merged, merged, split",
+                    value
+                ),
+            };
+        }
+        _ => anyhow::bail!(
+            "Unknown default key: '{}'\n  Valid keys: dest_path, output_format, merge_mode",
+            key
+        ),
+    }
+    Ok(())
+}
+
+/// Set a library-wide default in `config.toml`, creating it if absent.
+fn set_default(key: &str, value: &str, data_dir: Option<PathBuf>) -> Result<()> {
+    let config_path = get_data_dir(data_dir)?.join("config.toml");
+    let mut config = if config_path.exists() {
+        Config::load(&config_path)?
+    } else {
+        Config::default()
+    };
+
+    set_default_field(&mut config, key, value)?;
+
+    // A not-yet-existing destination is fine: `apply` creates it.
+    if key == "dest_path" && !PathBuf::from(value).exists() {
+        println!(
+            "Warning: Path does not exist yet: {}\n  It will be created when running 'cat198x apply'.",
+            value
+        );
+    }
+
+    config.save(&config_path)?;
+    println!("Set default {} to: {}", key, value);
+    Ok(())
 }
 
 fn set_config(collection: &str, key: &str, value: &str, data_dir: Option<PathBuf>) -> Result<()> {
@@ -311,6 +372,33 @@ fn list_config(collection: Option<&str>, data_dir: Option<PathBuf>) -> Result<()
 
 #[cfg(test)]
 mod tests {
-    // Integration tests cover most of the config functionality
-    // Unit tests would require mocking the database
+    use super::*;
+
+    // Most config behaviour is covered by integration tests (they need a DB).
+    // The library-wide default mapping is pure, so it is unit-tested here.
+
+    #[test]
+    fn set_default_field_sets_dest_path() {
+        let mut config = Config::default();
+        set_default_field(&mut config, "dest_path", "/Volumes/Data").unwrap();
+        assert_eq!(config.default_dest_path.as_deref(), Some("/Volumes/Data"));
+    }
+
+    #[test]
+    fn set_default_field_parses_output_format_and_merge_mode() {
+        let mut config = Config::default();
+        set_default_field(&mut config, "output_format", "torrentzip").unwrap();
+        assert_eq!(config.default_output_format, OutputFormat::TorrentZip);
+
+        set_default_field(&mut config, "merge_mode", "split").unwrap();
+        assert_eq!(config.default_merge_mode, MergeMode::Split);
+    }
+
+    #[test]
+    fn set_default_field_rejects_unknown_key_and_bad_value() {
+        let mut config = Config::default();
+        assert!(set_default_field(&mut config, "nonsense", "x").is_err());
+        assert!(set_default_field(&mut config, "output_format", "rar").is_err());
+        assert!(set_default_field(&mut config, "merge_mode", "fused").is_err());
+    }
 }
