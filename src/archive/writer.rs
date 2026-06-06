@@ -265,7 +265,7 @@ impl TorrentZipWriter {
 }
 
 /// Extract a single entry from an archive to memory
-fn extract_archive_entry(archive_path: &Path, entry_path: &str) -> Result<Vec<u8>> {
+pub(crate) fn extract_archive_entry(archive_path: &Path, entry_path: &str) -> Result<Vec<u8>> {
     let ext = archive_path
         .extension()
         .and_then(|e| e.to_str())

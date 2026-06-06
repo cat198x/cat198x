@@ -213,11 +213,69 @@ pub fn execute_repack(sources: &[SourceRef], dest_path: &str, format: &str) -> R
     match format {
         "zip" => execute_repack_zip(sources, dest),
         "torrentzip" => execute_repack_torrentzip(sources, dest),
+        "7z" => execute_repack_7z(sources, dest),
         _ => anyhow::bail!(
-            "Unsupported repack format: {} (use 'zip' or 'torrentzip')",
+            "Unsupported repack format: {} (use 'zip', 'torrentzip', or '7z')",
             format
         ),
     }
+}
+
+/// The raw bytes of a source — read from disk for a loose file, or extracted
+/// from its inner archive entry.
+fn source_bytes(source: &SourceRef) -> Result<Vec<u8>> {
+    match &source.archive_path {
+        Some(entry) => crate::archive::extract_archive_entry(Path::new(&source.path), entry),
+        None => fs::read(&source.path)
+            .with_context(|| format!("Failed to read source: {}", source.path)),
+    }
+}
+
+/// Repack into a 7z archive (native, via sevenz-rust2), with canonical entry
+/// names. Each entry's content is verified against its expected SHA1 before the
+/// archive is finalised; a mismatch removes the partial archive and fails.
+fn execute_repack_7z(sources: &[SourceRef], dest: &Path) -> Result<()> {
+    use sevenz_rust2::{ArchiveEntry, ArchiveWriter};
+    use sha1::Digest as Sha1Digest;
+
+    let mut writer = ArchiveWriter::create(dest).context("Failed to create 7z archive")?;
+    let mut verification_errors = Vec::new();
+
+    for source in sources {
+        let entry_name = get_entry_name(source);
+        let data = source_bytes(source)?;
+
+        let mut hasher = sha1::Sha1::new();
+        Sha1Digest::update(&mut hasher, &data);
+        let actual_sha1 = crate::util::hex_upper(Sha1Digest::finalize(hasher));
+        if !actual_sha1.eq_ignore_ascii_case(&source.sha1) {
+            verification_errors.push(format!(
+                "{}: expected {}, got {}",
+                entry_name, source.sha1, actual_sha1
+            ));
+            continue;
+        }
+
+        writer
+            .push_archive_entry(
+                ArchiveEntry::new_file(entry_name),
+                Some(std::io::Cursor::new(data)),
+            )
+            .with_context(|| format!("Failed to add 7z entry: {}", entry_name))?;
+    }
+
+    if !verification_errors.is_empty() {
+        drop(writer);
+        let _ = fs::remove_file(dest);
+        anyhow::bail!(
+            "Repack verification failed for {} file(s):\n  {}",
+            verification_errors.len(),
+            verification_errors.join("\n  ")
+        );
+    }
+
+    writer.finish().context("Failed to finalise 7z archive")?;
+    Ok(())
 }
 
 /// Repack using standard ZIP format
@@ -816,7 +874,7 @@ mod tests {
         let src = temp.path().join("file.rom");
         fs::write(&src, b"data").unwrap();
 
-        let dest_path = temp.path().join("game.7z");
+        let dest_path = temp.path().join("game.rar");
 
         let sources = vec![SourceRef {
             path: src.to_str().unwrap().to_string(),
@@ -825,7 +883,7 @@ mod tests {
             entry_name: None,
         }];
 
-        let result = execute_repack(&sources, dest_path.to_str().unwrap(), "7z");
+        let result = execute_repack(&sources, dest_path.to_str().unwrap(), "rar");
 
         assert!(result.is_err());
         assert!(
@@ -1121,5 +1179,61 @@ mod tests {
         assert!(src_path.exists());
         // Destination should not exist
         assert!(!dest_path.exists());
+    }
+
+    #[test]
+    fn execute_repack_7z_writes_canonical_entries() {
+        use crate::plan::SourceRef;
+
+        let temp = TempDir::new().unwrap();
+        // Source file with a non-canonical name; SHA1 of "cpu data".
+        let src = temp.path().join("whatever-it-was-called.bin");
+        fs::write(&src, b"cpu data").unwrap();
+        let expected_sha1 = "76218C22675632AEF6A27578DD0A2C6471D995D5";
+
+        let dest = temp.path().join("game.7z");
+        let sources = vec![SourceRef {
+            path: src.to_str().unwrap().to_string(),
+            archive_path: None,
+            sha1: expected_sha1.to_string(),
+            entry_name: Some("canonical.rom".to_string()),
+        }];
+
+        execute_repack(&sources, dest.to_str().unwrap(), "7z").unwrap();
+        assert!(dest.exists());
+
+        // Read back: one entry, named canonically, with the right content hash.
+        let entries = crate::scanner::archive::hash_archive_entries(&dest).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, "canonical.rom");
+        assert!(
+            entries[0]
+                .hashes
+                .as_ref()
+                .unwrap()
+                .sha1
+                .eq_ignore_ascii_case(expected_sha1)
+        );
+    }
+
+    #[test]
+    fn execute_repack_7z_verifies_content_hash() {
+        use crate::plan::SourceRef;
+
+        let temp = TempDir::new().unwrap();
+        let src = temp.path().join("a.bin");
+        fs::write(&src, b"cpu data").unwrap();
+        let dest = temp.path().join("bad.7z");
+
+        // Wrong expected hash → repack fails and removes the partial archive.
+        let sources = vec![SourceRef {
+            path: src.to_str().unwrap().to_string(),
+            archive_path: None,
+            sha1: "0000000000000000000000000000000000000000".to_string(),
+            entry_name: Some("x.rom".to_string()),
+        }];
+
+        assert!(execute_repack(&sources, dest.to_str().unwrap(), "7z").is_err());
+        assert!(!dest.exists());
     }
 }

@@ -44,6 +44,7 @@ fn output_format_str(f: OutputFormat) -> &'static str {
         OutputFormat::Loose => "loose",
         OutputFormat::Zip => "zip",
         OutputFormat::TorrentZip => "torrentzip",
+        OutputFormat::SevenZip => "7z",
     }
 }
 
@@ -92,8 +93,9 @@ fn set_default_field(config: &mut Config, key: &str, value: &str) -> Result<()> 
                 "loose" => OutputFormat::Loose,
                 "zip" => OutputFormat::Zip,
                 "torrentzip" => OutputFormat::TorrentZip,
+                "7z" => OutputFormat::SevenZip,
                 _ => anyhow::bail!(
-                    "Invalid output_format: '{}'\n  Valid options: loose, zip, torrentzip",
+                    "Invalid output_format: '{}'\n  Valid options: loose, zip, torrentzip, 7z",
                     value
                 ),
             };
@@ -158,14 +160,14 @@ fn set_config(collection: &str, key: &str, value: &str, data_dir: Option<PathBuf
         "output_format" => {
             // Validate format
             match value.to_lowercase().as_str() {
-                "loose" | "zip" | "torrentzip" => {
+                "loose" | "zip" | "torrentzip" | "7z" => {
                     db_config::set_output_format(conn, collection, value)?;
                     println!("Set output_format for '{}' to: {}", collection, value);
                 }
                 _ => {
                     anyhow::bail!(
                         "Invalid output_format: '{}'\n\
-                         Valid options: loose, zip, torrentzip",
+                         Valid options: loose, zip, torrentzip, 7z",
                         value
                     );
                 }

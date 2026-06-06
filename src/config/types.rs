@@ -34,6 +34,9 @@ pub enum OutputFormat {
     Zip,
     /// TorrentZip format (deterministic)
     TorrentZip,
+    /// 7z archives
+    #[serde(rename = "7z")]
+    SevenZip,
 }
 
 /// Merge mode for MAME-style ROM sets

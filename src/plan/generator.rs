@@ -186,8 +186,9 @@ pub fn generate_plan_filtered(conn: &Connection, opts: &PlanOptions) -> Result<P
                 // with entries carrying canonical ROM names.
                 let games = group_for_archive(matches);
 
+                let ext = archive_extension(tag);
                 for game in games {
-                    let dest = format!("{}/{}.zip", dest_root.trim_end_matches('/'), game.name);
+                    let dest = format!("{}/{}.{}", dest_root.trim_end_matches('/'), game.name, ext);
 
                     if is_archive_correct_at_dest(&dest, &game.expected, tag)? {
                         already_correct += game.expected.len();
@@ -300,6 +301,7 @@ fn resolve_output_format(explicit: Option<&str>, default: OutputFormat) -> Outpu
         Some("loose") => OutputFormat::Loose,
         Some("zip") => OutputFormat::Zip,
         Some("torrentzip") => OutputFormat::TorrentZip,
+        Some("7z") => OutputFormat::SevenZip,
         _ => default,
     }
 }
@@ -311,7 +313,13 @@ fn archive_format_tag(format: OutputFormat) -> Option<&'static str> {
         OutputFormat::Loose => None,
         OutputFormat::Zip => Some("zip"),
         OutputFormat::TorrentZip => Some("torrentzip"),
+        OutputFormat::SevenZip => Some("7z"),
     }
+}
+
+/// The archive file extension for a repack format tag.
+fn archive_extension(tag: &str) -> &'static str {
+    if tag == "7z" { "7z" } else { "zip" }
 }
 
 /// A game's ROMs gathered for a single archive.
@@ -800,6 +808,18 @@ mod tests {
             archive_format_tag(OutputFormat::TorrentZip),
             Some("torrentzip")
         );
+        assert_eq!(archive_format_tag(OutputFormat::SevenZip), Some("7z"));
+    }
+
+    #[test]
+    fn resolve_output_format_and_extension_handle_7z() {
+        assert_eq!(
+            resolve_output_format(Some("7z"), OutputFormat::Loose),
+            OutputFormat::SevenZip
+        );
+        assert_eq!(archive_extension("7z"), "7z");
+        assert_eq!(archive_extension("zip"), "zip");
+        assert_eq!(archive_extension("torrentzip"), "zip");
     }
 
     #[test]
