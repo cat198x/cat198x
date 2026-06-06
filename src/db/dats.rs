@@ -1,7 +1,7 @@
 //! DAT node, game, and ROM CRUD operations
 
 use anyhow::Result;
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension, params};
 use std::collections::{HashMap, HashSet};
 
 /// Merge mode for MAME-style ROM sets
@@ -68,6 +68,20 @@ pub fn create_node(
         params![version_id, parent_id, name, node_type, path],
     )?;
     Ok(conn.last_insert_rowid())
+}
+
+/// The `path` of a version's DAT node — the collection's place in the library
+/// tree, recorded by recursive `dat add` (e.g. `Acorn/BBC/Magazines/Laserbug`),
+/// or the flat collection name otherwise. `None` if the version has no node.
+pub fn primary_node_path(conn: &Connection, version_id: i64) -> Result<Option<String>> {
+    let path = conn
+        .query_row(
+            "SELECT path FROM dat_nodes WHERE version_id = ? ORDER BY id LIMIT 1",
+            [version_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    Ok(path)
 }
 
 /// Create a game entry

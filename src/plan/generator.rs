@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use super::{Plan, SourceRef};
-use crate::db::{collections, config as db_config};
+use crate::db::{collections, config as db_config, dats};
 use crate::filter::{RomCandidate, parse_game_name, select_preferred};
 
 /// A matched ROM ready for planning
@@ -36,7 +36,7 @@ pub struct MatchedRom {
 /// If `dat_filter` is provided, only collections matching the glob pattern
 /// will be included in the plan.
 pub fn generate_plan(conn: &Connection) -> Result<Plan> {
-    generate_plan_filtered(conn, None)
+    generate_plan_filtered(conn, None, None)
 }
 
 /// Generate a plan with optional collection name filtering
@@ -45,96 +45,78 @@ pub fn generate_plan(conn: &Connection) -> Result<Plan> {
 /// - `*` matches any sequence of characters
 /// - `?` matches any single character
 /// - Case-insensitive matching
-pub fn generate_plan_filtered(conn: &Connection, dat_filter: Option<&str>) -> Result<Plan> {
+pub fn generate_plan_filtered(
+    conn: &Connection,
+    dat_filter: Option<&str>,
+    default_dest: Option<&str>,
+) -> Result<Plan> {
     // Calculate state hash
     let state_hash = compute_state_hash(conn)?;
     let mut plan = Plan::new(state_hash);
 
-    // Get all collections with configured dest_path
-    let configs = db_config::list_all_configs(conn)?;
+    // Plan every collection, not only those with an explicit dest_path: a
+    // library-wide `default_dest_path` should reach collections that were never
+    // individually configured. Each collection's destination is resolved below.
+    let all_collections = collections::list_collections(conn)?;
 
-    if configs.is_empty() {
-        println!("No collections configured with destination paths.");
-        println!();
-        println!("Configure a destination with:");
-        println!("  cat198x config set <collection> dest_path <path>");
-        return Ok(plan);
-    }
+    let mut planned_any = false;
+    let mut filter_matched_any = false;
+    let mut skipped_no_dest = 0usize;
 
-    // Filter configs by pattern if provided
-    let configs: Vec<_> = if let Some(pattern) = dat_filter {
-        configs
-            .into_iter()
-            .filter(|cfg| glob_match(pattern, &cfg.path_pattern))
-            .collect()
-    } else {
-        configs
-    };
-
-    if configs.is_empty() {
-        if let Some(pattern) = dat_filter {
-            println!("No collections match the filter: {}", pattern);
+    for collection in &all_collections {
+        if let Some(pattern) = dat_filter
+            && !glob_match(pattern, &collection.name)
+        {
+            continue;
         }
-        return Ok(plan);
-    }
+        filter_matched_any = true;
 
-    // Process each configured collection
-    for cfg in &configs {
-        let dest_path = match &cfg.dest_path {
-            Some(p) => p,
-            None => continue, // Skip collections without dest_path
-        };
-
-        // Find the collection
-        let collection = match collections::get_collection_by_name(conn, &cfg.path_pattern)? {
-            Some(c) => c,
-            None => {
-                println!(
-                    "Warning: Config exists for '{}' but no matching collection found",
-                    cfg.path_pattern
-                );
-                continue;
-            }
-        };
-
-        // Get active version
+        // Only collections with an active version can be planned.
         let version = match collections::get_active_version(conn, collection.id)? {
             Some(v) => v,
+            None => continue,
+        };
+
+        let cfg = db_config::get_collection_config(conn, &collection.name)?;
+
+        // The collection's library path (set by recursive `dat add`), used when
+        // falling back to the library-wide default destination.
+        let hierarchy =
+            dats::primary_node_path(conn, version.id)?.unwrap_or_else(|| collection.name.clone());
+        let explicit = cfg.as_ref().and_then(|c| c.dest_path.as_deref());
+
+        let dest_root = match resolve_dest_root(explicit, default_dest, &hierarchy) {
+            Some(root) => root,
             None => {
-                println!(
-                    "Warning: No active version for collection '{}'",
-                    collection.name
-                );
+                // No destination resolved — counted and reported, never silent.
+                skipped_no_dest += 1;
                 continue;
             }
         };
 
+        planned_any = true;
         println!("Planning for: {} (v{})", collection.name, version.version);
 
         // Find all matched ROMs for this version
         let matches = find_matched_roms(conn, version.id, &collection.name)?;
 
-        // Apply 1G1R filtering if enabled
-        let matches = if let Some(extra) = &cfg.extra_config {
-            if extra.one_g_one_r {
+        // Apply 1G1R filtering if enabled for this collection.
+        let matches = match cfg.as_ref().and_then(|c| c.extra_config.as_ref()) {
+            Some(extra) if extra.one_g_one_r => {
                 let prefs = extra.to_filter_preferences();
-                let filtered = apply_one_g_one_r_filter(&matches, &prefs);
                 let original_count = matches.len();
-                let filtered_count = filtered.len();
-                if filtered_count < original_count {
+                let filtered = apply_one_g_one_r_filter(&matches, &prefs);
+                if filtered.len() < original_count {
                     println!(
                         "  1G1R: {} -> {} ROMs (filtered {} variants)",
                         original_count,
-                        filtered_count,
-                        original_count - filtered_count
+                        filtered.len(),
+                        original_count - filtered.len()
                     );
                 }
                 filtered
-            } else {
-                matches
             }
-        } else {
-            matches
+            _ => matches,
         };
 
         let mut already_correct = 0;
@@ -150,7 +132,7 @@ pub fn generate_plan_filtered(conn: &Connection, dat_filter: Option<&str>) -> Re
 
         for m in matches {
             let multi_rom = roms_per_game.get(&m.game_name).copied().unwrap_or(1) > 1;
-            let dest = build_dest_path(dest_path, &m.game_name, &m.rom_name, multi_rom);
+            let dest = build_dest_path(&dest_root, &m.game_name, &m.rom_name, multi_rom);
 
             // Check if file already exists at destination with correct hash
             if is_file_correct_at_dest(&dest, &m.sha1)? {
@@ -179,6 +161,26 @@ pub fn generate_plan_filtered(conn: &Connection, dat_filter: Option<&str>) -> Re
             "  {} already correct, {} to copy",
             already_correct, copy_count
         );
+    }
+
+    // Never skip silently: report collections left out because no destination
+    // could be resolved, and how to include them.
+    if skipped_no_dest > 0 {
+        println!();
+        println!(
+            "{} collection(s) skipped — no destination resolved.",
+            skipped_no_dest
+        );
+        println!("  Set one per collection:  cat198x config set <collection> dest_path <path>");
+        println!("  or library-wide:         default_dest_path in config.toml");
+    }
+
+    if let Some(pattern) = dat_filter
+        && !filter_matched_any
+    {
+        println!("No collections match the filter: {}", pattern);
+    } else if !planned_any && skipped_no_dest == 0 {
+        println!("No collections with an active version to plan.");
     }
 
     Ok(plan)
@@ -236,6 +238,22 @@ fn find_matched_roms(
 }
 
 /// Build destination path for a ROM
+/// Resolve a collection's destination root, in order of precedence:
+///   1. an explicit per-collection `dest_path`, used as-is;
+///   2. otherwise the library-wide `default_dest` joined with the collection's
+///      library path (`hierarchy`), so a whole set is tidied from one setting;
+///   3. otherwise `None` — no destination, and the caller skips the collection.
+fn resolve_dest_root(
+    explicit: Option<&str>,
+    default_dest: Option<&str>,
+    hierarchy: &str,
+) -> Option<String> {
+    match explicit {
+        Some(p) => Some(p.to_string()),
+        None => default_dest.map(|base| format!("{}/{}", base.trim_end_matches('/'), hierarchy)),
+    }
+}
+
 /// Build the on-disk destination for one ROM under its collection's root.
 ///
 /// Loose layout: a single-ROM game is placed flat as `dest_root/rom_name` — the
@@ -486,6 +504,35 @@ mod tests {
 
         let plan = generate_plan(conn).unwrap();
         assert!(plan.is_empty());
+    }
+
+    #[test]
+    fn resolve_dest_root_prefers_explicit_path() {
+        // An explicit per-collection dest_path wins and is used verbatim,
+        // ignoring both the default and the hierarchy.
+        assert_eq!(
+            resolve_dest_root(Some("/explicit/here"), Some("/lib"), "Acorn/BBC"),
+            Some("/explicit/here".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_dest_root_falls_back_to_default_plus_hierarchy() {
+        assert_eq!(
+            resolve_dest_root(None, Some("/Volumes/Data"), "TOSEC-PIX/Acorn/BBC"),
+            Some("/Volumes/Data/TOSEC-PIX/Acorn/BBC".to_string())
+        );
+        // A trailing slash on the default base is normalised away.
+        assert_eq!(
+            resolve_dest_root(None, Some("/Volumes/Data/"), "TOSEC/Sinclair"),
+            Some("/Volumes/Data/TOSEC/Sinclair".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_dest_root_is_none_without_explicit_or_default() {
+        // Neither an explicit path nor a default: no destination, caller skips.
+        assert_eq!(resolve_dest_root(None, None, "Acorn/BBC"), None);
     }
 
     #[test]

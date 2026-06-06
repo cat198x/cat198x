@@ -4,6 +4,7 @@ use anyhow::{Context, Result};
 use std::fs;
 use std::path::PathBuf;
 
+use crate::config::Config;
 use crate::plan::{Plan, generate_plan_filtered};
 
 use super::{get_data_dir, open_database};
@@ -13,6 +14,15 @@ pub fn run(dat_filter: Option<String>, data_dir: Option<PathBuf>) -> Result<()> 
     let db = open_database(data_dir.clone())?;
     let conn = db.conn();
 
+    // The library-wide default destination (if configured) lets collections
+    // without their own dest_path be planned under one root.
+    let config_path = get_data_dir(data_dir.clone())?.join("config.toml");
+    let file_config = if config_path.exists() {
+        Config::load(&config_path).unwrap_or_default()
+    } else {
+        Config::default()
+    };
+
     if let Some(ref filter) = dat_filter {
         println!("Generating plan for collections matching: {}", filter);
     } else {
@@ -20,7 +30,11 @@ pub fn run(dat_filter: Option<String>, data_dir: Option<PathBuf>) -> Result<()> 
     }
     println!();
 
-    let plan = generate_plan_filtered(conn, dat_filter.as_deref())?;
+    let plan = generate_plan_filtered(
+        conn,
+        dat_filter.as_deref(),
+        file_config.default_dest_path.as_deref(),
+    )?;
 
     if plan.is_empty() {
         println!();

@@ -13,6 +13,14 @@ pub struct Config {
     /// Default merge mode for MAME sets
     #[serde(default)]
     pub default_merge_mode: MergeMode,
+
+    /// Library-wide destination root for reorganised files. When set, any
+    /// collection without its own `dest_path` is laid out under
+    /// `<default_dest_path>/<collection library path>`, so a whole set can be
+    /// tidied from one setting instead of a destination per collection. `None`
+    /// leaves such collections out of the plan (reported, never silent).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_dest_path: Option<String>,
 }
 
 /// Output format for organized ROM files
@@ -99,6 +107,7 @@ mod tests {
         let config = Config {
             default_output_format: OutputFormat::Zip,
             default_merge_mode: MergeMode::NonMerged,
+            default_dest_path: None,
         };
         let toml_str = toml::to_string_pretty(&config).unwrap();
 
@@ -110,6 +119,7 @@ mod tests {
         let config = Config {
             default_output_format: OutputFormat::TorrentZip,
             default_merge_mode: MergeMode::NonMerged,
+            default_dest_path: None,
         };
         let toml_str = toml::to_string_pretty(&config).unwrap();
 
@@ -121,6 +131,7 @@ mod tests {
         let config = Config {
             default_output_format: OutputFormat::Loose,
             default_merge_mode: MergeMode::Merged,
+            default_dest_path: None,
         };
         let toml_str = toml::to_string_pretty(&config).unwrap();
 
@@ -132,6 +143,7 @@ mod tests {
         let config = Config {
             default_output_format: OutputFormat::Loose,
             default_merge_mode: MergeMode::Split,
+            default_dest_path: None,
         };
         let toml_str = toml::to_string_pretty(&config).unwrap();
 
@@ -185,6 +197,7 @@ mod tests {
         let original = Config {
             default_output_format: OutputFormat::TorrentZip,
             default_merge_mode: MergeMode::Split,
+            default_dest_path: None,
         };
 
         let toml_str = toml::to_string_pretty(&original).unwrap();
@@ -202,6 +215,7 @@ mod tests {
         let config = Config {
             default_output_format: OutputFormat::Zip,
             default_merge_mode: MergeMode::Merged,
+            default_dest_path: None,
         };
 
         // Create temp file and save
@@ -275,6 +289,7 @@ mod tests {
         let config = Config {
             default_output_format: OutputFormat::TorrentZip,
             default_merge_mode: MergeMode::Merged,
+            default_dest_path: None,
         };
         let cloned = config.clone();
 
