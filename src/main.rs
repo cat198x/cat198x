@@ -95,6 +95,11 @@ enum Commands {
         /// Only plan for specific DAT paths (glob patterns supported)
         #[arg(long)]
         dat: Option<String>,
+
+        /// Move files into place (delete the source) instead of copying — a true
+        /// in-place tidy. Rollback-logged; copy is the default.
+        #[arg(long)]
+        r#move: bool,
     },
 
     /// Apply a previously generated plan
@@ -202,7 +207,7 @@ fn main() -> Result<()> {
         } => status::run(collection, detailed, merge_mode, cli.data_dir),
         Commands::Stats { group_by } => stats_cmd::run(group_by.as_deref(), cli.data_dir),
         Commands::Config(cmd) => config_cmd::run(cmd, cli.data_dir),
-        Commands::Plan { dat } => plan_cmd::run(dat, cli.data_dir),
+        Commands::Plan { dat, r#move } => plan_cmd::run(dat, r#move, cli.data_dir),
         Commands::Apply {
             dry_run,
             skip_space_check,

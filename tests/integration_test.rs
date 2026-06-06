@@ -662,7 +662,7 @@ fn test_plan_generation() {
 
     // Generate plan - note: this will print output but we just verify it doesn't panic
     // A real plan would require destination configuration
-    cli::plan::run(None, env.data_dir_opt()).unwrap();
+    cli::plan::run(None, false, env.data_dir_opt()).unwrap();
 
     // Check that the plans directory exists
     let plans_dir = env.data_dir.join("objects/plans");
@@ -793,7 +793,7 @@ fn test_plan_apply_rollback_cycle() {
     drop(db);
 
     // Generate plan
-    cli::plan::run(None, env.data_dir_opt()).expect("Plan generation failed");
+    cli::plan::run(None, false, env.data_dir_opt()).expect("Plan generation failed");
 
     // Verify plan was created with operations
     let plans_dir = env.data_dir.join("objects/plans");
@@ -922,7 +922,7 @@ fn test_apply_from_zip_archive() {
     drop(db);
 
     // Generate and apply plan
-    cli::plan::run(None, env.data_dir_opt()).expect("Plan generation failed");
+    cli::plan::run(None, false, env.data_dir_opt()).expect("Plan generation failed");
     cli::apply::run(false, true, env.data_dir_opt()).expect("Apply failed");
 
     // Verify file was extracted to destination
@@ -993,7 +993,7 @@ fn test_stale_plan_detection() {
     drop(db);
 
     // Generate plan
-    cli::plan::run(None, env.data_dir_opt()).unwrap();
+    cli::plan::run(None, false, env.data_dir_opt()).unwrap();
 
     // Now modify the state by adding a new file and rescanning
     create_test_rom(&env.roms_dir, "new_file.rom", b"new content");
@@ -1112,7 +1112,7 @@ fn test_multi_file_plan_apply() {
     drop(db);
 
     // Generate plan
-    cli::plan::run(None, env.data_dir_opt()).unwrap();
+    cli::plan::run(None, false, env.data_dir_opt()).unwrap();
 
     // Verify plan has 3 operations
     let plans_dir = env.data_dir.join("objects/plans");
@@ -1208,7 +1208,7 @@ fn test_apply_skips_already_correct_files() {
     drop(db);
 
     // Generate plan - should detect file is already correct
-    cli::plan::run(None, env.data_dir_opt()).unwrap();
+    cli::plan::run(None, false, env.data_dir_opt()).unwrap();
 
     // When no operations are needed, plan file might not be saved.
     // The key verification is that the destination file still has correct content
@@ -2056,7 +2056,7 @@ fn test_recursive_add_plans_into_hierarchical_destination() {
     .unwrap();
 
     // Plan, then read the saved plan and assert the destination is hierarchical.
-    cli::plan::run(None, env.data_dir_opt()).unwrap();
+    cli::plan::run(None, false, env.data_dir_opt()).unwrap();
 
     let plans_dir = env.data_dir.join("objects/plans");
     let plan_file = fs::read_dir(&plans_dir)
@@ -2193,7 +2193,7 @@ fn test_zip_output_format_plans_applies_and_converges() {
     }
 
     // Plan: one repack to an archive named after the game.
-    cli::plan::run(None, env.data_dir_opt()).unwrap();
+    cli::plan::run(None, false, env.data_dir_opt()).unwrap();
     let plans_dir = env.data_dir.join("objects/plans");
     let plan_file = fs::read_dir(&plans_dir)
         .unwrap()
@@ -2226,9 +2226,11 @@ fn test_zip_output_format_plans_applies_and_converges() {
     let db = env.db();
     let plan = generate_plan_filtered(
         db.conn(),
-        None,
-        Some(&dest_root.to_string_lossy()),
-        OutputFormat::Zip,
+        &cat198x::plan::PlanOptions {
+            default_dest: Some(dest_root.to_string_lossy().into_owned()),
+            default_format: OutputFormat::Zip,
+            ..Default::default()
+        },
     )
     .unwrap();
     assert_eq!(
@@ -2275,9 +2277,11 @@ fn test_plan_records_per_collection_breakdown() {
     let db = env.db();
     let plan = generate_plan_filtered(
         db.conn(),
-        None,
-        Some(&dest.to_string_lossy()),
-        OutputFormat::Loose,
+        &cat198x::plan::PlanOptions {
+            default_dest: Some(dest.to_string_lossy().into_owned()),
+            default_format: OutputFormat::Loose,
+            ..Default::default()
+        },
     )
     .unwrap();
 
@@ -2289,4 +2293,82 @@ fn test_plan_records_per_collection_breakdown() {
     assert_eq!(stat.to_write, 1, "one ROM to copy");
     assert_eq!(stat.already_correct, 0);
     assert!(stat.bytes > 0);
+}
+
+/// `plan --move` relocates a misnamed file into its canonical place and removes
+/// the original, rather than copying and leaving a duplicate.
+#[test]
+fn test_move_mode_relocates_and_removes_source() {
+    use cat198x::{ConfigCommands, DatCommands, SourceCommands};
+    use sha1::Digest;
+
+    let env = TestEnv::new();
+    env.init();
+
+    let content = b"hello";
+    let sha1_hash = cat198x::util::hex_upper(sha1::Sha1::digest(content));
+    // The DAT's canonical ROM name is "test.rom"; the source file is misnamed,
+    // so a real relocation happens.
+    let dat = create_matching_dat(env.temp_dir.path(), "Move Test", &sha1_hash);
+    cli::dat::run(
+        DatCommands::Add {
+            path: dat,
+            collection: None,
+            recursive: false,
+        },
+        env.data_dir_opt(),
+    )
+    .unwrap();
+
+    let misnamed = env.roms_dir.join("wrongname.rom");
+    fs::write(&misnamed, content).unwrap();
+    cli::source::run(
+        SourceCommands::Add {
+            path: env.roms_dir.clone(),
+        },
+        env.data_dir_opt(),
+    )
+    .unwrap();
+    cli::scan::run(None, false, env.data_dir_opt()).unwrap();
+
+    let dest_root = env.temp_dir.path().join("library");
+    cli::config::run(
+        ConfigCommands::SetDefault {
+            key: "dest_path".to_string(),
+            value: dest_root.to_string_lossy().into_owned(),
+        },
+        env.data_dir_opt(),
+    )
+    .unwrap();
+
+    // Plan with --move, then apply.
+    cli::plan::run(None, true, env.data_dir_opt()).unwrap();
+    let plans_dir = env.data_dir.join("objects/plans");
+    let plan_json = fs::read_to_string(
+        fs::read_dir(&plans_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .find(|p| p.extension().map(|x| x == "json").unwrap_or(false))
+            .expect("a plan file"),
+    )
+    .unwrap();
+    assert!(
+        plan_json.contains("\"type\": \"move\""),
+        "--move should produce move ops, plan was:\n{plan_json}"
+    );
+
+    cli::apply::run(false, true, env.data_dir_opt()).unwrap();
+
+    // Canonical file placed; misnamed original gone (moved, not copied).
+    let placed = dest_root.join("Move Test").join("test.rom");
+    assert!(
+        placed.is_file(),
+        "canonical file should exist at {}",
+        placed.display()
+    );
+    assert!(
+        !misnamed.exists(),
+        "the misnamed source should have been removed by the move"
+    );
 }

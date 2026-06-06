@@ -146,6 +146,18 @@ impl Plan {
         self.summary.total_bytes += size;
     }
 
+    /// Add a move operation (copy into place, then delete the source).
+    pub fn add_move(&mut self, source: SourceRef, dest: String, size: u64) {
+        let id = self.operations.len() as u64;
+        self.operations.push(Operation {
+            id,
+            status: OperationStatus::Pending,
+            kind: OperationKind::Move { source, dest, size },
+        });
+        self.summary.move_count += 1;
+        self.summary.total_bytes += size;
+    }
+
     /// Add a repack operation: one archive containing a game's ROMs. `size` is
     /// the total uncompressed bytes, used for the plan summary and space check.
     pub fn add_repack(&mut self, sources: Vec<SourceRef>, dest: String, format: String, size: u64) {

@@ -5,12 +5,12 @@ use std::fs;
 use std::path::PathBuf;
 
 use crate::config::Config;
-use crate::plan::{Plan, generate_plan_filtered};
+use crate::plan::{Plan, PlanOptions, generate_plan_filtered};
 
 use super::{get_data_dir, open_database};
 
 /// Run the plan command
-pub fn run(dat_filter: Option<String>, data_dir: Option<PathBuf>) -> Result<()> {
+pub fn run(dat_filter: Option<String>, move_files: bool, data_dir: Option<PathBuf>) -> Result<()> {
     let db = open_database(data_dir.clone())?;
     let conn = db.conn();
 
@@ -32,9 +32,12 @@ pub fn run(dat_filter: Option<String>, data_dir: Option<PathBuf>) -> Result<()> 
 
     let plan = generate_plan_filtered(
         conn,
-        dat_filter.as_deref(),
-        file_config.default_dest_path.as_deref(),
-        file_config.default_output_format,
+        &PlanOptions {
+            dat_filter,
+            default_dest: file_config.default_dest_path,
+            default_format: file_config.default_output_format,
+            move_files,
+        },
     )?;
 
     let data_dir = get_data_dir(data_dir)?;

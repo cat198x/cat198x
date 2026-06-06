@@ -32,26 +32,34 @@ pub struct MatchedRom {
     pub archive_path: Option<String>,
 }
 
-/// Generate a plan for all configured collections
-///
-/// If `dat_filter` is provided, only collections matching the glob pattern
-/// will be included in the plan.
-pub fn generate_plan(conn: &Connection) -> Result<Plan> {
-    generate_plan_filtered(conn, None, None, OutputFormat::Loose)
+/// Options controlling plan generation.
+#[derive(Debug, Clone, Default)]
+pub struct PlanOptions {
+    /// Glob over collection names; `None` plans every collection.
+    pub dat_filter: Option<String>,
+    /// Library-wide destination root for collections without their own dest_path.
+    pub default_dest: Option<String>,
+    /// Output format for collections without their own setting.
+    pub default_format: OutputFormat,
+    /// Move files into place (and delete the source) instead of copying — a true
+    /// in-place tidy rather than a duplicating copy. Off (copy) by default.
+    pub move_files: bool,
 }
 
-/// Generate a plan with optional collection name filtering
+/// Generate a plan for all configured collections with default options.
+pub fn generate_plan(conn: &Connection) -> Result<Plan> {
+    generate_plan_filtered(conn, &PlanOptions::default())
+}
+
+/// Generate a plan from the given options.
 ///
-/// The filter supports glob patterns:
-/// - `*` matches any sequence of characters
-/// - `?` matches any single character
-/// - Case-insensitive matching
-pub fn generate_plan_filtered(
-    conn: &Connection,
-    dat_filter: Option<&str>,
-    default_dest: Option<&str>,
-    default_format: OutputFormat,
-) -> Result<Plan> {
+/// `dat_filter` supports glob patterns (`*`, `?`, case-insensitive) over
+/// collection names.
+pub fn generate_plan_filtered(conn: &Connection, opts: &PlanOptions) -> Result<Plan> {
+    let dat_filter = opts.dat_filter.as_deref();
+    let default_dest = opts.default_dest.as_deref();
+    let default_format = opts.default_format;
+
     // Calculate state hash
     let state_hash = compute_state_hash(conn)?;
     let mut plan = Plan::new(state_hash);
@@ -154,21 +162,23 @@ pub fn generate_plan_filtered(
 
                     let full_source = format!("{}/{}", m.source_root, m.source_path);
                     bytes += m.size as u64;
-                    plan.add_copy(
-                        SourceRef {
-                            path: full_source,
-                            archive_path: m.archive_path,
-                            sha1: m.sha1,
-                            entry_name: None,
-                        },
-                        dest,
-                        m.size as u64,
-                    );
+                    let source = SourceRef {
+                        path: full_source,
+                        archive_path: m.archive_path,
+                        sha1: m.sha1,
+                        entry_name: None,
+                    };
+                    if opts.move_files {
+                        plan.add_move(source, dest, m.size as u64);
+                    } else {
+                        plan.add_copy(source, dest, m.size as u64);
+                    }
                     to_write += 1;
                 }
+                let verb = if opts.move_files { "move" } else { "copy" };
                 println!(
-                    "  {} already correct, {} to copy",
-                    already_correct, to_write
+                    "  {} already correct, {} to {}",
+                    already_correct, to_write, verb
                 );
             }
             Some(tag) => {
@@ -693,7 +703,7 @@ mod tests {
         let vid = collections::add_version(conn, cid, "1.0", "/tmp/x.dat", true).unwrap();
         dats::create_node(conn, vid, None, "No Dest Coll", "dat", "No Dest Coll").unwrap();
 
-        let plan = generate_plan_filtered(conn, None, None, OutputFormat::Loose).unwrap();
+        let plan = generate_plan_filtered(conn, &PlanOptions::default()).unwrap();
         assert!(plan.is_empty(), "no destination → no operations");
         assert_eq!(plan.skipped_no_dest, vec!["No Dest Coll".to_string()]);
     }
