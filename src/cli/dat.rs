@@ -57,18 +57,32 @@ fn add_dat(path: &Path, collection_name: Option<&str>, data_dir: Option<PathBuf>
     Ok(())
 }
 
+/// Outcome of importing a single DAT file.
+enum ImportOutcome {
+    /// A new version was imported.
+    Added { games: usize, roms: usize },
+    /// This exact version was already present; nothing changed.
+    AlreadyPresent,
+}
+
 /// Import a single DAT file into an already-open database.
 ///
-/// Returns `(games, roms)` imported. With `quiet`, the per-file progress chatter
-/// is suppressed so callers (such as recursive add) can print their own summary.
-/// Each call commits its own transaction, so one bad DAT in a batch does not roll
-/// back the DATs imported before it.
+/// Returns what happened: a new version was [`Added`](ImportOutcome::Added), or
+/// the same version was [`AlreadyPresent`](ImportOutcome::AlreadyPresent) and the
+/// import was skipped. Re-adding an unchanged DAT is therefore a no-op rather than
+/// a `UNIQUE` constraint error, which makes a recursive add over a pack that
+/// overlaps the catalogue safe to repeat.
+///
+/// With `quiet`, the per-file progress chatter is suppressed so callers (such as
+/// recursive add) can print their own summary. Each call commits its own
+/// transaction, so one bad DAT in a batch does not roll back the DATs imported
+/// before it.
 fn import_dat_file(
     db: &Database,
     path: &Path,
     collection_name: Option<&str>,
     quiet: bool,
-) -> Result<(usize, usize)> {
+) -> Result<ImportOutcome> {
     let abs_path =
         std::fs::canonicalize(path).with_context(|| format!("Cannot resolve path: {:?}", path))?;
 
@@ -111,6 +125,26 @@ fn import_dat_file(
 
     let conn = db.conn();
 
+    // Version string (the DAT's own version, or today's date as a fallback).
+    let version = header.version.clone().unwrap_or_else(chrono_lite_version);
+
+    // Idempotency: if this exact version is already present for the collection,
+    // skip rather than fail on the UNIQUE(collection_id, version) constraint.
+    // This makes re-running a recursive add over a pack that overlaps the
+    // catalogue safe — already-present DATs are reported, not errors.
+    if let Some(existing) = collections::get_collection_by_name(conn, &coll_name)?
+        && collections::get_version_by_name(conn, existing.id, &version)?.is_some()
+    {
+        if !quiet {
+            println!();
+            println!(
+                "Version '{}' of '{}' is already present; nothing to do.",
+                version, coll_name
+            );
+        }
+        return Ok(ImportOutcome::AlreadyPresent);
+    }
+
     // Wrap the whole import (collection, version, node, games, ROMs) in one
     // transaction: a mid-import failure rolls back cleanly instead of leaving
     // orphaned partial rows, and the per-row inserts commit once rather than
@@ -134,12 +168,6 @@ fn import_dat_file(
                 .ok_or_else(|| anyhow::anyhow!("Failed to create collection"))?
         }
     };
-
-    // Get version string
-    let version = header.version.clone().unwrap_or_else(|| {
-        // Use current date as version if none specified
-        chrono_lite_version()
-    });
 
     // Add version (activating it)
     let path_str = abs_path.to_string_lossy();
@@ -191,7 +219,10 @@ fn import_dat_file(
         println!("Run 'cat198x scan' to match files against this DAT.");
     }
 
-    Ok((game_count, rom_count))
+    Ok(ImportOutcome::Added {
+        games: game_count,
+        roms: rom_count,
+    })
 }
 
 /// Add every `.dat`/`.xml` file found under `dir` (recursively).
@@ -230,13 +261,14 @@ fn add_dats_recursive(
     let db = open_database(data_dir)?;
 
     let mut added = 0usize;
+    let mut skipped = 0usize;
     let mut games_total = 0usize;
     let mut roms_total = 0usize;
     let mut failures: Vec<(PathBuf, String)> = Vec::new();
 
     for (idx, file) in dat_files.iter().enumerate() {
         match import_dat_file(&db, file, None, true) {
-            Ok((games, roms)) => {
+            Ok(ImportOutcome::Added { games, roms }) => {
                 added += 1;
                 games_total += games;
                 roms_total += roms;
@@ -252,6 +284,7 @@ fn add_dats_recursive(
                     games
                 );
             }
+            Ok(ImportOutcome::AlreadyPresent) => skipped += 1,
             Err(e) => failures.push((file.clone(), e.to_string())),
         }
     }
@@ -261,6 +294,9 @@ fn add_dats_recursive(
         "Added {} DAT file(s): {} games, {} ROMs.",
         added, games_total, roms_total
     );
+    if skipped > 0 {
+        println!("{} already present, skipped.", skipped);
+    }
     if !failures.is_empty() {
         println!("{} file(s) failed:", failures.len());
         for (file, err) in &failures {
@@ -864,5 +900,51 @@ mod tests {
     fn collect_dat_files_on_empty_dir_returns_nothing() {
         let dir = tempfile::tempdir().expect("create temp dir");
         assert!(collect_dat_files(dir.path()).is_empty());
+    }
+
+    const MINIMAL_DAT: &str = r#"<?xml version="1.0"?>
+<datafile>
+  <header>
+    <name>Test Collection</name>
+    <version>2020-01-01</version>
+  </header>
+  <game name="Game One">
+    <description>Game One</description>
+    <rom name="game one.rom" size="1000" sha1="ABC123"/>
+  </game>
+</datafile>"#;
+
+    #[test]
+    fn import_dat_file_is_idempotent() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let dat_path = dir.path().join("Test Collection.dat");
+        fs::write(&dat_path, MINIMAL_DAT).expect("write dat");
+
+        let db = Database::open_in_memory().expect("open db");
+
+        // First import adds the version.
+        let first = import_dat_file(&db, &dat_path, None, true).expect("first import");
+        assert!(
+            matches!(first, ImportOutcome::Added { games: 1, .. }),
+            "first import should add one game"
+        );
+
+        // Re-importing the same version is a reported no-op, not a UNIQUE error.
+        let second = import_dat_file(&db, &dat_path, None, true).expect("second import");
+        assert!(
+            matches!(second, ImportOutcome::AlreadyPresent),
+            "re-import should skip as already present"
+        );
+
+        // And no duplicate version row was created.
+        let conn = db.conn();
+        let coll = collections::get_collection_by_name(conn, "Test Collection")
+            .expect("query collection")
+            .expect("collection exists");
+        assert_eq!(
+            collections::count_versions(conn, coll.id).expect("count versions"),
+            1,
+            "exactly one version should exist after a repeated import"
+        );
     }
 }
