@@ -1,7 +1,7 @@
 //! Plan generation logic
 
 use anyhow::{Context, Result};
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 use sha2::{Digest as Sha2Digest, Sha256};
 use std::collections::HashMap;
 use std::path::Path;
@@ -147,7 +147,7 @@ pub fn generate_plan_filtered(
                     let multi_rom = roms_per_game.get(&m.game_name).copied().unwrap_or(1) > 1;
                     let dest = build_dest_path(&dest_root, &m.game_name, &m.rom_name, multi_rom);
 
-                    if is_file_correct_at_dest(&dest, &m.sha1)? {
+                    if is_file_correct_at_dest(conn, &dest, &m.sha1)? {
                         already_correct += 1;
                         continue;
                     }
@@ -417,22 +417,53 @@ fn build_dest_path(dest_root: &str, game_name: &str, rom_name: &str, multi_rom: 
 }
 
 /// Check if a file at the destination already has the correct hash
-fn is_file_correct_at_dest(path: &str, expected_sha1: &str) -> Result<bool> {
+fn is_file_correct_at_dest(conn: &Connection, path: &str, expected_sha1: &str) -> Result<bool> {
     use sha1::Digest as Sha1Digest;
 
-    let path = Path::new(path);
-    if !path.exists() {
+    // Fast path: if the scan already indexed a loose file at this exact path
+    // with the expected hash, trust the catalogue instead of re-reading it.
+    // For an in-place tidy the destination *is* a scanned source file, so this
+    // avoids re-hashing the whole library over the network — the scan just did.
+    if catalogued_file_has_sha1(conn, path, expected_sha1)? {
+        return Ok(true);
+    }
+
+    let fs_path = Path::new(path);
+    if !fs_path.exists() {
         return Ok(false);
     }
 
-    // Hash the file and compare
-    let contents = std::fs::read(path).context("Failed to read destination file")?;
+    // Fall back to hashing on disk (destination not in the catalogue, or its
+    // recorded hash differs — re-verify the real bytes rather than trust stale).
+    let contents = std::fs::read(fs_path).context("Failed to read destination file")?;
     let mut hasher = sha1::Sha1::new();
     Sha1Digest::update(&mut hasher, &contents);
     let hash = Sha1Digest::finalize(hasher);
     let actual_sha1 = crate::util::hex_upper(hash);
 
     Ok(actual_sha1.eq_ignore_ascii_case(expected_sha1))
+}
+
+/// Whether the catalogue holds a loose file at the absolute path `abs_path`
+/// whose recorded SHA1 matches `expected_sha1`.
+fn catalogued_file_has_sha1(
+    conn: &Connection,
+    abs_path: &str,
+    expected_sha1: &str,
+) -> Result<bool> {
+    let found: Option<i64> = conn
+        .query_row(
+            "SELECT 1 FROM file_locations fl
+             JOIN sources s ON fl.source_id = s.id
+             WHERE fl.archive_path IS NULL
+               AND (s.path || '/' || fl.path) = ?1
+               AND fl.sha1 = ?2 COLLATE NOCASE
+             LIMIT 1",
+            rusqlite::params![abs_path, expected_sha1],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(found.is_some())
 }
 
 /// Compute state hash for plan validation
@@ -665,6 +696,32 @@ mod tests {
         let plan = generate_plan_filtered(conn, None, None, OutputFormat::Loose).unwrap();
         assert!(plan.is_empty(), "no destination → no operations");
         assert_eq!(plan.skipped_no_dest, vec!["No Dest Coll".to_string()]);
+    }
+
+    #[test]
+    fn catalogued_file_has_sha1_matches_scanned_loose_file() {
+        let db = setup_db();
+        let conn = db.conn();
+        conn.execute(
+            "INSERT INTO sources (id, path, case_sensitive) VALUES (1, '/lib/TOSEC', 0)",
+            [],
+        )
+        .unwrap();
+        conn.execute("INSERT INTO files (sha1, size) VALUES ('ABC123', 10)", [])
+            .unwrap();
+        conn.execute(
+            "INSERT INTO file_locations (sha1, source_id, path, archive_path)
+             VALUES ('ABC123', 1, 'Acorn/game.rom', NULL)",
+            [],
+        )
+        .unwrap();
+
+        // Exact path + hash → trusted (case-insensitive on the hash).
+        assert!(catalogued_file_has_sha1(conn, "/lib/TOSEC/Acorn/game.rom", "ABC123").unwrap());
+        assert!(catalogued_file_has_sha1(conn, "/lib/TOSEC/Acorn/game.rom", "abc123").unwrap());
+        // Wrong hash or wrong path → not trusted (falls back to disk hashing).
+        assert!(!catalogued_file_has_sha1(conn, "/lib/TOSEC/Acorn/game.rom", "DEF456").unwrap());
+        assert!(!catalogued_file_has_sha1(conn, "/lib/TOSEC/Acorn/other.rom", "ABC123").unwrap());
     }
 
     #[test]
