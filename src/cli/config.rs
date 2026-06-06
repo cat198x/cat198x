@@ -18,11 +18,68 @@ pub fn run(cmd: ConfigCommands, data_dir: Option<PathBuf>) -> Result<()> {
             value,
         } => set_config(&collection, &key, &value, data_dir),
         ConfigCommands::SetDefault { key, value } => set_default(&key, &value, data_dir),
+        ConfigCommands::GetDefault { key } => get_default(key.as_deref(), data_dir),
         ConfigCommands::Get { collection, key } => {
             get_config(&collection, key.as_deref(), data_dir)
         }
         ConfigCommands::List { collection } => list_config(collection.as_deref(), data_dir),
     }
+}
+
+/// Load the library-wide config from `config.toml`, returning its path and the
+/// parsed config (defaults if the file does not exist yet).
+fn load_file_config(data_dir: Option<PathBuf>) -> Result<(PathBuf, Config)> {
+    let path = get_data_dir(data_dir)?.join("config.toml");
+    let config = if path.exists() {
+        Config::load(&path)?
+    } else {
+        Config::default()
+    };
+    Ok((path, config))
+}
+
+/// The canonical lowercase string for an output format.
+fn output_format_str(f: OutputFormat) -> &'static str {
+    match f {
+        OutputFormat::Loose => "loose",
+        OutputFormat::Zip => "zip",
+        OutputFormat::TorrentZip => "torrentzip",
+    }
+}
+
+/// The canonical string for a merge mode.
+fn merge_mode_str(m: MergeMode) -> &'static str {
+    match m {
+        MergeMode::NonMerged => "non-merged",
+        MergeMode::Merged => "merged",
+        MergeMode::Split => "split",
+    }
+}
+
+/// Print the library-wide defaults (all keys, or one).
+fn get_default(key: Option<&str>, data_dir: Option<PathBuf>) -> Result<()> {
+    let (_, config) = load_file_config(data_dir)?;
+
+    let dest = config.default_dest_path.as_deref().unwrap_or("(not set)");
+    let format = output_format_str(config.default_output_format);
+    let mode = merge_mode_str(config.default_merge_mode);
+
+    match key {
+        Some("dest_path") => println!("{}", dest),
+        Some("output_format") => println!("{}", format),
+        Some("merge_mode") => println!("{}", mode),
+        Some(other) => anyhow::bail!(
+            "Unknown default key: '{}'\n  Valid keys: dest_path, output_format, merge_mode",
+            other
+        ),
+        None => {
+            println!("Library-wide defaults:");
+            println!("  dest_path:     {}", dest);
+            println!("  output_format: {}", format);
+            println!("  merge_mode:    {}", mode);
+        }
+    }
+    Ok(())
 }
 
 /// Apply a library-wide default to the in-memory `Config`, validating the key
@@ -62,12 +119,7 @@ fn set_default_field(config: &mut Config, key: &str, value: &str) -> Result<()> 
 
 /// Set a library-wide default in `config.toml`, creating it if absent.
 fn set_default(key: &str, value: &str, data_dir: Option<PathBuf>) -> Result<()> {
-    let config_path = get_data_dir(data_dir)?.join("config.toml");
-    let mut config = if config_path.exists() {
-        Config::load(&config_path)?
-    } else {
-        Config::default()
-    };
+    let (config_path, mut config) = load_file_config(data_dir)?;
 
     set_default_field(&mut config, key, value)?;
 
@@ -322,13 +374,17 @@ fn get_config(collection: &str, key: Option<&str>, data_dir: Option<PathBuf>) ->
 }
 
 fn list_config(collection: Option<&str>, data_dir: Option<PathBuf>) -> Result<()> {
-    let db = open_database(data_dir)?;
+    let db = open_database(data_dir.clone())?;
     let conn = db.conn();
 
     if let Some(coll) = collection {
         // Show config for specific collection
         get_config(coll, None, None)?;
     } else {
+        // Lead with the library-wide defaults, then the per-collection overrides.
+        get_default(None, data_dir)?;
+        println!();
+
         // Show all configured collections
         let configs = db_config::list_all_configs(conn)?;
 
@@ -400,5 +456,20 @@ mod tests {
         assert!(set_default_field(&mut config, "nonsense", "x").is_err());
         assert!(set_default_field(&mut config, "output_format", "rar").is_err());
         assert!(set_default_field(&mut config, "merge_mode", "fused").is_err());
+    }
+
+    #[test]
+    fn format_strings_round_trip_with_the_setter() {
+        // The display strings match what set_default_field accepts, so
+        // get-default output can be fed back to set-default.
+        let mut config = Config::default();
+        for v in ["loose", "zip", "torrentzip"] {
+            set_default_field(&mut config, "output_format", v).unwrap();
+            assert_eq!(output_format_str(config.default_output_format), v);
+        }
+        for v in ["non-merged", "merged", "split"] {
+            set_default_field(&mut config, "merge_mode", v).unwrap();
+            assert_eq!(merge_mode_str(config.default_merge_mode), v);
+        }
     }
 }

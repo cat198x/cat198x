@@ -164,6 +164,12 @@ pub enum ConfigCommands {
         value: String,
     },
 
+    /// Show the library-wide defaults (all, or a specific key)
+    GetDefault {
+        /// Configuration key (dest_path, output_format, merge_mode); all if omitted
+        key: Option<String>,
+    },
+
     /// Get a configuration value for a collection
     Get {
         /// Collection name
