@@ -6,7 +6,8 @@ use std::io;
 use cat198x::cli::{
     apply as apply_cmd, config as config_cmd, dat as dat_cmd, doctor as doctor_cmd,
     export as export_cmd, init, plan as plan_cmd, quarantine as quarantine_cmd, scan, source,
-    stats as stats_cmd, status, torrent as torrent_cmd, update as update_cmd,
+    stats as stats_cmd, status, torrent as torrent_cmd, unknowns as unknowns_cmd,
+    update as update_cmd,
 };
 use cat198x::{ConfigCommands, DatCommands, QuarantineCommands, SourceCommands, TorrentCommands};
 
@@ -76,6 +77,9 @@ enum Commands {
         #[arg(short, long)]
         merge_mode: Option<String>,
     },
+
+    /// List scanned files matched by no active DAT (written to a file for review)
+    Unknowns,
 
     /// Show overall statistics across all collections
     Stats {
@@ -205,6 +209,7 @@ fn main() -> Result<()> {
             detailed,
             merge_mode,
         } => status::run(collection, detailed, merge_mode, cli.data_dir),
+        Commands::Unknowns => unknowns_cmd::run(cli.data_dir),
         Commands::Stats { group_by } => stats_cmd::run(group_by.as_deref(), cli.data_dir),
         Commands::Config(cmd) => config_cmd::run(cmd, cli.data_dir),
         Commands::Plan { dat, r#move } => plan_cmd::run(dat, r#move, cli.data_dir),

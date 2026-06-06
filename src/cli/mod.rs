@@ -14,6 +14,7 @@ pub mod source;
 pub mod stats;
 pub mod status;
 pub mod torrent;
+pub mod unknowns;
 pub mod update;
 
 use anyhow::{Context, Result};
