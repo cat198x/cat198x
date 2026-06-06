@@ -53,7 +53,9 @@ pub fn run(cmd: DatCommands, data_dir: Option<PathBuf>) -> Result<()> {
 
 fn add_dat(path: &Path, collection_name: Option<&str>, data_dir: Option<PathBuf>) -> Result<()> {
     let db = open_database(data_dir)?;
-    import_dat_file(&db, path, collection_name, false)?;
+    // A single-file add has no recursive-add root, so no hierarchy is inferred;
+    // the node falls back to the flat collection name.
+    import_dat_file(&db, path, collection_name, false, None)?;
     Ok(())
 }
 
@@ -82,6 +84,7 @@ fn import_dat_file(
     path: &Path,
     collection_name: Option<&str>,
     quiet: bool,
+    rel_path: Option<&str>,
 ) -> Result<ImportOutcome> {
     let abs_path =
         std::fs::canonicalize(path).with_context(|| format!("Cannot resolve path: {:?}", path))?;
@@ -173,8 +176,13 @@ fn import_dat_file(
     let path_str = abs_path.to_string_lossy();
     let version_id = collections::add_version(conn, collection.id, &version, &path_str, true)?;
 
-    // Create root DAT node
-    let node_id = dats::create_node(conn, version_id, None, &header.name, "dat", &header.name)?;
+    // Create the DAT node. Its `path` carries the collection's place in the
+    // library tree: the directory of the DAT relative to the recursive-add root
+    // (e.g. "Acorn/BBC/Magazines/Laserbug") when known, falling back to the flat
+    // collection name for a single-file add or a DAT sitting at the add root.
+    // The destination builder reads this path to lay files out hierarchically.
+    let node_path = rel_path.unwrap_or(header.name.as_str());
+    let node_id = dats::create_node(conn, version_id, None, &header.name, "dat", node_path)?;
 
     // Import games and ROMs
     let mut game_count = 0;
@@ -267,7 +275,8 @@ fn add_dats_recursive(
     let mut failures: Vec<(PathBuf, String)> = Vec::new();
 
     for (idx, file) in dat_files.iter().enumerate() {
-        match import_dat_file(&db, file, None, true) {
+        let rel = relative_hierarchy(file, dir);
+        match import_dat_file(&db, file, None, true, rel.as_deref()) {
             Ok(ImportOutcome::Added { games, roms }) => {
                 added += 1;
                 games_total += games;
@@ -307,6 +316,31 @@ fn add_dats_recursive(
     println!("Run 'cat198x scan' to match files against these DATs.");
 
     Ok(())
+}
+
+/// The directory of `file` relative to the recursive-add `root`, as a
+/// `/`-joined string — the collection's place in the library tree.
+///
+/// `root/Acorn/BBC/Magazines/Laserbug/x.dat` under `root` yields
+/// `Some("Acorn/BBC/Magazines/Laserbug")`. A DAT sitting directly in `root`
+/// yields `None` (no hierarchy to infer — the import falls back to the flat
+/// collection name). The separator is always `/` so stored paths are stable
+/// across platforms.
+fn relative_hierarchy(file: &Path, root: &Path) -> Option<String> {
+    let rel = file.strip_prefix(root).ok()?;
+    let dir = rel.parent()?;
+    let segments: Vec<String> = dir
+        .components()
+        .filter_map(|c| match c {
+            std::path::Component::Normal(s) => Some(s.to_string_lossy().into_owned()),
+            _ => None,
+        })
+        .collect();
+    if segments.is_empty() {
+        None
+    } else {
+        Some(segments.join("/"))
+    }
 }
 
 /// Collect every `.dat`/`.xml` file under `dir`, sorted for stable output.
@@ -923,14 +957,14 @@ mod tests {
         let db = Database::open_in_memory().expect("open db");
 
         // First import adds the version.
-        let first = import_dat_file(&db, &dat_path, None, true).expect("first import");
+        let first = import_dat_file(&db, &dat_path, None, true, None).expect("first import");
         assert!(
             matches!(first, ImportOutcome::Added { games: 1, .. }),
             "first import should add one game"
         );
 
         // Re-importing the same version is a reported no-op, not a UNIQUE error.
-        let second = import_dat_file(&db, &dat_path, None, true).expect("second import");
+        let second = import_dat_file(&db, &dat_path, None, true, None).expect("second import");
         assert!(
             matches!(second, ImportOutcome::AlreadyPresent),
             "re-import should skip as already present"
@@ -945,6 +979,79 @@ mod tests {
             collections::count_versions(conn, coll.id).expect("count versions"),
             1,
             "exactly one version should exist after a repeated import"
+        );
+    }
+
+    #[test]
+    fn relative_hierarchy_derives_nested_path() {
+        let root = Path::new("/dats/TOSEC-PIX");
+        let file = Path::new("/dats/TOSEC-PIX/Acorn/BBC/Magazines/Laserbug/x.dat");
+        assert_eq!(
+            relative_hierarchy(file, root),
+            Some("Acorn/BBC/Magazines/Laserbug".to_string())
+        );
+    }
+
+    #[test]
+    fn relative_hierarchy_is_none_at_root() {
+        let root = Path::new("/dats/TOSEC-PIX");
+        let file = Path::new("/dats/TOSEC-PIX/flat.dat");
+        assert_eq!(relative_hierarchy(file, root), None);
+    }
+
+    #[test]
+    fn relative_hierarchy_is_none_when_unrelated_to_root() {
+        let root = Path::new("/dats/TOSEC-PIX");
+        let file = Path::new("/elsewhere/x.dat");
+        assert_eq!(relative_hierarchy(file, root), None);
+    }
+
+    /// Read the single DAT node's stored `path` for a collection version.
+    fn node_path_for(db: &Database, collection: &str) -> String {
+        let conn = db.conn();
+        conn.query_row(
+            "SELECT n.path FROM dat_nodes n
+             JOIN collection_versions cv ON n.version_id = cv.id
+             JOIN collections c ON cv.collection_id = c.id
+             WHERE c.name = ?",
+            [collection],
+            |row| row.get::<_, String>(0),
+        )
+        .expect("query node path")
+    }
+
+    #[test]
+    fn recursive_add_records_relative_hierarchy_on_the_node() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let nested = dir.path().join("Acorn/BBC/Magazines/Laserbug");
+        fs::create_dir_all(&nested).expect("mkdir nested");
+        fs::write(nested.join("coll.dat"), MINIMAL_DAT).expect("write dat");
+
+        let db = Database::open_in_memory().expect("open db");
+        let file = nested.join("coll.dat");
+        let rel = relative_hierarchy(&file, dir.path());
+        import_dat_file(&db, &file, None, true, rel.as_deref()).expect("import");
+
+        assert_eq!(
+            node_path_for(&db, "Test Collection"),
+            "Acorn/BBC/Magazines/Laserbug",
+            "the node path should carry the directory relative to the add root"
+        );
+    }
+
+    #[test]
+    fn single_add_node_path_falls_back_to_collection_name() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let dat_path = dir.path().join("coll.dat");
+        fs::write(&dat_path, MINIMAL_DAT).expect("write dat");
+
+        let db = Database::open_in_memory().expect("open db");
+        import_dat_file(&db, &dat_path, None, true, None).expect("import");
+
+        assert_eq!(
+            node_path_for(&db, "Test Collection"),
+            "Test Collection",
+            "with no hierarchy the node path falls back to the flat collection name"
         );
     }
 }
