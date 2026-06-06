@@ -55,6 +55,16 @@ pub enum DatCommands {
         dir: std::path::PathBuf,
     },
 
+    /// Sort a flat DAT pack into a nested tree by collection name, ready for a
+    /// recursive `dat add` that records the hierarchy
+    Sort {
+        /// Flat directory of DAT files to sort (searched recursively)
+        pack: std::path::PathBuf,
+
+        /// Destination root for the nested tree
+        dest: std::path::PathBuf,
+    },
+
     /// List imported DAT files
     List {
         /// Show all versions, not just active
