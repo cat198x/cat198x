@@ -201,20 +201,23 @@ pub fn run(fix: bool, data_dir: Option<PathBuf>) -> Result<()> {
         if missing_dats.is_empty() {
             checks.push(Check::ok("DAT files accessible"));
         } else {
+            let listed = if missing_dats.len() > 3 {
+                format!(
+                    "{}, ... and {} more",
+                    missing_dats[..3].join(", "),
+                    missing_dats.len() - 3
+                )
+            } else {
+                missing_dats.join(", ")
+            };
             checks.push(Check::warning(
                 "DAT files accessible",
                 &format!(
-                    "{} DAT file(s) not found: {}",
+                    "{} DAT file(s) not found: {}\n         \
+                     Re-point them with 'cat198x dat relink <dir>' \
+                     (searches <dir> for same-named DATs).",
                     missing_dats.len(),
-                    if missing_dats.len() > 3 {
-                        format!(
-                            "{}, ... and {} more",
-                            missing_dats[..3].join(", "),
-                            missing_dats.len() - 3
-                        )
-                    } else {
-                        missing_dats.join(", ")
-                    }
+                    listed
                 ),
             ));
         }
