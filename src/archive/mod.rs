@@ -6,4 +6,4 @@
 
 mod writer;
 
-pub use writer::{TorrentZipWriter, ZipWriter, ZipWriterOptions};
+pub use writer::{TorrentZipWriter, ZipWriter, ZipWriterOptions, is_torrentzip_stamped};

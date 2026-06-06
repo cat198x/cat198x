@@ -144,6 +144,29 @@ fn torrentzip_datetime() -> DateTime {
     DateTime::from_date_and_time(1996, 12, 24, 23, 32, 0).unwrap_or_default()
 }
 
+/// Whether every entry in the ZIP at `path` carries the fixed TorrentZIP
+/// timestamp this writer stamps — the reliable signal distinguishing a cat198x
+/// TorrentZIP from a plain ZIP, whose entries keep real modification times.
+///
+/// Note: cat198x's TorrentZIP omits the canonical `TORRENTZIPPED-xxxxxxxx` EOCD
+/// comment, so this checks the timestamp determinism it actually guarantees, not
+/// full TorrentZIP spec compliance. An empty archive is treated as stamped.
+pub fn is_torrentzip_stamped(path: &Path) -> Result<bool> {
+    let file =
+        File::open(path).with_context(|| format!("Failed to open ZIP: {}", path.display()))?;
+    let mut archive = zip::ZipArchive::new(file)
+        .with_context(|| format!("Failed to read ZIP: {}", path.display()))?;
+
+    let fixed = torrentzip_datetime();
+    for i in 0..archive.len() {
+        let entry = archive.by_index(i)?;
+        if entry.last_modified() != Some(fixed) {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
 impl TorrentZipWriter {
     /// Create a new TorrentZIP writer at the specified path
     pub fn new(dest_path: &Path) -> Result<Self> {
@@ -664,5 +687,26 @@ mod tests {
         let mut content = Vec::new();
         entry.read_to_end(&mut content).unwrap();
         assert_eq!(content, data);
+    }
+
+    #[test]
+    fn is_torrentzip_stamped_distinguishes_torrentzip_from_plain_zip() {
+        let temp = TempDir::new().unwrap();
+        let src = temp.path().join("a.rom");
+        fs::write(&src, b"content").unwrap();
+
+        // A TorrentZIP carries the fixed timestamp on every entry.
+        let tz = temp.path().join("tz.zip");
+        let mut w = TorrentZipWriter::new(&tz).unwrap();
+        w.add_file("a.rom", &src).unwrap();
+        w.finish().unwrap();
+        assert!(is_torrentzip_stamped(&tz).unwrap());
+
+        // A plain ZIP keeps the source's real modification time.
+        let plain = temp.path().join("plain.zip");
+        let mut w = ZipWriter::new(&plain, ZipWriterOptions::default()).unwrap();
+        w.add_file("a.rom", &src).unwrap();
+        w.finish().unwrap();
+        assert!(!is_torrentzip_stamped(&plain).unwrap());
     }
 }

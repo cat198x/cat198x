@@ -179,7 +179,7 @@ pub fn generate_plan_filtered(
                 for game in games {
                     let dest = format!("{}/{}.zip", dest_root.trim_end_matches('/'), game.name);
 
-                    if is_archive_correct_at_dest(&dest, &game.expected)? {
+                    if is_archive_correct_at_dest(&dest, &game.expected, tag)? {
                         already_correct += game.expected.len();
                         continue;
                     }
@@ -342,9 +342,18 @@ fn group_for_archive(matches: Vec<MatchedRom>) -> Vec<ArchiveGame> {
 }
 
 /// Whether the archive at `dest` already holds exactly the expected entries
-/// (matching names and SHA1s). A missing or differing archive returns `false`,
-/// so it is (re)built; an exact match is left untouched, keeping re-runs no-ops.
-fn is_archive_correct_at_dest(dest: &str, expected: &[(String, String)]) -> Result<bool> {
+/// (matching names and SHA1s) *and* is in the requested container format. A
+/// missing, differing, or wrong-format archive returns `false`, so it is
+/// (re)built; an exact match is left untouched, keeping re-runs no-ops.
+///
+/// For `torrentzip`, a content-correct plain ZIP is still rebuilt, because the
+/// container format itself is part of "correct" (TorrentZIP determinism). For
+/// `zip`, any content-correct ZIP — including a TorrentZIP — passes.
+fn is_archive_correct_at_dest(
+    dest: &str,
+    expected: &[(String, String)],
+    format: &str,
+) -> Result<bool> {
     let path = Path::new(dest);
     if !path.exists() {
         return Ok(false);
@@ -360,9 +369,19 @@ fn is_archive_correct_at_dest(dest: &str, expected: &[(String, String)]) -> Resu
     if have.len() != expected.len() {
         return Ok(false);
     }
-    Ok(expected
+    let content_ok = expected
         .iter()
-        .all(|(name, sha1)| have.get(name).is_some_and(|h| h.eq_ignore_ascii_case(sha1))))
+        .all(|(name, sha1)| have.get(name).is_some_and(|h| h.eq_ignore_ascii_case(sha1)));
+    if !content_ok {
+        return Ok(false);
+    }
+
+    // Container-format check: a TorrentZIP target must actually be TorrentZIP.
+    if format == "torrentzip" && !crate::archive::is_torrentzip_stamped(path)? {
+        return Ok(false);
+    }
+
+    Ok(true)
 }
 
 /// Resolve a collection's destination root, in order of precedence:
