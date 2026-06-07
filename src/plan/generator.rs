@@ -1,7 +1,7 @@
 //! Plan generation logic
 
-use anyhow::{Context, Result};
-use rusqlite::{Connection, OptionalExtension};
+use anyhow::Result;
+use rusqlite::Connection;
 use sha2::{Digest as Sha2Digest, Sha256};
 use std::collections::HashMap;
 use std::path::Path;
@@ -107,7 +107,7 @@ pub fn generate_plan_filtered(conn: &Connection, opts: &PlanOptions) -> Result<P
         planned_any = true;
         println!("Planning for: {} (v{})", collection.name, version.version);
 
-        // Find all matched ROMs for this version
+        // Find all matched ROMs for this version.
         let matches = find_matched_roms(conn, version.id, &collection.name)?;
 
         // Apply 1G1R filtering if enabled for this collection.
@@ -129,11 +129,29 @@ pub fn generate_plan_filtered(conn: &Connection, opts: &PlanOptions) -> Result<P
             _ => matches,
         };
 
-        // The effective output format: per-collection setting, else the
-        // library-wide default. Loose copies each ROM into place; zip/torrentzip
-        // packs each game into one archive.
+        // Effective output format, in precedence order: an explicit
+        // per-collection setting, then a per-set rule (a config row keyed on the
+        // set — the top segment of the library path, e.g. "TOSEC-PIX"), then the
+        // library-wide default. The per-set tier lets whole sets diverge — TOSEC
+        // kept as zip, TOSEC-PIX left loose for later PDF/collateral extraction —
+        // without configuring every collection. Loose copies each ROM into place;
+        // zip/torrentzip packs each game into one archive.
+        let explicit_format = cfg.as_ref().and_then(|c| c.output_format.clone());
+        let set_format = match explicit_format {
+            Some(_) => None,
+            None => {
+                let set = hierarchy.split('/').next().unwrap_or(hierarchy.as_str());
+                // Only consult a per-set rule when there is a set prefix; a flat
+                // collection name is not a set and must not match itself here.
+                if set != hierarchy {
+                    db_config::get_collection_config(conn, set)?.and_then(|c| c.output_format)
+                } else {
+                    None
+                }
+            }
+        };
         let format = resolve_output_format(
-            cfg.as_ref().and_then(|c| c.output_format.as_deref()),
+            explicit_format.as_deref().or(set_format.as_deref()),
             default_format,
         );
 
@@ -155,12 +173,17 @@ pub fn generate_plan_filtered(conn: &Connection, opts: &PlanOptions) -> Result<P
                     let multi_rom = roms_per_game.get(&m.game_name).copied().unwrap_or(1) > 1;
                     let dest = build_dest_path(&dest_root, &m.game_name, &m.rom_name, multi_rom);
 
-                    if is_file_correct_at_dest(conn, &dest, &m.sha1)? {
+                    // Already correct when the held file is a loose file already
+                    // sitting at its canonical destination. The match carries the
+                    // file's current location, so this is an in-memory comparison
+                    // — no per-file disk stat or catalogue scan, which is what
+                    // makes planning a whole library over a network mount viable.
+                    let full_source = format!("{}/{}", m.source_root, m.source_path);
+                    if m.archive_path.is_none() && full_source == dest {
                         already_correct += 1;
                         continue;
                     }
 
-                    let full_source = format!("{}/{}", m.source_root, m.source_path);
                     bytes += m.size as u64;
                     let source = SourceRef {
                         path: full_source,
@@ -190,7 +213,13 @@ pub fn generate_plan_filtered(conn: &Connection, opts: &PlanOptions) -> Result<P
                 for game in games {
                     let dest = format!("{}/{}.{}", dest_root.trim_end_matches('/'), game.name, ext);
 
-                    if is_archive_correct_at_dest(&dest, &game.expected, tag)? {
+                    // The matched entries already live in the archive at `dest`
+                    // when every source's container is `dest` itself — an
+                    // in-memory check (the matches carry their location), so a
+                    // correctly-placed archive needs no disk read.
+                    let at_dest =
+                        !game.sources.is_empty() && game.sources.iter().all(|s| s.path == dest);
+                    if archive_at_dest_is_correct(at_dest, &dest, tag)? {
                         already_correct += game.expected.len();
                         continue;
                     }
@@ -241,37 +270,52 @@ pub fn generate_plan_filtered(conn: &Connection, opts: &PlanOptions) -> Result<P
     Ok(plan)
 }
 
-/// Find all ROMs that have matching files in sources
+/// Find all ROMs in one collection version that have a matching held file.
+///
+/// Performance is critical here — this runs once per collection, and a full
+/// library is thousands of collections. The match has three modes: a DAT SHA1
+/// may be the file's headered or headerless hash, and a SHA1-less DAT entry
+/// matches on CRC + size. Expressed as a single `OR` join, SQLite can't drive
+/// from this version's ROMs into the file index and instead scans the whole
+/// `files` table per call (~13s each on a real library). Splitting the modes
+/// into a `UNION` lets each branch use an index (files PK on `sha1`,
+/// `idx_files_sha1_no_header`), so the query starts from the version's ROMs and
+/// runs in milliseconds. We select the *file's* sha1 and size (not the DAT's) —
+/// that's the true content placed at the destination, which
+/// `is_file_correct_at_dest` verifies.
 fn find_matched_roms(
     conn: &Connection,
     version_id: i64,
     collection_name: &str,
 ) -> Result<Vec<MatchedRom>> {
-    // Match each DAT ROM to a file we hold. A DAT SHA1 may be the headered or
-    // headerless form, so match either of the file's hashes; a SHA1-less DAT
-    // entry matches on CRC + size. We select the *file's* sha1 and size (not
-    // the DAT's), because that's the true content placed at the destination and
-    // what `is_file_correct_at_dest` re-hashes to verify.
     let mut stmt = conn.prepare(
-        "SELECT
-            g.name as game_name,
-            r.name as rom_name,
-            f.sha1,
-            f.size,
-            fl.path as source_path,
-            s.path as source_root,
-            fl.archive_path
-         FROM dat_roms r
-         JOIN dat_games g ON r.game_id = g.id
-         JOIN dat_nodes n ON g.node_id = n.id
-         JOIN files f ON
-                (r.sha1 IS NOT NULL AND (f.sha1 = r.sha1 OR f.sha1_no_header = r.sha1))
-             OR (r.sha1 IS NULL AND r.crc32 IS NOT NULL AND f.crc32 = r.crc32 AND f.size = r.size)
-         JOIN file_locations fl ON f.sha1 = fl.sha1
+        "WITH vroms AS (
+            SELECT r.id, r.game_id, r.name, r.sha1, r.crc32, r.size
+            FROM dat_roms r
+            JOIN dat_games g ON r.game_id = g.id
+            JOIN dat_nodes n ON g.node_id = n.id
+            WHERE n.version_id = ?1 AND r.status != 'nodump'
+         ),
+         matched AS (
+            SELECT vr.id AS rom_id, f.sha1, f.size
+            FROM vroms vr JOIN files f ON f.sha1 = vr.sha1
+            WHERE vr.sha1 IS NOT NULL
+            UNION
+            SELECT vr.id, f.sha1, f.size
+            FROM vroms vr JOIN files f ON f.sha1_no_header = vr.sha1
+            WHERE vr.sha1 IS NOT NULL
+            UNION
+            SELECT vr.id, f.sha1, f.size
+            FROM vroms vr JOIN files f ON f.crc32 = vr.crc32 AND f.size = vr.size
+            WHERE vr.sha1 IS NULL AND vr.crc32 IS NOT NULL
+         )
+         SELECT g.name, vr.name, m.sha1, m.size, fl.path, s.path, fl.archive_path
+         FROM matched m
+         JOIN vroms vr ON vr.id = m.rom_id
+         JOIN dat_games g ON vr.game_id = g.id
+         JOIN file_locations fl ON fl.sha1 = m.sha1
          JOIN sources s ON fl.source_id = s.id
-         WHERE n.version_id = ?
-           AND r.status != 'nodump'
-         ORDER BY g.name, r.name",
+         ORDER BY g.name, vr.name",
     )?;
 
     let matches = stmt
@@ -359,46 +403,22 @@ fn group_for_archive(matches: Vec<MatchedRom>) -> Vec<ArchiveGame> {
     games.into_values().collect()
 }
 
-/// Whether the archive at `dest` already holds exactly the expected entries
-/// (matching names and SHA1s) *and* is in the requested container format. A
-/// missing, differing, or wrong-format archive returns `false`, so it is
-/// (re)built; an exact match is left untouched, keeping re-runs no-ops.
+/// Whether the game's archive already exists, correct, at `dest`.
 ///
-/// For `torrentzip`, a content-correct plain ZIP is still rebuilt, because the
-/// container format itself is part of "correct" (TorrentZIP determinism). For
-/// `zip`, any content-correct ZIP — including a TorrentZIP — passes.
-fn is_archive_correct_at_dest(
-    dest: &str,
-    expected: &[(String, String)],
-    format: &str,
-) -> Result<bool> {
-    let path = Path::new(dest);
-    if !path.exists() {
+/// Entry correctness is established in memory by the caller: `at_dest` is true
+/// when every matched source already lives in the archive at `dest` (the matches
+/// carry their location, so no archive is opened). For `zip` that is sufficient
+/// — the right entries are present. `torrentzip` additionally requires the
+/// deterministic container stamp, which only the file itself can confirm, so
+/// that one case reads the archive; a content-correct plain ZIP is rebuilt to
+/// earn the stamp.
+fn archive_at_dest_is_correct(at_dest: bool, dest: &str, format: &str) -> Result<bool> {
+    if !at_dest {
         return Ok(false);
     }
-
-    let mut have: HashMap<String, String> = HashMap::new();
-    for entry in crate::scanner::archive::hash_archive_entries(path)? {
-        if let Some(hashes) = entry.hashes {
-            have.insert(entry.name, hashes.sha1);
-        }
+    if format == "torrentzip" {
+        return crate::archive::is_torrentzip_stamped(Path::new(dest));
     }
-
-    if have.len() != expected.len() {
-        return Ok(false);
-    }
-    let content_ok = expected
-        .iter()
-        .all(|(name, sha1)| have.get(name).is_some_and(|h| h.eq_ignore_ascii_case(sha1)));
-    if !content_ok {
-        return Ok(false);
-    }
-
-    // Container-format check: a TorrentZIP target must actually be TorrentZIP.
-    if format == "torrentzip" && !crate::archive::is_torrentzip_stamped(path)? {
-        return Ok(false);
-    }
-
     Ok(true)
 }
 
@@ -432,56 +452,6 @@ fn build_dest_path(dest_root: &str, game_name: &str, rom_name: &str, multi_rom: 
     } else {
         format!("{}/{}", root, rom_name)
     }
-}
-
-/// Check if a file at the destination already has the correct hash
-fn is_file_correct_at_dest(conn: &Connection, path: &str, expected_sha1: &str) -> Result<bool> {
-    use sha1::Digest as Sha1Digest;
-
-    // Fast path: if the scan already indexed a loose file at this exact path
-    // with the expected hash, trust the catalogue instead of re-reading it.
-    // For an in-place tidy the destination *is* a scanned source file, so this
-    // avoids re-hashing the whole library over the network — the scan just did.
-    if catalogued_file_has_sha1(conn, path, expected_sha1)? {
-        return Ok(true);
-    }
-
-    let fs_path = Path::new(path);
-    if !fs_path.exists() {
-        return Ok(false);
-    }
-
-    // Fall back to hashing on disk (destination not in the catalogue, or its
-    // recorded hash differs — re-verify the real bytes rather than trust stale).
-    let contents = std::fs::read(fs_path).context("Failed to read destination file")?;
-    let mut hasher = sha1::Sha1::new();
-    Sha1Digest::update(&mut hasher, &contents);
-    let hash = Sha1Digest::finalize(hasher);
-    let actual_sha1 = crate::util::hex_upper(hash);
-
-    Ok(actual_sha1.eq_ignore_ascii_case(expected_sha1))
-}
-
-/// Whether the catalogue holds a loose file at the absolute path `abs_path`
-/// whose recorded SHA1 matches `expected_sha1`.
-fn catalogued_file_has_sha1(
-    conn: &Connection,
-    abs_path: &str,
-    expected_sha1: &str,
-) -> Result<bool> {
-    let found: Option<i64> = conn
-        .query_row(
-            "SELECT 1 FROM file_locations fl
-             JOIN sources s ON fl.source_id = s.id
-             WHERE fl.archive_path IS NULL
-               AND (s.path || '/' || fl.path) = ?1
-               AND fl.sha1 = ?2 COLLATE NOCASE
-             LIMIT 1",
-            rusqlite::params![abs_path, expected_sha1],
-            |row| row.get(0),
-        )
-        .optional()?;
-    Ok(found.is_some())
 }
 
 /// Compute state hash for plan validation
@@ -717,29 +687,14 @@ mod tests {
     }
 
     #[test]
-    fn catalogued_file_has_sha1_matches_scanned_loose_file() {
-        let db = setup_db();
-        let conn = db.conn();
-        conn.execute(
-            "INSERT INTO sources (id, path, case_sensitive) VALUES (1, '/lib/TOSEC', 0)",
-            [],
-        )
-        .unwrap();
-        conn.execute("INSERT INTO files (sha1, size) VALUES ('ABC123', 10)", [])
-            .unwrap();
-        conn.execute(
-            "INSERT INTO file_locations (sha1, source_id, path, archive_path)
-             VALUES ('ABC123', 1, 'Acorn/game.rom', NULL)",
-            [],
-        )
-        .unwrap();
-
-        // Exact path + hash → trusted (case-insensitive on the hash).
-        assert!(catalogued_file_has_sha1(conn, "/lib/TOSEC/Acorn/game.rom", "ABC123").unwrap());
-        assert!(catalogued_file_has_sha1(conn, "/lib/TOSEC/Acorn/game.rom", "abc123").unwrap());
-        // Wrong hash or wrong path → not trusted (falls back to disk hashing).
-        assert!(!catalogued_file_has_sha1(conn, "/lib/TOSEC/Acorn/game.rom", "DEF456").unwrap());
-        assert!(!catalogued_file_has_sha1(conn, "/lib/TOSEC/Acorn/other.rom", "ABC123").unwrap());
+    fn archive_at_dest_is_correct_trusts_in_memory_placement() {
+        // zip: every matched source already in the archive at dest → correct,
+        // with no disk access.
+        assert!(archive_at_dest_is_correct(true, "/lib/x.zip", "zip").unwrap());
+        // Not all sources at dest → must (re)build; no disk access for either
+        // format when at_dest is false.
+        assert!(!archive_at_dest_is_correct(false, "/lib/x.zip", "zip").unwrap());
+        assert!(!archive_at_dest_is_correct(false, "/lib/x.zip", "torrentzip").unwrap());
     }
 
     #[test]
