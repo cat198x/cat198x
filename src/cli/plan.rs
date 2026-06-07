@@ -93,10 +93,7 @@ pub fn run(
         );
     }
     println!("  {} already correct", plan.summary.already_correct);
-    println!(
-        "  {} bytes to transfer",
-        format_bytes(plan.summary.total_bytes)
-    );
+    println!("  {} to transfer", format_bytes(plan.summary.total_bytes));
 
     print_breakdown_by_set(&plan);
 

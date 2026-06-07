@@ -121,6 +121,12 @@ enum Commands {
         #[arg(long)]
         skip_space_check: bool,
 
+        /// Defer repack operations (the expensive read-and-recompress ones),
+        /// applying only the cheap moves and quarantines now. Run `apply` again
+        /// without this flag to complete the deferred repacks.
+        #[arg(long)]
+        skip_repack: bool,
+
         /// Rollback the most recent apply operation
         #[arg(long)]
         rollback: bool,
@@ -221,13 +227,14 @@ fn main() -> Result<()> {
         Commands::Apply {
             dry_run,
             skip_space_check,
+            skip_repack,
             rollback,
             continue_rollback,
         } => {
             if rollback {
                 apply_cmd::run_rollback(dry_run, continue_rollback, cli.data_dir)
             } else {
-                apply_cmd::run(dry_run, skip_space_check, cli.data_dir)
+                apply_cmd::run(dry_run, skip_space_check, skip_repack, cli.data_dir)
             }
         }
         Commands::Quarantine(cmd) => quarantine_cmd::run(cmd, cli.data_dir),

@@ -811,7 +811,7 @@ fn test_plan_apply_rollback_cycle() {
     assert_eq!(operations.len(), 1, "Should have 1 copy operation");
 
     // Apply the plan
-    cli::apply::run(false, true, env.data_dir_opt()).expect("Apply failed");
+    cli::apply::run(false, true, false, env.data_dir_opt()).expect("Apply failed");
 
     // Verify file was copied to destination
     let dest_file = dest_dir.join("test.rom");
@@ -923,7 +923,7 @@ fn test_apply_from_zip_archive() {
 
     // Generate and apply plan
     cli::plan::run(None, None, false, env.data_dir_opt()).expect("Plan generation failed");
-    cli::apply::run(false, true, env.data_dir_opt()).expect("Apply failed");
+    cli::apply::run(false, true, false, env.data_dir_opt()).expect("Apply failed");
 
     // Verify file was extracted to destination
     let dest_file = dest_dir.join("test.rom");
@@ -1001,7 +1001,7 @@ fn test_stale_plan_detection() {
 
     // Apply should detect stale plan and not execute
     // (The apply command prints a message but doesn't error)
-    cli::apply::run(false, true, env.data_dir_opt()).unwrap();
+    cli::apply::run(false, true, false, env.data_dir_opt()).unwrap();
 
     // File should NOT be copied because plan is stale
     let dest_file = dest_dir.join("test.rom");
@@ -1128,7 +1128,7 @@ fn test_multi_file_plan_apply() {
     assert_eq!(operations.len(), 3, "Should have 3 copy operations");
 
     // Apply plan
-    cli::apply::run(false, true, env.data_dir_opt()).unwrap();
+    cli::apply::run(false, true, false, env.data_dir_opt()).unwrap();
 
     // Verify all 3 files were copied
     for (content, name) in &contents {
@@ -2229,7 +2229,7 @@ fn test_zip_output_format_plans_applies_and_converges() {
     );
 
     // Apply builds the archive.
-    cli::apply::run(false, true, env.data_dir_opt()).unwrap();
+    cli::apply::run(false, true, false, env.data_dir_opt()).unwrap();
     assert!(
         expected_archive.is_file(),
         "apply should have created {}",
@@ -2250,6 +2250,97 @@ fn test_zip_output_format_plans_applies_and_converges() {
     assert_eq!(
         plan.summary.repack_count, 0,
         "an already-correct archive should not be repacked again"
+    );
+}
+
+/// `apply --skip-repack` applies the cheap operations (here a duplicate
+/// quarantine) and defers the expensive repack, leaving it pending. A second
+/// `apply` then completes the repack — and must resume even though the cheap
+/// pass changed the catalogue (and so the state hash) underneath the plan.
+#[test]
+fn test_apply_skip_repack_defers_then_resumes() {
+    use cat198x::{ConfigCommands, DatCommands, SourceCommands};
+    use sha1::Digest;
+
+    let env = TestEnv::new();
+    env.init();
+
+    let content = b"hello";
+    let sha1_hash = cat198x::util::hex_upper(sha1::Sha1::digest(content));
+    let dat = create_matching_dat(env.temp_dir.path(), "Skip Repack Test", &sha1_hash);
+    cli::dat::run(
+        DatCommands::Add {
+            path: dat,
+            collection: None,
+            recursive: false,
+        },
+        env.data_dir_opt(),
+    )
+    .unwrap();
+
+    // The same ROM held in two sources: one becomes the repack source, the
+    // duplicate is quarantined. That gives a cheap op (quarantine) plus an
+    // expensive one (repack) in a single plan.
+    let roms2 = env.temp_dir.path().join("roms2");
+    fs::create_dir_all(&roms2).unwrap();
+    fs::write(env.roms_dir.join("test.rom"), content).unwrap();
+    fs::write(roms2.join("test.rom"), content).unwrap();
+    for dir in [env.roms_dir.clone(), roms2.clone()] {
+        cli::source::run(SourceCommands::Add { path: dir }, env.data_dir_opt()).unwrap();
+    }
+    cli::scan::run(None, false, env.data_dir_opt()).unwrap();
+
+    let dest_root = env.temp_dir.path().join("library");
+    fs::create_dir_all(&dest_root).unwrap();
+    let dest_root = std::fs::canonicalize(&dest_root).unwrap();
+    cli::source::run(
+        SourceCommands::Add {
+            path: dest_root.clone(),
+        },
+        env.data_dir_opt(),
+    )
+    .unwrap();
+    for (k, v) in [
+        ("dest_path", dest_root.to_string_lossy().into_owned()),
+        ("output_format", "zip".to_string()),
+    ] {
+        cli::config::run(
+            ConfigCommands::SetDefault {
+                key: k.to_string(),
+                value: v,
+            },
+            env.data_dir_opt(),
+        )
+        .unwrap();
+    }
+
+    cli::plan::run(None, None, false, env.data_dir_opt()).unwrap();
+    let expected_archive = dest_root.join("Skip Repack Test").join("Test Game.zip");
+
+    // Pass 1: defer the repack. The duplicate is quarantined (one of the two
+    // copies moves away), but the archive is not built yet.
+    cli::apply::run(false, true, true, env.data_dir_opt()).unwrap();
+    let remaining = [env.roms_dir.join("test.rom"), roms2.join("test.rom")]
+        .iter()
+        .filter(|p| p.exists())
+        .count();
+    assert_eq!(
+        remaining, 1,
+        "the duplicate copy should have been quarantined in the cheap pass"
+    );
+    assert!(
+        !expected_archive.exists(),
+        "the repack should be deferred, not built, in pass 1"
+    );
+
+    // Pass 2: no flag. The cheap pass changed the catalogue, so the plan's
+    // stored state hash no longer matches — the resume path must still apply the
+    // pending repack rather than rejecting the plan as stale.
+    cli::apply::run(false, true, false, env.data_dir_opt()).unwrap();
+    assert!(
+        expected_archive.is_file(),
+        "the deferred repack should be completed on the second apply: {}",
+        expected_archive.display()
     );
 }
 
@@ -2372,7 +2463,7 @@ fn test_move_mode_relocates_and_removes_source() {
         "--move should produce move ops, plan was:\n{plan_json}"
     );
 
-    cli::apply::run(false, true, env.data_dir_opt()).unwrap();
+    cli::apply::run(false, true, false, env.data_dir_opt()).unwrap();
 
     // Canonical file placed; misnamed original gone (moved, not copied).
     let placed = dest_root.join("Move Test").join("test.rom");

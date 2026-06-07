@@ -19,6 +19,7 @@ use super::{open_database, plan::load_latest_plan};
 pub fn run(
     dry_run: bool,
     skip_space_check: bool,
+    skip_repack: bool,
     data_dir: Option<std::path::PathBuf>,
 ) -> Result<()> {
     // Load the most recent plan
@@ -34,7 +35,17 @@ pub fn run(
     let db = open_database(data_dir.clone())?;
     let current_hash = compute_state_hash(db.conn())?;
 
-    if current_hash != plan.state_hash {
+    // A plan with operations already applied is mid-flight: its own completed
+    // operations updated the catalogue (and so the state hash) by design, so the
+    // drift is expected and we resume rather than reject. The stale check only
+    // guards a fresh plan — one whose every operation is still pending — against
+    // a catalogue that moved underneath it (e.g. a scan) since it was generated.
+    let plan_started = plan
+        .operations
+        .iter()
+        .any(|op| op.status != OperationStatus::Pending);
+
+    if !plan_started && current_hash != plan.state_hash {
         println!("Plan is stale! The database state has changed since the plan was generated.");
         println!();
         println!("Run 'cat198x plan' to generate a new plan.");
@@ -67,6 +78,26 @@ pub fn run(
         "Applying plan: {} operations ({} pending)",
         total_ops, pending_count
     );
+
+    // Deferring repacks runs the cheap operations (relocates, quarantines) now
+    // and leaves the expensive read-and-recompress repacks pending for a later
+    // pass. Resumable: a subsequent `apply` (without --skip-repack) picks them up.
+    if skip_repack {
+        let deferred = plan
+            .operations
+            .iter()
+            .filter(|op| {
+                op.status == OperationStatus::Pending
+                    && matches!(op.kind, OperationKind::Repack { .. })
+            })
+            .count();
+        if deferred > 0 {
+            println!(
+                "Deferring {} repack operation(s); run `cat198x apply` again to complete them.",
+                deferred
+            );
+        }
+    }
     println!();
 
     if dry_run {
@@ -91,6 +122,12 @@ pub fn run(
     for (i, op) in plan.operations.iter_mut().enumerate() {
         if op.status != OperationStatus::Pending {
             continue; // Skip already completed or failed operations
+        }
+
+        // Leave repacks pending for a later pass when deferred, so the cheap
+        // operations land first and the recompression can run separately.
+        if skip_repack && matches!(op.kind, OperationKind::Repack { .. }) {
+            continue;
         }
 
         match &op.kind {
