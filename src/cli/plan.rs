@@ -86,6 +86,12 @@ pub fn run(
     if plan.summary.repack_count > 0 {
         println!("  {} repack operations", plan.summary.repack_count);
     }
+    if plan.summary.quarantine_count > 0 {
+        println!(
+            "  {} quarantine operations (duplicates)",
+            plan.summary.quarantine_count
+        );
+    }
     println!("  {} already correct", plan.summary.already_correct);
     println!(
         "  {} bytes to transfer",
