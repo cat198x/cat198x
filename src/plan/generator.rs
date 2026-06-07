@@ -331,6 +331,7 @@ pub fn generate_plan_filtered(conn: &Connection, opts: &PlanOptions) -> Result<P
                     } else if let Some(ref src) = staged_complete
                         && opts.move_files
                         && tag != "torrentzip"
+                        && is_relocatable_archive(&containers[src], src, ext)
                     {
                         // Relocate the complete staged archive to its destination.
                         let size: u64 = containers[src].iter().map(|m| m.size as u64).sum();
@@ -517,6 +518,22 @@ fn archive_format_tag(format: OutputFormat) -> Option<&'static str> {
 /// The archive file extension for a repack format tag.
 fn archive_extension(tag: &str) -> &'static str {
     if tag == "7z" { "7z" } else { "zip" }
+}
+
+/// Whether a complete source container can be relocated whole to its
+/// destination rather than repacked. A relocate is a rename, so it only
+/// preserves the set's format when the source is *already* an archive in that
+/// exact format: every entry must live inside an archive (not be a loose ROM),
+/// and the source file's extension must match the target's. Renaming a loose
+/// `.tap`/`.cue`/`.z80`, or a `.7z` into a zip set, would mint a file whose
+/// extension lies about its contents — those must be repacked instead.
+fn is_relocatable_archive(entries: &[MatchedRom], src: &str, ext: &str) -> bool {
+    !entries.is_empty()
+        && entries.iter().all(|m| m.archive_path.is_some())
+        && src
+            .rsplit('.')
+            .next()
+            .is_some_and(|e| e.eq_ignore_ascii_case(ext))
 }
 
 /// Build a repack source reference from a matched ROM, carrying its canonical
@@ -1107,6 +1124,114 @@ mod tests {
                 "/lib/ROMs/SET/Sys/Game.zip".to_string(),
             )]
         );
+    }
+
+    #[test]
+    fn loose_staged_file_is_repacked_not_renamed_to_archive() {
+        let db = setup_db();
+        let conn = db.conn();
+        // A complete game held only as a loose .tap under ToSort, in a zip set.
+        let coll = collections::create_collection(conn, "Test Coll", "tosec").unwrap();
+        let vid = collections::add_version(conn, coll, "v1", "/dats/test.dat", true).unwrap();
+        let node = dats::create_node(conn, vid, None, "Test Coll", "dat", "SET/Sys").unwrap();
+        let game = dats::create_game(conn, node, "Game", None, None, false, false, false).unwrap();
+        dats::create_rom(
+            conn,
+            game,
+            "game.tap",
+            10,
+            Some("AAA"),
+            None,
+            None,
+            "good",
+            None,
+        )
+        .unwrap();
+        conn.execute("INSERT INTO files (sha1, size) VALUES ('AAA', 10)", [])
+            .unwrap();
+        conn.execute(
+            "INSERT INTO sources (id, path, case_sensitive) VALUES (102, '/lib/ToSort/SET', 0)",
+            [],
+        )
+        .unwrap();
+        // Loose file (archive_path NULL): NOT an archive in the target format.
+        conn.execute(
+            "INSERT INTO file_locations (sha1, source_id, path, archive_path)
+             VALUES ('AAA', 102, 'Sys/game.tap', NULL)",
+            [],
+        )
+        .unwrap();
+        db_config::set_output_format(conn, "SET", "zip").unwrap();
+
+        let plan = generate_plan_filtered(
+            conn,
+            &PlanOptions {
+                default_dest: Some("/lib/ROMs".to_string()),
+                default_format: OutputFormat::Loose,
+                move_files: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        // Renaming a loose .tap to .zip would mint a file whose extension lies
+        // about its contents — the loose ROM must be repacked into a real zip.
+        let relocates = plan
+            .operations
+            .iter()
+            .filter(|op| matches!(op.kind, OperationKind::Relocate { .. }))
+            .count();
+        assert_eq!(
+            relocates, 0,
+            "a loose file is never relocated to an archive"
+        );
+        assert_eq!(
+            plan.summary.repack_count, 1,
+            "the loose .tap is repacked into Game.zip"
+        );
+        let dest = plan.operations.iter().find_map(|op| match &op.kind {
+            OperationKind::Repack { dest, .. } => Some(dest.clone()),
+            _ => None,
+        });
+        assert_eq!(dest.as_deref(), Some("/lib/ROMs/SET/Sys/Game.zip"));
+    }
+
+    #[test]
+    fn is_relocatable_archive_requires_matching_archive_format() {
+        let archived = |path: &str| MatchedRom {
+            collection: "C".into(),
+            game_name: "G".into(),
+            rom_name: "r".into(),
+            sha1: "AAA".into(),
+            size: 1,
+            source_root: "/s".into(),
+            source_path: path.into(),
+            archive_path: Some("r".into()),
+        };
+        let loose = |path: &str| MatchedRom {
+            archive_path: None,
+            ..archived(path)
+        };
+        // A real .zip whose entries are archived → relocatable.
+        assert!(is_relocatable_archive(
+            &[archived("Game.zip")],
+            "/s/Game.zip",
+            "zip"
+        ));
+        // A loose ROM (no archive_path) → must be repacked.
+        assert!(!is_relocatable_archive(
+            &[loose("game.tap")],
+            "/s/game.tap",
+            "zip"
+        ));
+        // An archive in a different format (.7z into a zip set) → repack.
+        assert!(!is_relocatable_archive(
+            &[archived("Game.7z")],
+            "/s/Game.7z",
+            "zip"
+        ));
+        // No entries → not relocatable.
+        assert!(!is_relocatable_archive(&[], "/s/Game.zip", "zip"));
     }
 
     #[test]
