@@ -21,7 +21,11 @@ pub fn parse_dat_file(path: &Path) -> Result<(DatHeader, Vec<DatGameEntry>)> {
 /// Parse DAT content from a string
 pub fn parse_dat(xml: &str) -> Result<(DatHeader, Vec<DatGameEntry>)> {
     let mut reader = Reader::from_str(xml);
-    reader.config_mut().trim_text(true);
+    // Note: text is NOT trimmed per-event. quick-xml splits a run of character
+    // data at every entity reference (see `read_element_text`), so trimming
+    // each fragment would eat the spaces around an entity — e.g. turning
+    // "Famicom &amp; Entertainment" into "Famicom&Entertainment". We accumulate
+    // the raw fragments and trim only the final element text instead.
 
     let mut header = DatHeader::default();
     let mut games = Vec::new();
@@ -59,34 +63,27 @@ pub fn parse_dat(xml: &str) -> Result<(DatHeader, Vec<DatGameEntry>)> {
 fn parse_header(reader: &mut Reader<&[u8]>) -> Result<DatHeader> {
     let mut header = DatHeader::default();
     let mut buf = Vec::new();
-    let mut current_tag: Option<String> = None;
 
     loop {
         match reader.read_event_into(&mut buf) {
             Ok(Event::Start(e)) => {
-                current_tag = Some(String::from_utf8_lossy(e.name().as_ref()).to_string());
-            }
-            Ok(Event::Text(e)) => {
-                if let Some(ref tag) = current_tag {
-                    let text = text_value(&e)?;
-                    match tag.as_str() {
-                        "name" => header.name = text,
-                        "description" => header.description = Some(text),
-                        "version" => header.version = Some(text),
-                        "author" => header.author = Some(text),
-                        "homepage" => header.homepage = Some(text),
-                        "url" => header.url = Some(text),
-                        "category" => header.category = Some(text),
-                        _ => {}
-                    }
+                // Read the child element's full text content in one go, so a
+                // value split across entity references (e.g. "Shoot&apos;em
+                // Up") is reassembled rather than truncated to its last chunk.
+                let tag = e.name().as_ref().to_vec();
+                let text = read_element_text(reader, &tag)?;
+                match tag.as_slice() {
+                    b"name" => header.name = text,
+                    b"description" => header.description = Some(text),
+                    b"version" => header.version = Some(text),
+                    b"author" => header.author = Some(text),
+                    b"homepage" => header.homepage = Some(text),
+                    b"url" => header.url = Some(text),
+                    b"category" => header.category = Some(text),
+                    _ => {}
                 }
             }
-            Ok(Event::End(e)) => {
-                if e.name().as_ref() == b"header" {
-                    break;
-                }
-                current_tag = None;
-            }
+            Ok(Event::End(e)) if e.name().as_ref() == b"header" => break,
             Ok(Event::Eof) => break,
             Err(e) => return Err(e.into()),
             _ => {}
@@ -128,7 +125,6 @@ fn parse_game(
     }
 
     let mut buf = Vec::new();
-    let mut current_tag: Option<String> = None;
 
     loop {
         match reader.read_event_into(&mut buf) {
@@ -137,33 +133,21 @@ fn parse_game(
                 // data we need on the start tag, so handle them like their
                 // self-closing form — otherwise non-self-closing elements are
                 // silently dropped (a game then looks ROM-less, i.e. "complete").
-                // Other start tags (e.g. <description>) set current_tag so the
-                // following Text event is captured.
-                if handle_game_child(&e, &mut game)? {
-                    current_tag = None;
-                } else {
-                    current_tag = Some(String::from_utf8_lossy(e.name().as_ref()).to_string());
+                // Any other element (e.g. <description>) has its full text read
+                // and consumed up to its end tag.
+                let consumed = handle_game_child(&e, &mut game)?;
+                if !consumed {
+                    let tag = e.name().as_ref().to_vec();
+                    let text = read_element_text(reader, &tag)?;
+                    if tag == b"description" {
+                        game.description = Some(text);
+                    }
                 }
             }
             Ok(Event::Empty(e)) => {
                 handle_game_child(&e, &mut game)?;
             }
-            Ok(Event::Text(e)) => {
-                if let Some(ref tag) = current_tag {
-                    let text = text_value(&e)?;
-                    if tag == "description" {
-                        game.description = Some(text);
-                    }
-                }
-            }
-            Ok(Event::End(e)) => {
-                let name = e.name();
-                let tag = name.as_ref();
-                if tag == b"game" || tag == b"machine" {
-                    break;
-                }
-                current_tag = None;
-            }
+            Ok(Event::End(e)) if matches!(e.name().as_ref(), b"game" | b"machine") => break,
             Ok(Event::Eof) => break,
             Err(e) => return Err(e.into()),
             _ => {}
@@ -242,6 +226,44 @@ fn text_value(e: &quick_xml::events::BytesText) -> Result<String> {
     Ok(quick_xml::escape::unescape(&decoded)?.to_string())
 }
 
+/// Read an element's full text content, concatenating every chunk until the
+/// matching `</end>` tag, then trimming surrounding whitespace.
+///
+/// quick-xml emits each general entity reference (`&apos;`, `&amp;`, `&#39;`, …)
+/// as its own [`Event::GeneralRef`], which splits one run of character data into
+/// several events. Assigning on each event keeps only the final chunk — the bug
+/// that stored "Shoot&apos;em Up" as "em Up". Accumulating across `Text`,
+/// `CData`, and `GeneralRef` events reassembles the value faithfully.
+fn read_element_text(reader: &mut Reader<&[u8]>, end: &[u8]) -> Result<String> {
+    let mut buf = Vec::new();
+    let mut out = String::new();
+    loop {
+        match reader.read_event_into(&mut buf) {
+            Ok(Event::Text(e)) => out.push_str(&text_value(&e)?),
+            Ok(Event::CData(e)) => out.push_str(&e.decode()?),
+            Ok(Event::GeneralRef(e)) => out.push_str(&resolve_entity(&e)?),
+            Ok(Event::End(e)) if e.name().as_ref() == end => break,
+            Ok(Event::Eof) => break,
+            Err(e) => return Err(e.into()),
+            _ => {}
+        }
+        buf.clear();
+    }
+    Ok(out.trim().to_string())
+}
+
+/// Resolve a general entity reference to its text. Numeric references
+/// (`&#39;`, `&#x27;`) decode directly; named references (`apos`, `amp`, `lt`,
+/// `gt`, `quot`) are resolved through the predefined-entity table by
+/// reconstructing `&name;` and unescaping it.
+fn resolve_entity(e: &quick_xml::events::BytesRef) -> Result<String> {
+    if let Some(ch) = e.resolve_char_ref()? {
+        return Ok(ch.to_string());
+    }
+    let name = e.decode()?;
+    Ok(quick_xml::escape::unescape(&format!("&{};", name))?.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -301,6 +323,36 @@ mod tests {
         assert_eq!(games[0].roms[1].name, "b.rom");
         // Sibling text elements still parse correctly alongside the change.
         assert_eq!(games[0].description, Some("Game One".to_string()));
+    }
+
+    #[test]
+    fn test_entity_references_in_text_are_not_truncated() {
+        // Regression: quick-xml emits each entity reference as its own event,
+        // splitting a text run. The header name "Shoot&apos;em Up" arrives as
+        // Text("Commodore C64 - Games - Shoot") + GeneralRef("apos") +
+        // Text("em Up - [D64]"); the old assign-per-event logic kept only the
+        // last chunk ("em Up - [D64]"). It must reassemble the whole value.
+        let xml = r#"<?xml version="1.0"?>
+<datafile>
+  <header>
+    <name>Commodore C64 - Games - Shoot&apos;em Up - [D64]</name>
+    <description>Nintendo Famicom &amp; Entertainment System</description>
+  </header>
+  <game name="g1">
+    <description>Smash &#39;Em &amp; Run &#x21;</description>
+    <rom name="a.rom" size="1" sha1="AA"/>
+  </game>
+</datafile>"#;
+
+        let (header, games) = parse_dat(xml).unwrap();
+        assert_eq!(header.name, "Commodore C64 - Games - Shoot'em Up - [D64]");
+        // Spaces on either side of the entity must survive (no per-fragment trim).
+        assert_eq!(
+            header.description,
+            Some("Nintendo Famicom & Entertainment System".to_string())
+        );
+        // Numeric (&#39;), named (&amp;), and hex (&#x21;) refs all resolve.
+        assert_eq!(games[0].description, Some("Smash 'Em & Run !".to_string()));
     }
 
     #[test]

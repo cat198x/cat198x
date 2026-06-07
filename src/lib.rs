@@ -65,6 +65,11 @@ pub enum DatCommands {
         dest: std::path::PathBuf,
     },
 
+    /// Re-parse stored DAT files and correct collection names mangled by an
+    /// earlier parser that mishandled XML entities (e.g. "Shoot&apos;em Up"
+    /// stored as "em Up"). Surgical: only names are rewritten, in place.
+    RepairNames,
+
     /// List imported DAT files
     List {
         /// Show all versions, not just active

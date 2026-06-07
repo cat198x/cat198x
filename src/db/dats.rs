@@ -70,6 +70,25 @@ pub fn create_node(
     Ok(conn.last_insert_rowid())
 }
 
+/// Correct a version's root DAT node name after a parser fix (`dat repair-names`).
+///
+/// Always updates the node `name`. The `path` is only rewritten when it still
+/// mirrors the old name — i.e. it was the flat-add fallback (`node_path =
+/// header.name`). A real recorded hierarchy path (e.g. `Acorn/BBC/…`) never
+/// equals the bare name, so it is left untouched. SQLite evaluates every
+/// assignment's right-hand side against the row's original values, so the
+/// `CASE WHEN path = name` test sees the pre-update name.
+pub fn rename_dat_node(conn: &Connection, version_id: i64, new_name: &str) -> Result<()> {
+    conn.execute(
+        "UPDATE dat_nodes
+            SET path = CASE WHEN path = name THEN ?1 ELSE path END,
+                name = ?1
+          WHERE version_id = ?2 AND parent_id IS NULL",
+        params![new_name, version_id],
+    )?;
+    Ok(())
+}
+
 /// The `path` of a version's DAT node — the collection's place in the library
 /// tree, recorded by recursive `dat add` (e.g. `Acorn/BBC/Magazines/Laserbug`),
 /// or the flat collection name otherwise. `None` if the version has no node.
@@ -96,11 +115,30 @@ pub fn create_game(
     is_device: bool,
     is_mechanical: bool,
 ) -> Result<i64> {
-    conn.execute(
-        "INSERT INTO dat_games (node_id, name, description, parent_name, is_bios, is_device, is_mechanical)
+    // INSERT OR IGNORE because a DAT can list the same game name twice. TOSEC's
+    // ISO sets in particular contain accidental double-listings — the second
+    // <game> is byte-identical to the first (same description, same ROM CRC/MD5/
+    // SHA1), e.g. "CPC Games CD, The" in the IBM PC CD compilations DAT and
+    // "Smickeonn - The Game" in the Dreamcast homebrew DAT. A plain INSERT trips
+    // UNIQUE(node_id, name) and aborts the whole DAT import, silently dropping
+    // the entire collection. Skipping the duplicate keeps completeness correct:
+    // the identical ROM is already catalogued, and the caller's create_rom calls
+    // (also INSERT OR IGNORE) collapse onto the existing game row.
+    let inserted = conn.execute(
+        "INSERT OR IGNORE INTO dat_games (node_id, name, description, parent_name, is_bios, is_device, is_mechanical)
          VALUES (?, ?, ?, ?, ?, ?, ?)",
         params![node_id, name, description, parent_name, is_bios, is_device, is_mechanical],
     )?;
+    if inserted == 0 {
+        // Already present — return the existing row's id so any ROMs the
+        // duplicate listing carries attach to the real game rather than a stale
+        // last_insert_rowid from an unrelated prior insert.
+        return Ok(conn.query_row(
+            "SELECT id FROM dat_games WHERE node_id = ? AND name = ?",
+            params![node_id, name],
+            |row| row.get(0),
+        )?);
+    }
     Ok(conn.last_insert_rowid())
 }
 
@@ -769,6 +807,74 @@ mod tests {
     }
 
     #[test]
+    fn test_rename_dat_node_rewrites_flat_path_but_preserves_hierarchy() {
+        let db = setup_db();
+        let conn = db.conn();
+
+        // Flat add: node path == node name (the header.name fallback). Both the
+        // name and the path should be corrected.
+        let (_, flat_ver) = create_test_collection_version(conn);
+        create_node(
+            conn,
+            flat_ver,
+            None,
+            "em Up - [D64]",
+            "dat",
+            "em Up - [D64]",
+        )
+        .unwrap();
+        rename_dat_node(
+            conn,
+            flat_ver,
+            "Commodore C64 - Games - Shoot'em Up - [D64]",
+        )
+        .unwrap();
+        let (name, path): (String, String) = conn
+            .query_row(
+                "SELECT name, path FROM dat_nodes WHERE version_id = ?",
+                [flat_ver],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(name, "Commodore C64 - Games - Shoot'em Up - [D64]");
+        assert_eq!(path, "Commodore C64 - Games - Shoot'em Up - [D64]");
+
+        // Hierarchical add: path is a real tree location, not the bare name. The
+        // name is corrected; the recorded hierarchy path is left untouched. Use a
+        // distinct collection so the fixed test name doesn't collide.
+        let tree_coll = collections::create_collection(conn, "Acorn - BBC", "tosec").unwrap();
+        let tree_ver =
+            collections::add_version(conn, tree_coll, "20240101", "/path/tree.dat", true).unwrap();
+        create_node(
+            conn,
+            tree_ver,
+            None,
+            "em Up - [D64]",
+            "dat",
+            "Commodore/C64/Games",
+        )
+        .unwrap();
+        rename_dat_node(
+            conn,
+            tree_ver,
+            "Commodore C64 - Games - Shoot'em Up - [D64]",
+        )
+        .unwrap();
+        let (name, path): (String, String) = conn
+            .query_row(
+                "SELECT name, path FROM dat_nodes WHERE version_id = ?",
+                [tree_ver],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(name, "Commodore C64 - Games - Shoot'em Up - [D64]");
+        assert_eq!(
+            path, "Commodore/C64/Games",
+            "hierarchy path must be preserved"
+        );
+    }
+
+    #[test]
     fn test_create_nested_nodes() {
         let db = setup_db();
         let conn = db.conn();
@@ -858,6 +964,52 @@ mod tests {
         .unwrap();
 
         assert!(clone_id > 0);
+    }
+
+    #[test]
+    fn test_create_game_duplicate_name_is_deduped_not_an_error() {
+        // TOSEC ISO DATs contain accidental byte-identical double-listings of a
+        // game (e.g. "CPC Games CD, The", "Smickeonn - The Game"). Importing the
+        // second listing must not abort on UNIQUE(node_id, name) — the duplicate
+        // is skipped and the existing row id returned, so the whole DAT imports.
+        let db = setup_db();
+        let conn = db.conn();
+        let (_, version_id) = create_test_collection_version(conn);
+        let node_id = create_node(conn, version_id, None, "ISO", "root", "ISO").unwrap();
+
+        let first = create_game(
+            conn,
+            node_id,
+            "CPC Games CD, The (2020-03-20)(ESP Soft)(ES)",
+            Some("CPC Games CD, The (2020-03-20)(ESP Soft)(ES)"),
+            None,
+            false,
+            false,
+            false,
+        )
+        .unwrap();
+        // The duplicate listing — must not error.
+        let second = create_game(
+            conn,
+            node_id,
+            "CPC Games CD, The (2020-03-20)(ESP Soft)(ES)",
+            Some("CPC Games CD, The (2020-03-20)(ESP Soft)(ES)"),
+            None,
+            false,
+            false,
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(first, second, "duplicate should return the existing row id");
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM dat_games WHERE node_id = ? AND name = ?",
+                params![node_id, "CPC Games CD, The (2020-03-20)(ESP Soft)(ES)"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1, "duplicate game name should be stored once");
     }
 
     #[test]

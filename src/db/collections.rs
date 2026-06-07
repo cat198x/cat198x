@@ -135,6 +135,17 @@ pub fn update_dat_path(conn: &Connection, version_id: i64, new_path: &str) -> Re
     Ok(changed > 0)
 }
 
+/// Rename a collection. Returns true if a row was updated. Used by
+/// `dat repair-names` to correct names stored by an earlier parser that
+/// mishandled XML entities in DAT headers.
+pub fn rename_collection(conn: &Connection, collection_id: i64, new_name: &str) -> Result<bool> {
+    let changed = conn.execute(
+        "UPDATE collections SET name = ? WHERE id = ?",
+        params![new_name, collection_id],
+    )?;
+    Ok(changed > 0)
+}
+
 /// Activate a specific version
 pub fn activate_version(conn: &Connection, collection_id: i64, version: &str) -> Result<bool> {
     // Deactivate all versions
