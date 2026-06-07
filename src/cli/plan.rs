@@ -10,7 +10,12 @@ use crate::plan::{Plan, PlanOptions, generate_plan_filtered};
 use super::{get_data_dir, open_database};
 
 /// Run the plan command
-pub fn run(dat_filter: Option<String>, move_files: bool, data_dir: Option<PathBuf>) -> Result<()> {
+pub fn run(
+    dat_filter: Option<String>,
+    set_filter: Option<Vec<String>>,
+    move_files: bool,
+    data_dir: Option<PathBuf>,
+) -> Result<()> {
     let db = open_database(data_dir.clone())?;
     let conn = db.conn();
 
@@ -23,7 +28,9 @@ pub fn run(dat_filter: Option<String>, move_files: bool, data_dir: Option<PathBu
         Config::default()
     };
 
-    if let Some(ref filter) = dat_filter {
+    if let Some(ref sets) = set_filter {
+        println!("Generating plan for set(s): {}", sets.join(", "));
+    } else if let Some(ref filter) = dat_filter {
         println!("Generating plan for collections matching: {}", filter);
     } else {
         println!("Generating plan for all configured collections...");
@@ -34,6 +41,7 @@ pub fn run(dat_filter: Option<String>, move_files: bool, data_dir: Option<PathBu
         conn,
         &PlanOptions {
             dat_filter,
+            set_filter,
             default_dest: file_config.default_dest_path,
             default_format: file_config.default_output_format,
             move_files,

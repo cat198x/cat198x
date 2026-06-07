@@ -100,6 +100,11 @@ enum Commands {
         #[arg(long)]
         dat: Option<String>,
 
+        /// Only plan these sets — the top segment of the library path (e.g.
+        /// "TOSEC", "TOSEC-PIX"). Repeatable; scopes a phase to chosen sets.
+        #[arg(long)]
+        set: Option<Vec<String>>,
+
         /// Move files into place (delete the source) instead of copying — a true
         /// in-place tidy. Rollback-logged; copy is the default.
         #[arg(long)]
@@ -212,7 +217,7 @@ fn main() -> Result<()> {
         Commands::Unknowns => unknowns_cmd::run(cli.data_dir),
         Commands::Stats { group_by } => stats_cmd::run(group_by.as_deref(), cli.data_dir),
         Commands::Config(cmd) => config_cmd::run(cmd, cli.data_dir),
-        Commands::Plan { dat, r#move } => plan_cmd::run(dat, r#move, cli.data_dir),
+        Commands::Plan { dat, set, r#move } => plan_cmd::run(dat, set, r#move, cli.data_dir),
         Commands::Apply {
             dry_run,
             skip_space_check,

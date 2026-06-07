@@ -84,6 +84,10 @@ pub fn run(
     let mut success_count = 0;
     let mut error_count = 0;
 
+    // Source roots, listed once, used to keep the catalogue in step with each
+    // file operation (so a re-plan converges without a re-scan).
+    let sources = crate::db::files::list_sources(db.conn())?;
+
     for (i, op) in plan.operations.iter_mut().enumerate() {
         if op.status != OperationStatus::Pending {
             continue; // Skip already completed or failed operations
@@ -324,6 +328,16 @@ pub fn run(
                 }
             }
         }
+
+        // Keep the catalogue in step with what just happened on disk, so a
+        // re-plan converges without a re-scan. Catalogue-local and cheap; a
+        // failure here doesn't undo the file operation that already succeeded.
+        if !dry_run
+            && op.status == OperationStatus::Completed
+            && let Err(e) = sync_catalogue_after(db.conn(), &sources, &op.kind)
+        {
+            eprintln!("  warning: catalogue not updated for op {}: {}", op.id, e);
+        }
     }
 
     // Save updated plan and operation log
@@ -356,6 +370,87 @@ pub fn run(
         println!("Some operations failed. Run 'cat198x apply' again to retry.");
     }
 
+    Ok(())
+}
+
+/// Update the file catalogue to match a completed operation, so a re-plan
+/// converges without a re-scan: a move/relocate updates the file's recorded
+/// location, a quarantine/delete removes it, a copy/repack records the new copy.
+/// Paths outside any registered source can't be recorded (the file simply leaves
+/// the catalogue's view); the library destination is a source, so the common
+/// cases resolve.
+fn sync_catalogue_after(
+    conn: &rusqlite::Connection,
+    sources: &[crate::db::files::Source],
+    kind: &OperationKind,
+) -> Result<()> {
+    use crate::db::files;
+    match kind {
+        OperationKind::Move { source, dest, .. } => {
+            if source.archive_path.is_some() {
+                // A copy extracted from an archive to a loose dest; source kept.
+                if let Some((nsrc, nrel)) = files::resolve_in_sources(sources, dest) {
+                    files::upsert_file_location(conn, &source.sha1, nsrc, &nrel, None)?;
+                }
+            } else {
+                relocate_or_drop(conn, sources, &source.path, dest)?;
+            }
+        }
+        OperationKind::Relocate { source, dest, .. } => {
+            relocate_or_drop(conn, sources, source, dest)?;
+        }
+        OperationKind::Copy { source, dest, .. } => {
+            if let Some((nsrc, nrel)) = files::resolve_in_sources(sources, dest) {
+                files::upsert_file_location(conn, &source.sha1, nsrc, &nrel, None)?;
+            }
+        }
+        OperationKind::Repack {
+            sources: entries,
+            dest,
+            ..
+        } => {
+            if let Some((nsrc, nrel)) = files::resolve_in_sources(sources, dest) {
+                for e in entries {
+                    files::upsert_file_location(
+                        conn,
+                        &e.sha1,
+                        nsrc,
+                        &nrel,
+                        e.entry_name.as_deref(),
+                    )?;
+                }
+            }
+        }
+        OperationKind::Quarantine { path, .. } | OperationKind::Delete { path } => {
+            if let Some((src, rel)) = files::resolve_in_sources(sources, path) {
+                files::remove_locations_at(conn, src, &rel)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Move a file's catalogued location(s) from `old_abs` to `new_abs`, or drop them
+/// if the destination is outside every registered source.
+fn relocate_or_drop(
+    conn: &rusqlite::Connection,
+    sources: &[crate::db::files::Source],
+    old_abs: &str,
+    new_abs: &str,
+) -> Result<()> {
+    use crate::db::files;
+    match (
+        files::resolve_in_sources(sources, old_abs),
+        files::resolve_in_sources(sources, new_abs),
+    ) {
+        (Some((osrc, orel)), Some((nsrc, nrel))) => {
+            files::relocate_locations(conn, osrc, &orel, nsrc, &nrel)?;
+        }
+        (Some((osrc, orel)), None) => {
+            files::remove_locations_at(conn, osrc, &orel)?;
+        }
+        _ => {}
+    }
     Ok(())
 }
 

@@ -662,7 +662,7 @@ fn test_plan_generation() {
 
     // Generate plan - note: this will print output but we just verify it doesn't panic
     // A real plan would require destination configuration
-    cli::plan::run(None, false, env.data_dir_opt()).unwrap();
+    cli::plan::run(None, None, false, env.data_dir_opt()).unwrap();
 
     // Check that the plans directory exists
     let plans_dir = env.data_dir.join("objects/plans");
@@ -793,7 +793,7 @@ fn test_plan_apply_rollback_cycle() {
     drop(db);
 
     // Generate plan
-    cli::plan::run(None, false, env.data_dir_opt()).expect("Plan generation failed");
+    cli::plan::run(None, None, false, env.data_dir_opt()).expect("Plan generation failed");
 
     // Verify plan was created with operations
     let plans_dir = env.data_dir.join("objects/plans");
@@ -922,7 +922,7 @@ fn test_apply_from_zip_archive() {
     drop(db);
 
     // Generate and apply plan
-    cli::plan::run(None, false, env.data_dir_opt()).expect("Plan generation failed");
+    cli::plan::run(None, None, false, env.data_dir_opt()).expect("Plan generation failed");
     cli::apply::run(false, true, env.data_dir_opt()).expect("Apply failed");
 
     // Verify file was extracted to destination
@@ -993,7 +993,7 @@ fn test_stale_plan_detection() {
     drop(db);
 
     // Generate plan
-    cli::plan::run(None, false, env.data_dir_opt()).unwrap();
+    cli::plan::run(None, None, false, env.data_dir_opt()).unwrap();
 
     // Now modify the state by adding a new file and rescanning
     create_test_rom(&env.roms_dir, "new_file.rom", b"new content");
@@ -1112,7 +1112,7 @@ fn test_multi_file_plan_apply() {
     drop(db);
 
     // Generate plan
-    cli::plan::run(None, false, env.data_dir_opt()).unwrap();
+    cli::plan::run(None, None, false, env.data_dir_opt()).unwrap();
 
     // Verify plan has 3 operations
     let plans_dir = env.data_dir.join("objects/plans");
@@ -1182,33 +1182,34 @@ fn test_apply_skips_already_correct_files() {
     )
     .unwrap();
 
-    create_test_rom(&env.roms_dir, "source.rom", test_content);
+    // Place the matching file at its canonical destination and scan THAT as the
+    // source, so the catalogue records the file already where it belongs. Under
+    // the catalogue-trust model, "already correct" means the catalogue shows the
+    // file at its destination — which a re-plan then leaves alone.
+    let dest_dir = env.temp_dir.path().join("output");
+    fs::create_dir_all(&dest_dir).unwrap();
+    // Canonicalize so the configured destination matches the canonicalized path
+    // `source add` records (on macOS /var is a symlink to /private/var).
+    let dest_dir = std::fs::canonicalize(&dest_dir).unwrap();
+    let dest_file = dest_dir.join("test.rom");
+    fs::write(&dest_file, test_content).unwrap();
 
     use cat198x::SourceCommands;
     cli::source::run(
         SourceCommands::Add {
-            path: env.roms_dir.clone(),
+            path: dest_dir.clone(),
         },
         env.data_dir_opt(),
     )
     .unwrap();
-
     cli::scan::run(None, false, env.data_dir_opt()).unwrap();
-
-    // Create destination with file already in place
-    let dest_dir = env.temp_dir.path().join("output");
-    fs::create_dir_all(&dest_dir).unwrap();
-
-    // Pre-create the destination file with correct content
-    let dest_file = dest_dir.join("test.rom");
-    fs::write(&dest_file, test_content).unwrap();
 
     let db = env.db();
     cat198x::db::config::set_dest_path(db.conn(), "Skip Test", dest_dir.to_str().unwrap()).unwrap();
     drop(db);
 
     // Generate plan - should detect file is already correct
-    cli::plan::run(None, false, env.data_dir_opt()).unwrap();
+    cli::plan::run(None, None, false, env.data_dir_opt()).unwrap();
 
     // When no operations are needed, plan file might not be saved.
     // The key verification is that the destination file still has correct content
@@ -2056,7 +2057,7 @@ fn test_recursive_add_plans_into_hierarchical_destination() {
     .unwrap();
 
     // Plan, then read the saved plan and assert the destination is hierarchical.
-    cli::plan::run(None, false, env.data_dir_opt()).unwrap();
+    cli::plan::run(None, None, false, env.data_dir_opt()).unwrap();
 
     let plans_dir = env.data_dir.join("objects/plans");
     let plan_file = fs::read_dir(&plans_dir)
@@ -2178,6 +2179,19 @@ fn test_zip_output_format_plans_applies_and_converges() {
 
     // Library-wide defaults: a destination and zip output.
     let dest_root = env.temp_dir.path().join("library");
+    fs::create_dir_all(&dest_root).unwrap();
+    // Canonicalize so the built archive's path resolves under the source root
+    // (on macOS /var is a symlink to /private/var, which `source add` resolves).
+    let dest_root = std::fs::canonicalize(&dest_root).unwrap();
+    // The library is itself a source, so apply can record what it places there
+    // and a re-plan converges without a re-scan.
+    cli::source::run(
+        SourceCommands::Add {
+            path: dest_root.clone(),
+        },
+        env.data_dir_opt(),
+    )
+    .unwrap();
     for (k, v) in [
         ("dest_path", dest_root.to_string_lossy().into_owned()),
         ("output_format", "zip".to_string()),
@@ -2193,7 +2207,7 @@ fn test_zip_output_format_plans_applies_and_converges() {
     }
 
     // Plan: one repack to an archive named after the game.
-    cli::plan::run(None, false, env.data_dir_opt()).unwrap();
+    cli::plan::run(None, None, false, env.data_dir_opt()).unwrap();
     let plans_dir = env.data_dir.join("objects/plans");
     let plan_file = fs::read_dir(&plans_dir)
         .unwrap()
@@ -2342,7 +2356,7 @@ fn test_move_mode_relocates_and_removes_source() {
     .unwrap();
 
     // Plan with --move, then apply.
-    cli::plan::run(None, true, env.data_dir_opt()).unwrap();
+    cli::plan::run(None, None, true, env.data_dir_opt()).unwrap();
     let plans_dir = env.data_dir.join("objects/plans");
     let plan_json = fs::read_to_string(
         fs::read_dir(&plans_dir)

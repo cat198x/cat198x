@@ -212,6 +212,52 @@ pub fn upsert_file_location(
     Ok(conn.last_insert_rowid())
 }
 
+/// Resolve an absolute path to the source that contains it (the longest matching
+/// source prefix) and the path relative to that source. `None` when no source
+/// contains the path. Pure over `sources`, so callers list sources once and
+/// resolve many paths without re-querying.
+pub fn resolve_in_sources(sources: &[Source], abs_path: &str) -> Option<(i64, String)> {
+    sources
+        .iter()
+        .filter_map(|s| {
+            let root = s.path.trim_end_matches('/');
+            abs_path
+                .strip_prefix(root)
+                .and_then(|rest| rest.strip_prefix('/'))
+                .map(|rel| (root.len(), s.id, rel.to_string()))
+        })
+        .max_by_key(|(prefix_len, _, _)| *prefix_len)
+        .map(|(_, id, rel)| (id, rel))
+}
+
+/// Move every file-location row for a container — a loose file, or all entries
+/// of an archive — from one (source, path) to another. Used after a move or
+/// relocate so the catalogue reflects the file's new home (and a re-plan
+/// converges without a re-scan). Returns the number of rows moved.
+pub fn relocate_locations(
+    conn: &Connection,
+    old_source_id: i64,
+    old_path: &str,
+    new_source_id: i64,
+    new_path: &str,
+) -> Result<usize> {
+    let n = conn.execute(
+        "UPDATE file_locations SET source_id = ?1, path = ?2 WHERE source_id = ?3 AND path = ?4",
+        params![new_source_id, new_path, old_source_id, old_path],
+    )?;
+    Ok(n)
+}
+
+/// Remove every file-location row at a (source, path) — used after the file
+/// leaves the tracked sources (quarantine or delete). Returns rows removed.
+pub fn remove_locations_at(conn: &Connection, source_id: i64, path: &str) -> Result<usize> {
+    let n = conn.execute(
+        "DELETE FROM file_locations WHERE source_id = ?1 AND path = ?2",
+        params![source_id, path],
+    )?;
+    Ok(n)
+}
+
 /// Get all locations for a file
 pub fn get_file_locations(conn: &Connection, sha1: &str) -> Result<Vec<FileLocation>> {
     let mut stmt = conn.prepare(
@@ -261,6 +307,44 @@ mod tests {
 
     fn setup_db() -> Database {
         Database::open_in_memory().unwrap()
+    }
+
+    fn src(id: i64, path: &str) -> Source {
+        Source {
+            id,
+            path: path.to_string(),
+            case_sensitive: false,
+            added_at: String::new(),
+            last_scanned: None,
+        }
+    }
+
+    #[test]
+    fn resolve_in_sources_picks_longest_matching_prefix() {
+        let sources = vec![
+            src(1, "/lib/ROMs"),
+            src(2, "/lib/ROMs/TOSEC"), // more specific — should win for paths under it
+            src(3, "/lib/ToSort"),
+        ];
+
+        // Longest-prefix wins: a path under both /lib/ROMs and /lib/ROMs/TOSEC
+        // resolves to the more specific source, with the right relative path.
+        assert_eq!(
+            resolve_in_sources(&sources, "/lib/ROMs/TOSEC/Acorn/game.zip"),
+            Some((2, "Acorn/game.zip".to_string()))
+        );
+        assert_eq!(
+            resolve_in_sources(&sources, "/lib/ROMs/Other/game.rom"),
+            Some((1, "Other/game.rom".to_string()))
+        );
+        assert_eq!(
+            resolve_in_sources(&sources, "/lib/ToSort/x.zip"),
+            Some((3, "x.zip".to_string()))
+        );
+        // Outside every source → None (the file leaves the catalogue's view).
+        assert_eq!(resolve_in_sources(&sources, "/elsewhere/x.rom"), None);
+        // A path equal to a source root (no file under it) → None.
+        assert_eq!(resolve_in_sources(&sources, "/lib/ROMs"), None);
     }
 
     #[test]

@@ -37,6 +37,11 @@ pub struct MatchedRom {
 pub struct PlanOptions {
     /// Glob over collection names; `None` plans every collection.
     pub dat_filter: Option<String>,
+    /// Restrict planning to these sets — the top segment of a collection's
+    /// library path (e.g. `TOSEC`, `TOSEC-PIX`, `FinalBurn Neo`). `None` plans
+    /// every set; useful to scope one set's work (e.g. ingest TOSEC without the
+    /// arcade sets) without listing every collection.
+    pub set_filter: Option<Vec<String>>,
     /// Library-wide destination root for collections without their own dest_path.
     pub default_dest: Option<String>,
     /// Output format for collections without their own setting.
@@ -93,6 +98,17 @@ pub fn generate_plan_filtered(conn: &Connection, opts: &PlanOptions) -> Result<P
         // falling back to the library-wide default destination.
         let hierarchy =
             dats::primary_node_path(conn, version.id)?.unwrap_or_else(|| collection.name.clone());
+
+        // Restrict to requested sets (the top segment of the library path), so a
+        // phase can target e.g. just TOSEC without the arcade sets. Checked
+        // before the match query so excluded collections cost nothing.
+        if let Some(sets) = opts.set_filter.as_ref() {
+            let set = hierarchy.split('/').next().unwrap_or(hierarchy.as_str());
+            if !sets.iter().any(|s| s == set) {
+                continue;
+            }
+        }
+
         let explicit = cfg.as_ref().and_then(|c| c.dest_path.as_deref());
 
         let dest_root = match resolve_dest_root(explicit, default_dest, &hierarchy) {
@@ -993,6 +1009,32 @@ mod tests {
             quarantined,
             vec!["/lib/ToSort/SET/Sys/Game.zip".to_string()]
         );
+    }
+
+    #[test]
+    fn set_filter_restricts_planning_to_requested_sets() {
+        let db = setup_db();
+        let conn = db.conn();
+        setup_dup_fixture(conn, false); // collection whose set (top segment) is "SET"
+
+        let opts = |sets: Option<Vec<String>>| PlanOptions {
+            set_filter: sets,
+            default_dest: Some("/lib/ROMs".to_string()),
+            default_format: OutputFormat::Loose,
+            move_files: true,
+            ..Default::default()
+        };
+
+        // A non-matching set is skipped entirely — no operations.
+        let other = generate_plan_filtered(conn, &opts(Some(vec!["TOSEC".to_string()]))).unwrap();
+        assert!(
+            other.is_empty(),
+            "collection in set 'SET' excluded by --set TOSEC"
+        );
+
+        // The matching set is planned.
+        let matched = generate_plan_filtered(conn, &opts(Some(vec!["SET".to_string()]))).unwrap();
+        assert!(!matched.is_empty(), "set 'SET' is planned when requested");
     }
 
     #[test]
