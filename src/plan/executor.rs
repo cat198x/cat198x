@@ -112,7 +112,35 @@ pub fn execute_move(
     dest_path: &str,
     expected_sha1: &str,
 ) -> Result<()> {
-    // First, copy the file to the destination (reuse existing copy logic)
+    // Fast path: a loose-file move to a loose-file destination on the same
+    // filesystem is an atomic rename — no bytes copied. This is the common case
+    // for an in-place tidy and turns a full read+write+read of every ROM into a
+    // metadata operation. We verify the SOURCE first so a hash mismatch fails
+    // before the file is touched (the source is never lost to a bad move), then
+    // rename. Archive sources and archive (.zip) destinations can't be renamed
+    // and fall through to the copy path below.
+    if archive_path.is_none() && !dest_path.to_lowercase().ends_with(".zip") {
+        let source = Path::new(source_path);
+        let dest = Path::new(dest_path);
+
+        if !verify_sha1(source, expected_sha1)? {
+            anyhow::bail!(
+                "Verification failed: source file hash does not match expected SHA1 {}",
+                expected_sha1
+            );
+        }
+        if let Some(parent) = dest.parent() {
+            fs::create_dir_all(parent).context("Failed to create destination directory")?;
+        }
+        // A successful rename moves verified content atomically — done. A
+        // failure is almost always a cross-device link error; fall through to
+        // copy+delete in that case.
+        if fs::rename(source, dest).is_ok() {
+            return Ok(());
+        }
+    }
+
+    // Copy path: cross-device move, archive source, or archive destination.
     execute_copy(source_path, archive_path, dest_path, expected_sha1)?;
 
     // If source is inside an archive, we can't delete it - just return success
