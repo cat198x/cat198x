@@ -157,6 +157,7 @@ pub fn generate_plan_filtered(conn: &Connection, opts: &PlanOptions) -> Result<P
 
         let mut already_correct = 0;
         let mut to_write = 0;
+        let mut relocated = 0;
         let mut quarantined = 0;
         let mut bytes = 0u64;
 
@@ -296,16 +297,35 @@ pub fn generate_plan_filtered(conn: &Connection, opts: &PlanOptions) -> Result<P
                             .map(|(p, _)| p.clone())
                     };
 
+                    // A complete archive already staged somewhere other than the
+                    // destination — relocate the whole file there rather than
+                    // rebuilding it (the staged ToSort case: an instant rename
+                    // instead of reading and recompressing every entry).
+                    let staged_complete: Option<String> = match &build_from {
+                        Some(p) if *p != dest => Some(p.clone()),
+                        _ => None,
+                    };
+
                     // A content-correct `torrentzip` still needs its deterministic
                     // stamp, which the catalogue doesn't record, so it is rebuilt
                     // rather than read off the network to check — `zip` is correct
                     // on content alone.
                     if complete_at_dest && tag != "torrentzip" {
                         already_correct += expected.len();
+                    } else if let Some(ref src) = staged_complete
+                        && opts.move_files
+                        && tag != "torrentzip"
+                    {
+                        // Relocate the complete staged archive to its destination.
+                        let size: u64 = containers[src].iter().map(|m| m.size as u64).sum();
+                        bytes += size;
+                        plan.add_relocate(src.clone(), dest.clone(), size);
+                        relocated += 1;
                     } else {
                         // Build the canonical archive at dest: from one complete
                         // container if there is one, else from whatever entries we
-                        // hold (scattered across containers).
+                        // hold (scattered across containers). Used in copy mode, for
+                        // torrentzip, or when no single container is complete.
                         let sources: Vec<SourceRef> = match &build_from {
                             Some(p) => containers[p].iter().map(source_ref_for).collect(),
                             None => containers
@@ -346,8 +366,8 @@ pub fn generate_plan_filtered(conn: &Connection, opts: &PlanOptions) -> Result<P
                     }
                 }
                 println!(
-                    "  {} ROMs already archived, {} archive(s) to build, {} duplicate(s) to quarantine",
-                    already_correct, to_write, quarantined
+                    "  {} ROMs already archived, {} to relocate, {} archive(s) to build, {} duplicate(s) to quarantine",
+                    already_correct, relocated, to_write, quarantined
                 );
             }
         }
@@ -972,6 +992,78 @@ mod tests {
         assert_eq!(
             quarantined,
             vec!["/lib/ToSort/SET/Sys/Game.zip".to_string()]
+        );
+    }
+
+    #[test]
+    fn archive_complete_staged_copy_is_relocated_not_repacked() {
+        let db = setup_db();
+        let conn = db.conn();
+        // Only a staged ToSort copy exists; the library does not hold this game.
+        let coll = collections::create_collection(conn, "Test Coll", "tosec").unwrap();
+        let vid = collections::add_version(conn, coll, "v1", "/dats/test.dat", true).unwrap();
+        let node = dats::create_node(conn, vid, None, "Test Coll", "dat", "SET/Sys").unwrap();
+        let game = dats::create_game(conn, node, "Game", None, None, false, false, false).unwrap();
+        dats::create_rom(
+            conn,
+            game,
+            "game.rom",
+            10,
+            Some("AAA"),
+            None,
+            None,
+            "good",
+            None,
+        )
+        .unwrap();
+        conn.execute("INSERT INTO files (sha1, size) VALUES ('AAA', 10)", [])
+            .unwrap();
+        conn.execute(
+            "INSERT INTO sources (id, path, case_sensitive) VALUES (102, '/lib/ToSort/SET', 0)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO file_locations (sha1, source_id, path, archive_path)
+             VALUES ('AAA', 102, 'Sys/Game.zip', 'game.rom')",
+            [],
+        )
+        .unwrap();
+        db_config::set_output_format(conn, "SET", "zip").unwrap();
+
+        let plan = generate_plan_filtered(
+            conn,
+            &PlanOptions {
+                default_dest: Some("/lib/ROMs".to_string()),
+                default_format: OutputFormat::Loose,
+                move_files: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        // A complete staged archive is relocated whole to its canonical path —
+        // an instant rename — rather than rebuilt by repacking its entries.
+        assert_eq!(
+            plan.summary.repack_count, 0,
+            "the staged zip is moved as-is, not rebuilt"
+        );
+        let relocates: Vec<_> = plan
+            .operations
+            .iter()
+            .filter_map(|op| match &op.kind {
+                OperationKind::Relocate { source, dest, .. } => {
+                    Some((source.clone(), dest.clone()))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            relocates,
+            vec![(
+                "/lib/ToSort/SET/Sys/Game.zip".to_string(),
+                "/lib/ROMs/SET/Sys/Game.zip".to_string(),
+            )]
         );
     }
 

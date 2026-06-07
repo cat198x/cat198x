@@ -167,6 +167,54 @@ pub fn execute_move(
     Ok(())
 }
 
+/// Relocate a whole file unchanged to `dest`.
+///
+/// A same-filesystem rename moves the bytes atomically with no copy — the common
+/// case for staging a complete archive into the library on one volume. A rename
+/// failure (cross-device) falls back to a copy that is then verified byte-faithful
+/// to the source by re-hashing both (the file's own hash isn't catalogued), and
+/// the source is removed only after the copy is flushed to disk.
+pub fn execute_relocate(source_path: &str, dest_path: &str) -> Result<()> {
+    let source = Path::new(source_path);
+    let dest = Path::new(dest_path);
+
+    if !source.exists() {
+        anyhow::bail!("Source file not found: {}", source_path);
+    }
+    if let Some(parent) = dest.parent() {
+        fs::create_dir_all(parent).context("Failed to create destination directory")?;
+    }
+
+    if fs::rename(source, dest).is_ok() {
+        return Ok(());
+    }
+
+    // Cross-device: copy, confirm byte-faithful, flush, then remove the source.
+    fs::copy(source_path, dest_path).context("Failed to copy file during relocate")?;
+    if hash_file(source)? != hash_file(dest)? {
+        let _ = fs::remove_file(dest);
+        anyhow::bail!(
+            "Relocate copy is not byte-faithful to source: {}",
+            source_path
+        );
+    }
+    std::fs::File::open(dest_path)
+        .and_then(|f| f.sync_all())
+        .with_context(|| format!("Failed to flush destination before delete: {}", dest_path))?;
+    fs::remove_file(source)
+        .with_context(|| format!("Failed to delete source after relocate: {}", source_path))?;
+    Ok(())
+}
+
+/// SHA-1 of a whole file, upper-case hex.
+fn hash_file(path: &Path) -> Result<String> {
+    use sha1::{Digest, Sha1};
+    let bytes = fs::read(path).with_context(|| format!("Failed to read {}", path.display()))?;
+    let mut hasher = Sha1::new();
+    Digest::update(&mut hasher, &bytes);
+    Ok(crate::util::hex_upper(Digest::finalize(hasher)))
+}
+
 /// Execute a copy operation where the destination is a ZIP archive
 ///
 /// The entry name inside the ZIP is derived from the source file name.
@@ -503,7 +551,9 @@ pub fn check_disk_space(plan: &Plan) -> Result<()> {
         }
 
         match &op.kind {
-            OperationKind::Copy { dest, size, .. } | OperationKind::Move { dest, size, .. } => {
+            OperationKind::Copy { dest, size, .. }
+            | OperationKind::Move { dest, size, .. }
+            | OperationKind::Relocate { dest, size, .. } => {
                 // Get the parent directory as a rough mount point indicator
                 let dest_dir = Path::new(dest)
                     .parent()
@@ -1207,6 +1257,32 @@ mod tests {
         assert!(src_path.exists());
         // Destination should not exist
         assert!(!dest_path.exists());
+    }
+
+    #[test]
+    fn execute_relocate_moves_whole_file_unchanged() {
+        let temp = TempDir::new().unwrap();
+        let src = temp.path().join("ToSort/SET/Game.zip");
+        fs::create_dir_all(src.parent().unwrap()).unwrap();
+        fs::write(&src, b"a complete zip's bytes").unwrap();
+        // Destination in a not-yet-existing nested dir (same filesystem → rename).
+        let dest = temp.path().join("ROMs/SET/Sys/Game.zip");
+
+        execute_relocate(src.to_str().unwrap(), dest.to_str().unwrap()).unwrap();
+
+        assert!(!src.exists(), "source relocated away");
+        assert!(dest.exists());
+        assert_eq!(fs::read(&dest).unwrap(), b"a complete zip's bytes");
+    }
+
+    #[test]
+    fn execute_relocate_missing_source_errors() {
+        let temp = TempDir::new().unwrap();
+        let result = execute_relocate(
+            temp.path().join("nope.zip").to_str().unwrap(),
+            temp.path().join("dest.zip").to_str().unwrap(),
+        );
+        assert!(result.is_err());
     }
 
     #[test]

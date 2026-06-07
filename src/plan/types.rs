@@ -86,6 +86,17 @@ pub enum OperationKind {
         dest: String,
         size: u64,
     },
+    /// Relocate a whole file unchanged — e.g. a complete archive that is already
+    /// in its final form and only needs to sit at its canonical path. Unlike
+    /// `Move`, the content is not re-verified against a ROM hash (the catalogue
+    /// hashes an archive's inner entries, not the archive file itself); a
+    /// same-filesystem rename preserves the bytes, and the cross-device fallback
+    /// verifies the copy is byte-faithful to the source instead.
+    Relocate {
+        source: String,
+        dest: String,
+        size: u64,
+    },
     /// Repack files into an archive
     Repack {
         sources: Vec<SourceRef>,
@@ -153,6 +164,19 @@ impl Plan {
             id,
             status: OperationStatus::Pending,
             kind: OperationKind::Move { source, dest, size },
+        });
+        self.summary.move_count += 1;
+        self.summary.total_bytes += size;
+    }
+
+    /// Add a relocate operation: move a whole file (e.g. a complete archive)
+    /// unchanged to its canonical path. Counts as a move for the summary.
+    pub fn add_relocate(&mut self, source: String, dest: String, size: u64) {
+        let id = self.operations.len() as u64;
+        self.operations.push(Operation {
+            id,
+            status: OperationStatus::Pending,
+            kind: OperationKind::Relocate { source, dest, size },
         });
         self.summary.move_count += 1;
         self.summary.total_bytes += size;

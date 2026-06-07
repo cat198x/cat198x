@@ -48,6 +48,10 @@ pub enum LoggedOperation {
         dest: String,
         sha1: String,
     },
+    /// Relocate operation — a whole file moved unchanged. Its reverse is a
+    /// relocate back, with no ROM-hash verification (the file's own hash is not
+    /// catalogued; the move preserves the bytes).
+    Relocate { source: String, dest: String },
     /// Delete operation
     Delete { path: String },
     /// Repack operation
@@ -148,6 +152,29 @@ impl OperationLog {
             None
         };
 
+        self.entries.push(LogEntry {
+            operation_id,
+            executed_at: chrono_now(),
+            forward,
+            reverse,
+            status: if success {
+                LogStatus::Completed
+            } else {
+                LogStatus::Failed
+            },
+        });
+    }
+
+    /// Add a completed relocate operation. The reverse relocates back.
+    pub fn log_relocate(&mut self, operation_id: u64, source: &str, dest: &str, success: bool) {
+        let forward = LoggedOperation::Relocate {
+            source: source.to_string(),
+            dest: dest.to_string(),
+        };
+        let reverse = success.then(|| LoggedOperation::Relocate {
+            source: dest.to_string(),
+            dest: source.to_string(),
+        });
         self.entries.push(LogEntry {
             operation_id,
             executed_at: chrono_now(),

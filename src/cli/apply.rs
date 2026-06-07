@@ -5,7 +5,8 @@ use std::fs;
 
 use crate::db::quarantine::QuarantineReason;
 use crate::plan::executor::{
-    check_disk_space, execute_copy, execute_move, execute_repack, execute_rollback_move,
+    check_disk_space, execute_copy, execute_move, execute_relocate, execute_repack,
+    execute_rollback_move,
 };
 use crate::plan::{OperationKind, OperationLog, OperationStatus, compute_state_hash};
 use crate::util::truncate_path;
@@ -153,6 +154,39 @@ pub fn run(
                 // Log the operation
                 if let Some(ref mut log) = op_log {
                     log.log_move(op.id, &source.path, dest, &source.sha1, success);
+                }
+
+                match result {
+                    Ok(()) => {
+                        op.status = OperationStatus::Completed;
+                        success_count += 1;
+                    }
+                    Err(e) => {
+                        eprintln!("  ERROR: {}", e);
+                        op.status = OperationStatus::Failed;
+                        error_count += 1;
+                    }
+                }
+            }
+            OperationKind::Relocate { source, dest, .. } => {
+                println!(
+                    "[{}/{}] RELOCATE {} -> {}",
+                    i + 1,
+                    total_ops,
+                    truncate_path(source, 40),
+                    truncate_path(dest, 40)
+                );
+
+                if dry_run {
+                    success_count += 1;
+                    continue;
+                }
+
+                let result = execute_relocate(source, dest);
+                let success = result.is_ok();
+
+                if let Some(ref mut log) = op_log {
+                    log.log_relocate(op.id, source, dest, success);
                 }
 
                 match result {
@@ -472,6 +506,35 @@ pub fn run_rollback(
 
                 // Move the file back (source is current location, dest is original location)
                 match execute_rollback_move(source, dest, sha1) {
+                    Ok(()) => {
+                        log.entries[idx].status = LogStatus::RolledBack;
+                        success_count += 1;
+                    }
+                    Err(e) => {
+                        eprintln!("  ERROR: {}", e);
+                        log.entries[idx].status = LogStatus::Failed;
+                        error_count += 1;
+                    }
+                }
+            }
+            LoggedOperation::Relocate {
+                ref source,
+                ref dest,
+            } => {
+                println!(
+                    "[{}] RELOCATE {} -> {}",
+                    operation_id,
+                    truncate_path(source, 30),
+                    truncate_path(dest, 30)
+                );
+
+                if dry_run {
+                    success_count += 1;
+                    continue;
+                }
+
+                // Reverse is itself a relocate (source is current, dest is original).
+                match execute_relocate(source, dest) {
                     Ok(()) => {
                         log.entries[idx].status = LogStatus::RolledBack;
                         success_count += 1;
