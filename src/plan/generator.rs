@@ -3,8 +3,7 @@
 use anyhow::Result;
 use rusqlite::Connection;
 use sha2::{Digest as Sha2Digest, Sha256};
-use std::collections::HashMap;
-use std::path::Path;
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use super::{CollectionPlanStat, Plan, SourceRef};
 use crate::config::OutputFormat;
@@ -157,80 +156,197 @@ pub fn generate_plan_filtered(conn: &Connection, opts: &PlanOptions) -> Result<P
 
         let mut already_correct = 0;
         let mut to_write = 0;
+        let mut quarantined = 0;
         let mut bytes = 0u64;
 
         match archive_format_tag(format) {
             None => {
                 // LOOSE: one file per ROM. A single-ROM game stays flat
-                // (dest/rom); a multi-ROM game gets a folder (dest/game/rom),
-                // so count ROMs per game up front.
-                let mut roms_per_game: HashMap<String, usize> = HashMap::new();
+                // (dest/rom); a multi-ROM game gets a folder (dest/game/rom), so
+                // count the *distinct* ROMs per game up front — counting match
+                // rows would mistake a ROM held in several locations for a
+                // multi-ROM game and wrongly add a folder level.
+                let mut roms_per_game: HashMap<String, HashSet<String>> = HashMap::new();
                 for m in &matches {
-                    *roms_per_game.entry(m.game_name.clone()).or_insert(0) += 1;
+                    roms_per_game
+                        .entry(m.game_name.clone())
+                        .or_default()
+                        .insert(m.rom_name.clone());
                 }
 
+                // Group every held copy by its canonical destination. Copies of
+                // one ROM (same content from different locations — e.g. a file
+                // already placed in the library plus a staged copy under ToSort)
+                // share a destination: we keep exactly one canonical copy there
+                // and quarantine the rest as duplicates.
+                let mut by_dest: BTreeMap<String, Vec<MatchedRom>> = BTreeMap::new();
                 for m in matches {
-                    let multi_rom = roms_per_game.get(&m.game_name).copied().unwrap_or(1) > 1;
+                    let multi_rom = roms_per_game
+                        .get(&m.game_name)
+                        .map(|s| s.len())
+                        .unwrap_or(1)
+                        > 1;
                     let dest = build_dest_path(&dest_root, &m.game_name, &m.rom_name, multi_rom);
+                    by_dest.entry(dest).or_default().push(m);
+                }
 
-                    // Already correct when the held file is a loose file already
-                    // sitting at its canonical destination. The match carries the
-                    // file's current location, so this is an in-memory comparison
-                    // — no per-file disk stat or catalogue scan, which is what
-                    // makes planning a whole library over a network mount viable.
-                    let full_source = format!("{}/{}", m.source_root, m.source_path);
-                    if m.archive_path.is_none() && full_source == dest {
-                        already_correct += 1;
-                        continue;
-                    }
-
-                    bytes += m.size as u64;
-                    let source = SourceRef {
-                        path: full_source,
-                        archive_path: m.archive_path,
-                        sha1: m.sha1,
-                        entry_name: None,
+                for (dest, copies) in by_dest {
+                    // A loose copy already sitting at the destination is the
+                    // canonical one — an in-memory comparison (the match carries
+                    // its location), so no per-file disk stat or catalogue scan.
+                    let at_dest = copies.iter().position(|m| {
+                        m.archive_path.is_none()
+                            && format!("{}/{}", m.source_root, m.source_path) == dest
+                    });
+                    let keep = match at_dest {
+                        Some(i) => {
+                            already_correct += 1;
+                            Some(i)
+                        }
+                        None => {
+                            // Nothing at dest yet: place the first copy there.
+                            let m = &copies[0];
+                            bytes += m.size as u64;
+                            let source = SourceRef {
+                                path: format!("{}/{}", m.source_root, m.source_path),
+                                archive_path: m.archive_path.clone(),
+                                sha1: m.sha1.clone(),
+                                entry_name: None,
+                            };
+                            if opts.move_files {
+                                plan.add_move(source, dest.clone(), m.size as u64);
+                            } else {
+                                plan.add_copy(source, dest.clone(), m.size as u64);
+                            }
+                            to_write += 1;
+                            Some(0)
+                        }
                     };
-                    if opts.move_files {
-                        plan.add_move(source, dest, m.size as u64);
-                    } else {
-                        plan.add_copy(source, dest, m.size as u64);
+                    // Quarantine every other loose copy — its content is already
+                    // accounted for at the destination.
+                    for (i, m) in copies.iter().enumerate() {
+                        if Some(i) == keep || m.archive_path.is_some() {
+                            continue;
+                        }
+                        let path = format!("{}/{}", m.source_root, m.source_path);
+                        if path == dest {
+                            continue;
+                        }
+                        plan.add_quarantine(
+                            path,
+                            m.sha1.clone(),
+                            m.size as u64,
+                            format!("duplicate of {}", dest),
+                            Some(collection.name.clone()),
+                        );
+                        quarantined += 1;
                     }
-                    to_write += 1;
                 }
                 let verb = if opts.move_files { "move" } else { "copy" };
                 println!(
-                    "  {} already correct, {} to {}",
-                    already_correct, to_write, verb
+                    "  {} already correct, {} to {}, {} duplicate(s) to quarantine",
+                    already_correct, to_write, verb, quarantined
                 );
             }
             Some(tag) => {
-                // ARCHIVE: one archive per game, named <dest_root>/<game>.zip,
-                // with entries carrying canonical ROM names.
-                let games = group_for_archive(matches);
-
+                // ARCHIVE: one archive per game at <dest_root>/<game>.<ext>. A
+                // game's ROMs may be held in several physical archives (the
+                // library copy plus staged ToSort copies); one canonical archive
+                // belongs at dest, and duplicate whole-archive copies elsewhere
+                // are quarantined.
                 let ext = archive_extension(tag);
-                for game in games {
-                    let dest = format!("{}/{}.{}", dest_root.trim_end_matches('/'), game.name, ext);
+                let mut games: BTreeMap<String, Vec<MatchedRom>> = BTreeMap::new();
+                for m in matches {
+                    games.entry(m.game_name.clone()).or_default().push(m);
+                }
 
-                    // The matched entries already live in the archive at `dest`
-                    // when every source's container is `dest` itself — an
-                    // in-memory check (the matches carry their location), so a
-                    // correctly-placed archive needs no disk read.
-                    let at_dest =
-                        !game.sources.is_empty() && game.sources.iter().all(|s| s.path == dest);
-                    if archive_at_dest_is_correct(at_dest, &dest, tag)? {
-                        already_correct += game.expected.len();
-                        continue;
+                for (game_name, gmatches) in games {
+                    let dest = format!("{}/{}.{}", dest_root.trim_end_matches('/'), game_name, ext);
+
+                    // Distinct expected entries (canonical name + SHA1) and the
+                    // source containers that hold them.
+                    let mut expected: Vec<(String, String)> = Vec::new();
+                    let mut seen = HashSet::new();
+                    let mut containers: BTreeMap<String, Vec<MatchedRom>> = BTreeMap::new();
+                    for m in gmatches {
+                        if seen.insert((m.rom_name.clone(), m.sha1.clone())) {
+                            expected.push((m.rom_name.clone(), m.sha1.clone()));
+                        }
+                        let container = format!("{}/{}", m.source_root, m.source_path);
+                        containers.entry(container).or_default().push(m);
+                    }
+                    let is_complete = |entries: &[MatchedRom]| {
+                        expected.iter().all(|(name, sha1)| {
+                            entries
+                                .iter()
+                                .any(|m| &m.rom_name == name && m.sha1.eq_ignore_ascii_case(sha1))
+                        })
+                    };
+
+                    // The canonical container is the complete one at dest if it
+                    // exists, otherwise a complete one elsewhere we build from.
+                    let complete_at_dest = containers.get(&dest).is_some_and(|e| is_complete(e));
+                    let build_from = if complete_at_dest {
+                        Some(dest.clone())
+                    } else {
+                        containers
+                            .iter()
+                            .find(|(_, e)| is_complete(e))
+                            .map(|(p, _)| p.clone())
+                    };
+
+                    // A content-correct `torrentzip` still needs its deterministic
+                    // stamp, which the catalogue doesn't record, so it is rebuilt
+                    // rather than read off the network to check — `zip` is correct
+                    // on content alone.
+                    if complete_at_dest && tag != "torrentzip" {
+                        already_correct += expected.len();
+                    } else {
+                        // Build the canonical archive at dest: from one complete
+                        // container if there is one, else from whatever entries we
+                        // hold (scattered across containers).
+                        let sources: Vec<SourceRef> = match &build_from {
+                            Some(p) => containers[p].iter().map(source_ref_for).collect(),
+                            None => containers
+                                .values()
+                                .flat_map(|e| e.iter().map(source_ref_for))
+                                .collect(),
+                        };
+                        let size: u64 = expected
+                            .iter()
+                            .filter_map(|(name, _)| {
+                                containers
+                                    .values()
+                                    .flatten()
+                                    .find(|m| &m.rom_name == name)
+                                    .map(|m| m.size as u64)
+                            })
+                            .sum();
+                        bytes += size;
+                        plan.add_repack(sources, dest.clone(), tag.to_string(), size);
+                        to_write += 1;
                     }
 
-                    bytes += game.size;
-                    plan.add_repack(game.sources, dest, tag.to_string(), game.size);
-                    to_write += 1;
+                    // Quarantine duplicate whole-archive copies: any container
+                    // that is neither the destination nor the one we build from.
+                    for (path, entries) in &containers {
+                        if *path == dest || build_from.as_deref() == Some(path.as_str()) {
+                            continue;
+                        }
+                        let size: u64 = entries.iter().map(|m| m.size as u64).sum();
+                        plan.add_quarantine(
+                            path.clone(),
+                            entries[0].sha1.clone(),
+                            size,
+                            format!("duplicate archive of {}", dest),
+                            Some(collection.name.clone()),
+                        );
+                        quarantined += 1;
+                    }
                 }
                 println!(
-                    "  {} ROMs already archived, {} archive(s) to build",
-                    already_correct, to_write
+                    "  {} ROMs already archived, {} archive(s) to build, {} duplicate(s) to quarantine",
+                    already_correct, to_write, quarantined
                 );
             }
         }
@@ -366,60 +482,15 @@ fn archive_extension(tag: &str) -> &'static str {
     if tag == "7z" { "7z" } else { "zip" }
 }
 
-/// A game's ROMs gathered for a single archive.
-struct ArchiveGame {
-    name: String,
-    sources: Vec<SourceRef>,
-    /// (entry name, sha1) pairs, used to check an existing archive is correct.
-    expected: Vec<(String, String)>,
-    size: u64,
-}
-
-/// Group matched ROMs by game for archive output — one [`ArchiveGame`] per game,
-/// sorted by name for stable plans. Each source carries its canonical ROM name
-/// as the archive entry name.
-fn group_for_archive(matches: Vec<MatchedRom>) -> Vec<ArchiveGame> {
-    use std::collections::BTreeMap;
-
-    let mut games: BTreeMap<String, ArchiveGame> = BTreeMap::new();
-    for m in matches {
-        let game = games
-            .entry(m.game_name.clone())
-            .or_insert_with(|| ArchiveGame {
-                name: m.game_name.clone(),
-                sources: Vec::new(),
-                expected: Vec::new(),
-                size: 0,
-            });
-        game.expected.push((m.rom_name.clone(), m.sha1.clone()));
-        game.size += m.size as u64;
-        game.sources.push(SourceRef {
-            path: format!("{}/{}", m.source_root, m.source_path),
-            archive_path: m.archive_path,
-            sha1: m.sha1,
-            entry_name: Some(m.rom_name),
-        });
+/// Build a repack source reference from a matched ROM, carrying its canonical
+/// ROM name as the archive entry name.
+fn source_ref_for(m: &MatchedRom) -> SourceRef {
+    SourceRef {
+        path: format!("{}/{}", m.source_root, m.source_path),
+        archive_path: m.archive_path.clone(),
+        sha1: m.sha1.clone(),
+        entry_name: Some(m.rom_name.clone()),
     }
-    games.into_values().collect()
-}
-
-/// Whether the game's archive already exists, correct, at `dest`.
-///
-/// Entry correctness is established in memory by the caller: `at_dest` is true
-/// when every matched source already lives in the archive at `dest` (the matches
-/// carry their location, so no archive is opened). For `zip` that is sufficient
-/// — the right entries are present. `torrentzip` additionally requires the
-/// deterministic container stamp, which only the file itself can confirm, so
-/// that one case reads the archive; a content-correct plain ZIP is rebuilt to
-/// earn the stamp.
-fn archive_at_dest_is_correct(at_dest: bool, dest: &str, format: &str) -> Result<bool> {
-    if !at_dest {
-        return Ok(false);
-    }
-    if format == "torrentzip" {
-        return crate::archive::is_torrentzip_stamped(Path::new(dest));
-    }
-    Ok(true)
 }
 
 /// Resolve a collection's destination root, in order of precedence:
@@ -611,6 +682,7 @@ fn apply_one_g_one_r_filter(
 mod tests {
     use super::*;
     use crate::db::Database;
+    use crate::plan::OperationKind;
 
     fn setup_db() -> Database {
         Database::open_in_memory().unwrap()
@@ -684,17 +756,6 @@ mod tests {
         let plan = generate_plan_filtered(conn, &PlanOptions::default()).unwrap();
         assert!(plan.is_empty(), "no destination → no operations");
         assert_eq!(plan.skipped_no_dest, vec!["No Dest Coll".to_string()]);
-    }
-
-    #[test]
-    fn archive_at_dest_is_correct_trusts_in_memory_placement() {
-        // zip: every matched source already in the archive at dest → correct,
-        // with no disk access.
-        assert!(archive_at_dest_is_correct(true, "/lib/x.zip", "zip").unwrap());
-        // Not all sources at dest → must (re)build; no disk access for either
-        // format when at_dest is false.
-        assert!(!archive_at_dest_is_correct(false, "/lib/x.zip", "zip").unwrap());
-        assert!(!archive_at_dest_is_correct(false, "/lib/x.zip", "torrentzip").unwrap());
     }
 
     #[test]
@@ -777,41 +838,134 @@ mod tests {
         assert_eq!(archive_extension("torrentzip"), "zip");
     }
 
-    #[test]
-    fn group_for_archive_collects_roms_per_game_with_canonical_entry_names() {
-        let matches = vec![
-            MatchedRom {
-                collection: "C".into(),
-                game_name: "Game".into(),
-                rom_name: "disk1.img".into(),
-                sha1: "AAA".into(),
-                size: 10,
-                source_path: "src/a.img".into(),
-                source_root: "/roms".into(),
-                archive_path: None,
-            },
-            MatchedRom {
-                collection: "C".into(),
-                game_name: "Game".into(),
-                rom_name: "disk2.img".into(),
-                sha1: "BBB".into(),
-                size: 20,
-                source_path: "src/b.img".into(),
-                source_root: "/roms".into(),
-                archive_path: None,
-            },
-        ];
+    /// Build a one-ROM collection whose held file exists in two places: already
+    /// at its canonical destination under the library, and a staged duplicate
+    /// elsewhere. `archived` controls whether the file is a loose file or an
+    /// inner entry of a `.zip` (and sets the per-set format accordingly).
+    fn setup_dup_fixture(conn: &Connection, archived: bool) {
+        let coll = collections::create_collection(conn, "Test Coll", "tosec").unwrap();
+        let vid = collections::add_version(conn, coll, "v1", "/dats/test.dat", true).unwrap();
+        // Node path "SET/Sys" → set is "SET"; library default + path is the root.
+        let node = dats::create_node(conn, vid, None, "Test Coll", "dat", "SET/Sys").unwrap();
+        let game = dats::create_game(conn, node, "Game", None, None, false, false, false).unwrap();
+        dats::create_rom(
+            conn,
+            game,
+            "game.rom",
+            10,
+            Some("AAA"),
+            None,
+            None,
+            "good",
+            None,
+        )
+        .unwrap();
+        conn.execute("INSERT INTO files (sha1, size) VALUES ('AAA', 10)", [])
+            .unwrap();
 
-        let games = group_for_archive(matches);
-        assert_eq!(games.len(), 1);
-        let g = &games[0];
-        assert_eq!(g.name, "Game");
-        assert_eq!(g.size, 30);
-        assert_eq!(g.sources.len(), 2);
-        // Sources carry canonical ROM names as their archive entry names.
-        assert_eq!(g.sources[0].entry_name.as_deref(), Some("disk1.img"));
-        assert_eq!(g.sources[0].path, "/roms/src/a.img");
-        assert_eq!(g.expected.len(), 2);
+        // Library copy (already at the canonical destination) and a ToSort dup.
+        conn.execute(
+            "INSERT INTO sources (id, path, case_sensitive) VALUES
+                (101, '/lib/ROMs/SET/Sys', 0), (102, '/lib/ToSort/SET', 0)",
+            [],
+        )
+        .unwrap();
+        if archived {
+            // Each copy is a .zip holding the ROM as an inner entry.
+            conn.execute(
+                "INSERT INTO file_locations (sha1, source_id, path, archive_path) VALUES
+                    ('AAA', 101, 'Game.zip', 'game.rom'),
+                    ('AAA', 102, 'Sys/Game.zip', 'game.rom')",
+                [],
+            )
+            .unwrap();
+            db_config::set_output_format(conn, "SET", "zip").unwrap();
+        } else {
+            conn.execute(
+                "INSERT INTO file_locations (sha1, source_id, path, archive_path) VALUES
+                    ('AAA', 101, 'game.rom', NULL),
+                    ('AAA', 102, 'Sys/game.rom', NULL)",
+                [],
+            )
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn loose_duplicate_is_quarantined_canonical_kept_in_place() {
+        let db = setup_db();
+        let conn = db.conn();
+        setup_dup_fixture(conn, false);
+
+        let plan = generate_plan_filtered(
+            conn,
+            &PlanOptions {
+                default_dest: Some("/lib/ROMs".to_string()),
+                default_format: OutputFormat::Loose,
+                move_files: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        // The library copy at /lib/ROMs/SET/Sys/game.rom is already correct, so
+        // no move; the ToSort copy is the duplicate and is quarantined.
+        assert_eq!(
+            plan.summary.move_count, 0,
+            "canonical copy already in place"
+        );
+        assert_eq!(plan.summary.copy_count, 0);
+        assert_eq!(plan.summary.quarantine_count, 1, "ToSort dup quarantined");
+        let quarantined: Vec<_> = plan
+            .operations
+            .iter()
+            .filter_map(|op| match &op.kind {
+                OperationKind::Quarantine { path, .. } => Some(path.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            quarantined,
+            vec!["/lib/ToSort/SET/Sys/game.rom".to_string()]
+        );
+    }
+
+    #[test]
+    fn archive_duplicate_container_is_quarantined() {
+        let db = setup_db();
+        let conn = db.conn();
+        setup_dup_fixture(conn, true);
+
+        let plan = generate_plan_filtered(
+            conn,
+            &PlanOptions {
+                default_dest: Some("/lib/ROMs".to_string()),
+                default_format: OutputFormat::Loose, // overridden to zip per-set
+                move_files: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        // The complete archive already sits at /lib/ROMs/SET/Sys/Game.zip, so
+        // nothing is built; the ToSort .zip is a duplicate container, quarantined.
+        assert_eq!(
+            plan.summary.repack_count, 0,
+            "canonical archive already at dest"
+        );
+        assert_eq!(plan.summary.quarantine_count, 1);
+        let quarantined: Vec<_> = plan
+            .operations
+            .iter()
+            .filter_map(|op| match &op.kind {
+                OperationKind::Quarantine { path, .. } => Some(path.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            quarantined,
+            vec!["/lib/ToSort/SET/Sys/Game.zip".to_string()]
+        );
     }
 
     #[test]
