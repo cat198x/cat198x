@@ -16,6 +16,8 @@ pub enum QuarantineReason {
     ContentChanged,
     /// File is no longer needed at its current location
     PathChanged,
+    /// Content is already held at its canonical destination by another copy
+    Duplicate,
 }
 
 impl QuarantineReason {
@@ -24,6 +26,7 @@ impl QuarantineReason {
             QuarantineReason::SetRemoved => "set_removed",
             QuarantineReason::ContentChanged => "content_changed",
             QuarantineReason::PathChanged => "path_changed",
+            QuarantineReason::Duplicate => "duplicate",
         }
     }
 
@@ -33,6 +36,7 @@ impl QuarantineReason {
             "set_removed" => Some(QuarantineReason::SetRemoved),
             "content_changed" => Some(QuarantineReason::ContentChanged),
             "path_changed" => Some(QuarantineReason::PathChanged),
+            "duplicate" => Some(QuarantineReason::Duplicate),
             _ => None,
         }
     }
@@ -42,6 +46,7 @@ impl QuarantineReason {
             QuarantineReason::SetRemoved => "Set no longer in active DAT",
             QuarantineReason::ContentChanged => "Would be overwritten with different content",
             QuarantineReason::PathChanged => "No longer needed at original location",
+            QuarantineReason::Duplicate => "Duplicate of a copy already in the library",
         }
     }
 }

@@ -7,6 +7,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 
 use super::{CollectionPlanStat, Plan, SourceRef};
 use crate::config::OutputFormat;
+use crate::db::quarantine::QuarantineReason;
 use crate::db::{collections, config as db_config, dats};
 use crate::filter::{RomCandidate, parse_game_name, select_preferred};
 
@@ -236,7 +237,7 @@ pub fn generate_plan_filtered(conn: &Connection, opts: &PlanOptions) -> Result<P
                             path,
                             m.sha1.clone(),
                             m.size as u64,
-                            format!("duplicate of {}", dest),
+                            QuarantineReason::Duplicate.as_str().to_string(),
                             Some(collection.name.clone()),
                         );
                         quarantined += 1;
@@ -338,7 +339,7 @@ pub fn generate_plan_filtered(conn: &Connection, opts: &PlanOptions) -> Result<P
                             path.clone(),
                             entries[0].sha1.clone(),
                             size,
-                            format!("duplicate archive of {}", dest),
+                            QuarantineReason::Duplicate.as_str().to_string(),
                             Some(collection.name.clone()),
                         );
                         quarantined += 1;
@@ -920,13 +921,19 @@ mod tests {
             .operations
             .iter()
             .filter_map(|op| match &op.kind {
-                OperationKind::Quarantine { path, .. } => Some(path.clone()),
+                OperationKind::Quarantine { path, reason, .. } => {
+                    Some((path.clone(), reason.clone()))
+                }
                 _ => None,
             })
             .collect();
         assert_eq!(
             quarantined,
-            vec!["/lib/ToSort/SET/Sys/game.rom".to_string()]
+            vec![(
+                "/lib/ToSort/SET/Sys/game.rom".to_string(),
+                QuarantineReason::Duplicate.as_str().to_string()
+            )],
+            "duplicate quarantined with the Duplicate reason so it groups in status",
         );
     }
 
