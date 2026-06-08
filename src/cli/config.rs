@@ -38,6 +38,17 @@ fn load_file_config(data_dir: Option<PathBuf>) -> Result<(PathBuf, Config)> {
     Ok((path, config))
 }
 
+/// The quarantine store directory: the configured `quarantine_dir`, or
+/// `<data_dir>/quarantine` when unset. Shared by every quarantine operation
+/// (move, prune, restore) so the store location stays consistent.
+pub fn resolve_quarantine_dir(data_dir: Option<PathBuf>) -> Result<PathBuf> {
+    let (_, config) = load_file_config(data_dir.clone())?;
+    match config.quarantine_dir {
+        Some(dir) => Ok(PathBuf::from(dir)),
+        None => Ok(get_data_dir(data_dir)?.join("quarantine")),
+    }
+}
+
 /// The canonical lowercase string for an output format.
 fn output_format_str(f: OutputFormat) -> &'static str {
     match f {
@@ -62,22 +73,28 @@ fn get_default(key: Option<&str>, data_dir: Option<PathBuf>) -> Result<()> {
     let (_, config) = load_file_config(data_dir)?;
 
     let dest = config.default_dest_path.as_deref().unwrap_or("(not set)");
+    let quarantine = config
+        .quarantine_dir
+        .as_deref()
+        .unwrap_or("(default: <data_dir>/quarantine)");
     let format = output_format_str(config.default_output_format);
     let mode = merge_mode_str(config.default_merge_mode);
 
     match key {
         Some("dest_path") => println!("{}", dest),
+        Some("quarantine_dir") => println!("{}", quarantine),
         Some("output_format") => println!("{}", format),
         Some("merge_mode") => println!("{}", mode),
         Some(other) => anyhow::bail!(
-            "Unknown default key: '{}'\n  Valid keys: dest_path, output_format, merge_mode",
+            "Unknown default key: '{}'\n  Valid keys: dest_path, quarantine_dir, output_format, merge_mode",
             other
         ),
         None => {
             println!("Library-wide defaults:");
-            println!("  dest_path:     {}", dest);
-            println!("  output_format: {}", format);
-            println!("  merge_mode:    {}", mode);
+            println!("  dest_path:      {}", dest);
+            println!("  quarantine_dir: {}", quarantine);
+            println!("  output_format:  {}", format);
+            println!("  merge_mode:     {}", mode);
         }
     }
     Ok(())
@@ -88,6 +105,7 @@ fn get_default(key: Option<&str>, data_dir: Option<PathBuf>) -> Result<()> {
 fn set_default_field(config: &mut Config, key: &str, value: &str) -> Result<()> {
     match key {
         "dest_path" => config.default_dest_path = Some(value.to_string()),
+        "quarantine_dir" => config.quarantine_dir = Some(value.to_string()),
         "output_format" => {
             config.default_output_format = match value.to_lowercase().as_str() {
                 "loose" => OutputFormat::Loose,
@@ -112,7 +130,7 @@ fn set_default_field(config: &mut Config, key: &str, value: &str) -> Result<()> 
             };
         }
         _ => anyhow::bail!(
-            "Unknown default key: '{}'\n  Valid keys: dest_path, output_format, merge_mode",
+            "Unknown default key: '{}'\n  Valid keys: dest_path, quarantine_dir, output_format, merge_mode",
             key
         ),
     }
@@ -440,6 +458,48 @@ mod tests {
         let mut config = Config::default();
         set_default_field(&mut config, "dest_path", "/Volumes/Data").unwrap();
         assert_eq!(config.default_dest_path.as_deref(), Some("/Volumes/Data"));
+    }
+
+    #[test]
+    fn set_default_field_sets_quarantine_dir() {
+        let mut config = Config::default();
+        assert_eq!(config.quarantine_dir, None);
+        set_default_field(
+            &mut config,
+            "quarantine_dir",
+            "/Volumes/Data/Library/Quarantine",
+        )
+        .unwrap();
+        assert_eq!(
+            config.quarantine_dir.as_deref(),
+            Some("/Volumes/Data/Library/Quarantine")
+        );
+    }
+
+    #[test]
+    fn resolve_quarantine_dir_defaults_to_data_dir_when_unset() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().to_path_buf();
+        // No config.toml written → unset → falls back to <data_dir>/quarantine.
+        let dir = resolve_quarantine_dir(Some(data_dir.clone())).unwrap();
+        assert_eq!(dir, data_dir.join("quarantine"));
+    }
+
+    #[test]
+    fn resolve_quarantine_dir_uses_configured_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().to_path_buf();
+        let mut config = Config::default();
+        set_default_field(
+            &mut config,
+            "quarantine_dir",
+            "/Volumes/Data/Library/Quarantine",
+        )
+        .unwrap();
+        config.save(&data_dir.join("config.toml")).unwrap();
+
+        let dir = resolve_quarantine_dir(Some(data_dir)).unwrap();
+        assert_eq!(dir, PathBuf::from("/Volumes/Data/Library/Quarantine"));
     }
 
     #[test]

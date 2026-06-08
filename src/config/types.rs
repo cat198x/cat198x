@@ -21,6 +21,14 @@ pub struct Config {
     /// leaves such collections out of the plan (reported, never silent).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_dest_path: Option<String>,
+
+    /// Where quarantined files are stored. `None` uses `<data_dir>/quarantine`.
+    /// Set this to a path on the *same volume* as the library so quarantining is
+    /// an instant rename rather than a cross-device byte copy — the default
+    /// local store would otherwise copy every file off a network mount and fill
+    /// the local disk.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quarantine_dir: Option<String>,
 }
 
 /// Output format for organized ROM files
@@ -111,6 +119,7 @@ mod tests {
             default_output_format: OutputFormat::Zip,
             default_merge_mode: MergeMode::NonMerged,
             default_dest_path: None,
+            quarantine_dir: None,
         };
         let toml_str = toml::to_string_pretty(&config).unwrap();
 
@@ -123,6 +132,7 @@ mod tests {
             default_output_format: OutputFormat::TorrentZip,
             default_merge_mode: MergeMode::NonMerged,
             default_dest_path: None,
+            quarantine_dir: None,
         };
         let toml_str = toml::to_string_pretty(&config).unwrap();
 
@@ -135,6 +145,7 @@ mod tests {
             default_output_format: OutputFormat::Loose,
             default_merge_mode: MergeMode::Merged,
             default_dest_path: None,
+            quarantine_dir: None,
         };
         let toml_str = toml::to_string_pretty(&config).unwrap();
 
@@ -147,6 +158,7 @@ mod tests {
             default_output_format: OutputFormat::Loose,
             default_merge_mode: MergeMode::Split,
             default_dest_path: None,
+            quarantine_dir: None,
         };
         let toml_str = toml::to_string_pretty(&config).unwrap();
 
@@ -201,6 +213,7 @@ mod tests {
             default_output_format: OutputFormat::TorrentZip,
             default_merge_mode: MergeMode::Split,
             default_dest_path: None,
+            quarantine_dir: None,
         };
 
         let toml_str = toml::to_string_pretty(&original).unwrap();
@@ -219,6 +232,7 @@ mod tests {
             default_output_format: OutputFormat::Zip,
             default_merge_mode: MergeMode::Merged,
             default_dest_path: None,
+            quarantine_dir: None,
         };
 
         // Create temp file and save
@@ -293,6 +307,7 @@ mod tests {
             default_output_format: OutputFormat::TorrentZip,
             default_merge_mode: MergeMode::Merged,
             default_dest_path: None,
+            quarantine_dir: None,
         };
         let cloned = config.clone();
 

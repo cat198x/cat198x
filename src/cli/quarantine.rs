@@ -11,7 +11,7 @@ use std::path::PathBuf;
 use crate::QuarantineCommands;
 use crate::db::quarantine as db_quarantine;
 
-use super::{get_data_dir, open_database};
+use super::open_database;
 
 /// Run the quarantine command
 pub fn run(cmd: QuarantineCommands, data_dir: Option<PathBuf>) -> Result<()> {
@@ -107,8 +107,7 @@ fn run_status(collection: Option<String>, detailed: bool, data_dir: Option<PathB
 fn run_prune(collection: Option<String>, yes: bool, data_dir: Option<PathBuf>) -> Result<()> {
     let db = open_database(data_dir.clone())?;
     let conn = db.conn();
-    let data_dir_path = get_data_dir(data_dir)?;
-    let quarantine_dir = data_dir_path.join("quarantine");
+    let quarantine_dir = super::config::resolve_quarantine_dir(data_dir)?;
 
     let entries = if let Some(ref pattern) = collection {
         db_quarantine::list_entries_by_collection(conn, pattern)?
@@ -207,8 +206,7 @@ fn run_restore(
 ) -> Result<()> {
     let db = open_database(data_dir.clone())?;
     let conn = db.conn();
-    let data_dir_path = get_data_dir(data_dir)?;
-    let quarantine_dir = data_dir_path.join("quarantine");
+    let quarantine_dir = super::config::resolve_quarantine_dir(data_dir)?;
 
     let entries = if let Some(ref pattern) = collection {
         db_quarantine::list_entries_by_collection(conn, pattern)?
@@ -342,8 +340,7 @@ pub fn move_to_quarantine(
     collection_name: Option<&str>,
     data_dir: Option<PathBuf>,
 ) -> Result<String> {
-    let data_dir_path = get_data_dir(data_dir.clone())?;
-    let quarantine_dir = data_dir_path.join("quarantine");
+    let quarantine_dir = super::config::resolve_quarantine_dir(data_dir.clone())?;
 
     // Create quarantine directory if it doesn't exist
     fs::create_dir_all(&quarantine_dir).context("Failed to create quarantine directory")?;
