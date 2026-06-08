@@ -55,6 +55,34 @@ pub fn generate_plan(conn: &Connection) -> Result<Plan> {
     generate_plan_filtered(conn, &PlanOptions::default())
 }
 
+/// The SHA1s whose content belongs to more than one distinct DAT game across all
+/// active versions — genuinely distinct catalogue entries that happen to be
+/// byte-identical (multi-disk sets sharing a data disk, re-releases, common
+/// loaders). Such content must be *copied* to each destination and never moved
+/// or deleted: a single physical file can be the matched source for many
+/// destinations, and consuming it to satisfy one strands the rest. Restricted to
+/// content we actually hold, since only held content can be placed anywhere.
+fn compute_shared_content(conn: &Connection) -> Result<HashSet<String>> {
+    let mut stmt = conn.prepare(
+        "SELECT r.sha1
+           FROM dat_roms r
+           JOIN dat_games g ON g.id = r.game_id
+           JOIN dat_nodes dn ON dn.id = g.node_id
+           JOIN collection_versions cv ON cv.id = dn.version_id
+          WHERE cv.is_active = 1
+            AND r.sha1 IS NOT NULL AND r.sha1 <> ''
+            AND r.sha1 IN (SELECT sha1 FROM file_locations)
+          GROUP BY r.sha1
+          HAVING COUNT(DISTINCT g.id) > 1",
+    )?;
+    let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+    let mut set = HashSet::new();
+    for r in rows {
+        set.insert(r?);
+    }
+    Ok(set)
+}
+
 /// Generate a plan from the given options.
 ///
 /// `dat_filter` supports glob patterns (`*`, `?`, case-insensitive) over
@@ -67,6 +95,16 @@ pub fn generate_plan_filtered(conn: &Connection, opts: &PlanOptions) -> Result<P
     // Calculate state hash
     let state_hash = compute_state_hash(conn)?;
     let mut plan = Plan::new(state_hash);
+
+    // Content shared across distinct entries is copied to each destination, never
+    // moved or deleted (see compute_shared_content). Computed once up front.
+    let shared = compute_shared_content(conn)?;
+    if !shared.is_empty() {
+        println!(
+            "{} shared content(s) span multiple entries — copied to each, not moved.",
+            shared.len()
+        );
+    }
 
     // Plan every collection, not only those with an explicit dest_path: a
     // library-wide `default_dest_path` should reach collections that were never
@@ -208,6 +246,12 @@ pub fn generate_plan_filtered(conn: &Connection, opts: &PlanOptions) -> Result<P
                 }
 
                 for (dest, copies) in by_dest {
+                    // Shared content (the same bytes also belong to another entry)
+                    // must never consume its source: a "duplicate" copy here may be
+                    // the matched source for a different destination. So copy it
+                    // into place even in move mode, and skip the redundancy delete.
+                    let shared_here = copies.iter().any(|m| shared.contains(&m.sha1));
+
                     // A loose copy already sitting at the destination is the
                     // canonical one — an in-memory comparison (the match carries
                     // its location), so no per-file disk stat or catalogue scan.
@@ -230,7 +274,7 @@ pub fn generate_plan_filtered(conn: &Connection, opts: &PlanOptions) -> Result<P
                                 sha1: m.sha1.clone(),
                                 entry_name: None,
                             };
-                            if opts.move_files {
+                            if opts.move_files && !shared_here {
                                 plan.add_move(source, dest.clone(), m.size as u64);
                             } else {
                                 plan.add_copy(source, dest.clone(), m.size as u64);
@@ -242,17 +286,18 @@ pub fn generate_plan_filtered(conn: &Connection, opts: &PlanOptions) -> Result<P
                     // Every other loose copy is an exact-content duplicate of the
                     // one kept at the destination. In move mode (an in-place tidy)
                     // delete the redundant copy — nothing unique is lost, since the
-                    // kept copy preserves the bytes. In copy mode leave it be: a
-                    // copy run must not remove source files.
-                    for (i, m) in copies.iter().enumerate() {
-                        if Some(i) == keep || m.archive_path.is_some() {
-                            continue;
-                        }
-                        let path = format!("{}/{}", m.source_root, m.source_path);
-                        if path == dest {
-                            continue;
-                        }
-                        if opts.move_files {
+                    // kept copy preserves the bytes. In copy mode, or for shared
+                    // content, leave it be: a copy run must not remove source files,
+                    // and a shared copy may be needed by another destination.
+                    if opts.move_files && !shared_here {
+                        for (i, m) in copies.iter().enumerate() {
+                            if Some(i) == keep || m.archive_path.is_some() {
+                                continue;
+                            }
+                            let path = format!("{}/{}", m.source_root, m.source_path);
+                            if path == dest {
+                                continue;
+                            }
                             plan.add_delete(path);
                             deduped += 1;
                         }
@@ -299,6 +344,12 @@ pub fn generate_plan_filtered(conn: &Connection, opts: &PlanOptions) -> Result<P
                         })
                     };
 
+                    // If any of this game's content is shared with another entry,
+                    // never consume a source for it — build the archive by copying
+                    // (repack without deleting sources) and don't relocate or delete
+                    // any container, since those bytes may be needed elsewhere.
+                    let game_shared = expected.iter().any(|(_, sha1)| shared.contains(sha1));
+
                     // The canonical container is the complete one at dest if it
                     // exists, otherwise a complete one elsewhere we build from.
                     let complete_at_dest = containers.get(&dest).is_some_and(|e| is_complete(e));
@@ -328,6 +379,7 @@ pub fn generate_plan_filtered(conn: &Connection, opts: &PlanOptions) -> Result<P
                         already_correct += expected.len();
                     } else if let Some(ref src) = staged_complete
                         && opts.move_files
+                        && !game_shared
                         && tag != "torrentzip"
                         && is_relocatable_archive(&containers[src], src, ext)
                     {
@@ -359,12 +411,15 @@ pub fn generate_plan_filtered(conn: &Connection, opts: &PlanOptions) -> Result<P
                             })
                             .sum();
                         bytes += size;
+                        // Consume loose sources only in move mode and only when the
+                        // content isn't shared — a shared source may feed another
+                        // game's archive too.
                         plan.add_repack(
                             sources,
                             dest.clone(),
                             tag.to_string(),
                             size,
-                            opts.move_files,
+                            opts.move_files && !game_shared,
                         );
                         to_write += 1;
                     }
@@ -372,12 +427,13 @@ pub fn generate_plan_filtered(conn: &Connection, opts: &PlanOptions) -> Result<P
                     // Delete duplicate whole-archive copies: any container that is
                     // neither the destination nor the one we build from holds an
                     // exact-content copy already preserved at the destination. In
-                    // move mode remove it; in copy mode leave sources untouched.
-                    for path in containers.keys() {
-                        if *path == dest || build_from.as_deref() == Some(path.as_str()) {
-                            continue;
-                        }
-                        if opts.move_files {
+                    // move mode remove it; in copy mode, or when the content is
+                    // shared with another entry, leave sources untouched.
+                    if opts.move_files && !game_shared {
+                        for path in containers.keys() {
+                            if *path == dest || build_from.as_deref() == Some(path.as_str()) {
+                                continue;
+                            }
                             plan.add_delete(path.clone());
                             deduped += 1;
                         }
@@ -1041,6 +1097,116 @@ mod tests {
             })
             .collect();
         assert_eq!(deleted, vec!["/lib/ToSort/SET/Sys/Game.zip".to_string()]);
+    }
+
+    #[test]
+    fn shared_content_is_copied_to_each_destination_not_moved() {
+        let db = setup_db();
+        let conn = db.conn();
+        // One physical file's content (BBB) belongs to two distinct games — two
+        // destinations. It is held once, in ToSort (at neither destination).
+        let coll = collections::create_collection(conn, "Shared Coll", "tosec").unwrap();
+        let vid = collections::add_version(conn, coll, "v1", "/dats/s.dat", true).unwrap();
+        let node = dats::create_node(conn, vid, None, "Shared Coll", "dat", "SET/Sys").unwrap();
+        let g1 = dats::create_game(conn, node, "GameA", None, None, false, false, false).unwrap();
+        dats::create_rom(conn, g1, "a.rom", 10, Some("BBB"), None, None, "good", None).unwrap();
+        let g2 = dats::create_game(conn, node, "GameB", None, None, false, false, false).unwrap();
+        dats::create_rom(conn, g2, "b.rom", 10, Some("BBB"), None, None, "good", None).unwrap();
+        conn.execute("INSERT INTO files (sha1, size) VALUES ('BBB', 10)", [])
+            .unwrap();
+        conn.execute(
+            "INSERT INTO sources (id, path, case_sensitive) VALUES (200, '/lib/ToSort/SET', 0)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO file_locations (sha1, source_id, path, archive_path)
+             VALUES ('BBB', 200, 'Sys/shared.rom', NULL)",
+            [],
+        )
+        .unwrap();
+
+        let plan = generate_plan_filtered(
+            conn,
+            &PlanOptions {
+                default_dest: Some("/lib/ROMs".to_string()),
+                default_format: OutputFormat::Loose,
+                move_files: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        // Both distinct entries get a real copy; the shared source is never moved
+        // or deleted, so neither destination can be stranded.
+        assert_eq!(
+            plan.summary.move_count, 0,
+            "shared content is copied, not moved"
+        );
+        assert_eq!(
+            plan.summary.delete_count, 0,
+            "a shared source is never deleted"
+        );
+        assert_eq!(
+            plan.summary.copy_count, 2,
+            "a real copy for each distinct destination"
+        );
+    }
+
+    #[test]
+    fn shared_archive_content_is_repacked_to_each_game_not_consumed() {
+        let db = setup_db();
+        let conn = db.conn();
+        // Content CCC belongs to two distinct games in a zip-format set, held once
+        // as a loose file in ToSort.
+        let coll = collections::create_collection(conn, "Shared Zip", "tosec").unwrap();
+        let vid = collections::add_version(conn, coll, "v1", "/dats/z.dat", true).unwrap();
+        let node = dats::create_node(conn, vid, None, "Shared Zip", "dat", "SET/Sys").unwrap();
+        let g1 = dats::create_game(conn, node, "GA", None, None, false, false, false).unwrap();
+        dats::create_rom(conn, g1, "r.rom", 10, Some("CCC"), None, None, "good", None).unwrap();
+        let g2 = dats::create_game(conn, node, "GB", None, None, false, false, false).unwrap();
+        dats::create_rom(conn, g2, "r.rom", 10, Some("CCC"), None, None, "good", None).unwrap();
+        conn.execute("INSERT INTO files (sha1, size) VALUES ('CCC', 10)", [])
+            .unwrap();
+        conn.execute(
+            "INSERT INTO sources (id, path, case_sensitive) VALUES (201, '/lib/ToSort/SET', 0)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO file_locations (sha1, source_id, path, archive_path)
+             VALUES ('CCC', 201, 'Sys/shared.rom', NULL)",
+            [],
+        )
+        .unwrap();
+        db_config::set_output_format(conn, "SET", "zip").unwrap();
+
+        let plan = generate_plan_filtered(
+            conn,
+            &PlanOptions {
+                default_dest: Some("/lib/ROMs".to_string()),
+                default_format: OutputFormat::Loose,
+                move_files: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        // Each game's archive is built by copying; the shared loose source is
+        // neither consumed by a repack nor removed as a duplicate container.
+        assert_eq!(
+            plan.summary.repack_count, 2,
+            "an archive built for each game"
+        );
+        assert_eq!(plan.summary.delete_count, 0, "shared source never deleted");
+        let none_consume_source = plan.operations.iter().all(|op| match &op.kind {
+            OperationKind::Repack { move_sources, .. } => !*move_sources,
+            _ => true,
+        });
+        assert!(
+            none_consume_source,
+            "shared repacks must not consume their source"
+        );
     }
 
     #[test]
