@@ -7,7 +7,6 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 
 use super::{CollectionPlanStat, Plan, SourceRef};
 use crate::config::OutputFormat;
-use crate::db::quarantine::QuarantineReason;
 use crate::db::{collections, config as db_config, dats};
 use crate::filter::{RomCandidate, parse_game_name, select_preferred};
 
@@ -174,7 +173,7 @@ pub fn generate_plan_filtered(conn: &Connection, opts: &PlanOptions) -> Result<P
         let mut already_correct = 0;
         let mut to_write = 0;
         let mut relocated = 0;
-        let mut quarantined = 0;
+        let mut deduped = 0;
         let mut bytes = 0u64;
 
         match archive_format_tag(format) {
@@ -240,8 +239,11 @@ pub fn generate_plan_filtered(conn: &Connection, opts: &PlanOptions) -> Result<P
                             Some(0)
                         }
                     };
-                    // Quarantine every other loose copy — its content is already
-                    // accounted for at the destination.
+                    // Every other loose copy is an exact-content duplicate of the
+                    // one kept at the destination. In move mode (an in-place tidy)
+                    // delete the redundant copy — nothing unique is lost, since the
+                    // kept copy preserves the bytes. In copy mode leave it be: a
+                    // copy run must not remove source files.
                     for (i, m) in copies.iter().enumerate() {
                         if Some(i) == keep || m.archive_path.is_some() {
                             continue;
@@ -250,20 +252,16 @@ pub fn generate_plan_filtered(conn: &Connection, opts: &PlanOptions) -> Result<P
                         if path == dest {
                             continue;
                         }
-                        plan.add_quarantine(
-                            path,
-                            m.sha1.clone(),
-                            m.size as u64,
-                            QuarantineReason::Duplicate.as_str().to_string(),
-                            Some(collection.name.clone()),
-                        );
-                        quarantined += 1;
+                        if opts.move_files {
+                            plan.add_delete(path);
+                            deduped += 1;
+                        }
                     }
                 }
                 let verb = if opts.move_files { "move" } else { "copy" };
                 println!(
-                    "  {} already correct, {} to {}, {} duplicate(s) to quarantine",
-                    already_correct, to_write, verb, quarantined
+                    "  {} already correct, {} to {}, {} duplicate(s) to delete",
+                    already_correct, to_write, verb, deduped
                 );
             }
             Some(tag) => {
@@ -371,26 +369,23 @@ pub fn generate_plan_filtered(conn: &Connection, opts: &PlanOptions) -> Result<P
                         to_write += 1;
                     }
 
-                    // Quarantine duplicate whole-archive copies: any container
-                    // that is neither the destination nor the one we build from.
-                    for (path, entries) in &containers {
+                    // Delete duplicate whole-archive copies: any container that is
+                    // neither the destination nor the one we build from holds an
+                    // exact-content copy already preserved at the destination. In
+                    // move mode remove it; in copy mode leave sources untouched.
+                    for path in containers.keys() {
                         if *path == dest || build_from.as_deref() == Some(path.as_str()) {
                             continue;
                         }
-                        let size: u64 = entries.iter().map(|m| m.size as u64).sum();
-                        plan.add_quarantine(
-                            path.clone(),
-                            entries[0].sha1.clone(),
-                            size,
-                            QuarantineReason::Duplicate.as_str().to_string(),
-                            Some(collection.name.clone()),
-                        );
-                        quarantined += 1;
+                        if opts.move_files {
+                            plan.add_delete(path.clone());
+                            deduped += 1;
+                        }
                     }
                 }
                 println!(
-                    "  {} ROMs already archived, {} to relocate, {} archive(s) to build, {} duplicate(s) to quarantine",
-                    already_correct, relocated, to_write, quarantined
+                    "  {} ROMs already archived, {} to relocate, {} archive(s) to build, {} duplicate(s) to delete",
+                    already_correct, relocated, to_write, deduped
                 );
             }
         }
@@ -952,7 +947,7 @@ mod tests {
     }
 
     #[test]
-    fn loose_duplicate_is_quarantined_canonical_kept_in_place() {
+    fn loose_duplicate_is_deleted_canonical_kept_in_place() {
         let db = setup_db();
         let conn = db.conn();
         setup_dup_fixture(conn, false);
@@ -969,35 +964,52 @@ mod tests {
         .unwrap();
 
         // The library copy at /lib/ROMs/SET/Sys/game.rom is already correct, so
-        // no move; the ToSort copy is the duplicate and is quarantined.
+        // no move; the ToSort copy is an exact-content duplicate and is deleted
+        // (its bytes are preserved by the canonical copy).
         assert_eq!(
             plan.summary.move_count, 0,
             "canonical copy already in place"
         );
         assert_eq!(plan.summary.copy_count, 0);
-        assert_eq!(plan.summary.quarantine_count, 1, "ToSort dup quarantined");
-        let quarantined: Vec<_> = plan
+        assert_eq!(
+            plan.summary.quarantine_count, 0,
+            "dups are deleted, not quarantined"
+        );
+        assert_eq!(plan.summary.delete_count, 1, "ToSort dup deleted");
+        let deleted: Vec<_> = plan
             .operations
             .iter()
             .filter_map(|op| match &op.kind {
-                OperationKind::Quarantine { path, reason, .. } => {
-                    Some((path.clone(), reason.clone()))
-                }
+                OperationKind::Delete { path } => Some(path.clone()),
                 _ => None,
             })
             .collect();
-        assert_eq!(
-            quarantined,
-            vec![(
-                "/lib/ToSort/SET/Sys/game.rom".to_string(),
-                QuarantineReason::Duplicate.as_str().to_string()
-            )],
-            "duplicate quarantined with the Duplicate reason so it groups in status",
-        );
+        assert_eq!(deleted, vec!["/lib/ToSort/SET/Sys/game.rom".to_string()]);
     }
 
     #[test]
-    fn archive_duplicate_container_is_quarantined() {
+    fn loose_duplicate_left_untouched_in_copy_mode() {
+        let db = setup_db();
+        let conn = db.conn();
+        setup_dup_fixture(conn, false);
+
+        // Copy mode must not remove source files: the duplicate is left in place.
+        let plan = generate_plan_filtered(
+            conn,
+            &PlanOptions {
+                default_dest: Some("/lib/ROMs".to_string()),
+                default_format: OutputFormat::Loose,
+                move_files: false,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(plan.summary.delete_count, 0, "copy mode deletes nothing");
+        assert_eq!(plan.summary.quarantine_count, 0);
+    }
+
+    #[test]
+    fn archive_duplicate_container_is_deleted() {
         let db = setup_db();
         let conn = db.conn();
         setup_dup_fixture(conn, true);
@@ -1014,24 +1026,21 @@ mod tests {
         .unwrap();
 
         // The complete archive already sits at /lib/ROMs/SET/Sys/Game.zip, so
-        // nothing is built; the ToSort .zip is a duplicate container, quarantined.
+        // nothing is built; the ToSort .zip is a duplicate container and deleted.
         assert_eq!(
             plan.summary.repack_count, 0,
             "canonical archive already at dest"
         );
-        assert_eq!(plan.summary.quarantine_count, 1);
-        let quarantined: Vec<_> = plan
+        assert_eq!(plan.summary.delete_count, 1);
+        let deleted: Vec<_> = plan
             .operations
             .iter()
             .filter_map(|op| match &op.kind {
-                OperationKind::Quarantine { path, .. } => Some(path.clone()),
+                OperationKind::Delete { path } => Some(path.clone()),
                 _ => None,
             })
             .collect();
-        assert_eq!(
-            quarantined,
-            vec!["/lib/ToSort/SET/Sys/Game.zip".to_string()]
-        );
+        assert_eq!(deleted, vec!["/lib/ToSort/SET/Sys/Game.zip".to_string()]);
     }
 
     #[test]

@@ -2314,11 +2314,13 @@ fn test_apply_skip_repack_defers_then_resumes() {
         .unwrap();
     }
 
-    cli::plan::run(None, None, false, env.data_dir_opt()).unwrap();
+    // Move mode: the duplicate is deleted (cheap), the kept copy is repacked.
+    cli::plan::run(None, None, true, env.data_dir_opt()).unwrap();
     let expected_archive = dest_root.join("Skip Repack Test").join("Test Game.zip");
 
-    // Pass 1: defer the repack. The duplicate is quarantined (one of the two
-    // copies moves away), but the archive is not built yet.
+    // Pass 1: defer the repack. The duplicate is deleted (one of the two copies
+    // removed), leaving the kept copy for the repack, but the archive is not
+    // built yet.
     cli::apply::run(false, true, true, env.data_dir_opt()).unwrap();
     let remaining = [env.roms_dir.join("test.rom"), roms2.join("test.rom")]
         .iter()
@@ -2326,7 +2328,7 @@ fn test_apply_skip_repack_defers_then_resumes() {
         .count();
     assert_eq!(
         remaining, 1,
-        "the duplicate copy should have been quarantined in the cheap pass"
+        "the duplicate copy should have been deleted in the cheap pass"
     );
     assert!(
         !expected_archive.exists(),

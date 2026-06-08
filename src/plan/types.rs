@@ -236,6 +236,19 @@ impl Plan {
         self.summary.quarantine_count += 1;
     }
 
+    /// Add a delete operation: remove a redundant file outright. Used to drop an
+    /// exact-content duplicate whose bytes are preserved by the canonical copy
+    /// kept elsewhere, so nothing unique is lost.
+    pub fn add_delete(&mut self, path: String) {
+        let id = self.operations.len() as u64;
+        self.operations.push(Operation {
+            id,
+            status: OperationStatus::Pending,
+            kind: OperationKind::Delete { path },
+        });
+        self.summary.delete_count += 1;
+    }
+
     /// Check if the plan has any operations
     pub fn is_empty(&self) -> bool {
         self.operations.is_empty()
