@@ -115,26 +115,19 @@ pub fn execute_move(
     // Fast path: a loose-file move to a loose-file destination on the same
     // filesystem is an atomic rename — no bytes copied. This is the common case
     // for an in-place tidy and turns a full read+write+read of every ROM into a
-    // metadata operation. We verify the SOURCE first so a hash mismatch fails
-    // before the file is touched (the source is never lost to a bad move), then
-    // rename. Archive sources and archive (.zip) destinations can't be renamed
-    // and fall through to the copy path below.
+    // metadata operation. A rename preserves the bytes exactly, so we trust the
+    // catalogue's recorded hash rather than re-reading every file over a
+    // (possibly networked) source to verify it first — the same trade-off
+    // execute_relocate makes. A rename failure (almost always a cross-device
+    // link error), an archive source, or an archive (.zip) destination falls
+    // through to the copy path below, which *does* verify the content.
     if archive_path.is_none() && !dest_path.to_lowercase().ends_with(".zip") {
         let source = Path::new(source_path);
         let dest = Path::new(dest_path);
 
-        if !verify_sha1(source, expected_sha1)? {
-            anyhow::bail!(
-                "Verification failed: source file hash does not match expected SHA1 {}",
-                expected_sha1
-            );
-        }
         if let Some(parent) = dest.parent() {
             fs::create_dir_all(parent).context("Failed to create destination directory")?;
         }
-        // A successful rename moves verified content atomically — done. A
-        // failure is almost always a cross-device link error; fall through to
-        // copy+delete in that case.
         if fs::rename(source, dest).is_ok() {
             return Ok(());
         }
@@ -1267,31 +1260,29 @@ mod tests {
     }
 
     #[test]
-    fn test_execute_move_verification_fails() {
+    fn test_execute_move_same_fs_renames_without_rehashing() {
         let temp = TempDir::new().unwrap();
         let src_path = temp.path().join("source.rom");
         let dest_path = temp.path().join("dest/moved.rom");
-
-        // Create source file
         fs::write(&src_path, b"test rom content").unwrap();
 
-        // Wrong SHA1
+        // A same-filesystem loose move is a pure rename that trusts the
+        // catalogue's recorded hash: it does not re-read the file to verify it
+        // first. A rename preserves the bytes exactly, so even a hash that does
+        // not match the content still moves it. This guards the performance fix
+        // that turned re-reading every ROM over a network mount back into a
+        // metadata-only rename.
         let wrong_sha1 = "0000000000000000000000000000000000000000";
-
-        // Execute move - should fail
-        let result = execute_move(
+        execute_move(
             src_path.to_str().unwrap(),
             None,
             dest_path.to_str().unwrap(),
             wrong_sha1,
-        );
+        )
+        .unwrap();
 
-        assert!(result.is_err());
-
-        // Source should still exist (copy failed before delete)
-        assert!(src_path.exists());
-        // Destination should not exist
-        assert!(!dest_path.exists());
+        assert!(!src_path.exists(), "source renamed away");
+        assert_eq!(fs::read(&dest_path).unwrap(), b"test rom content");
     }
 
     #[test]
