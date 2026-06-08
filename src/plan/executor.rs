@@ -278,7 +278,19 @@ fn execute_copy_to_zip(
 ///
 /// Each source file is verified against its expected SHA1 before being added.
 /// Supports "zip" and "torrentzip" formats.
-pub fn execute_repack(sources: &[SourceRef], dest_path: &str, format: &str) -> Result<()> {
+///
+/// In move mode (`move_sources`), the loose source files are deleted once the
+/// archive is built and verified — a true in-place tidy. Only loose sources are
+/// removed: an archive *member* source is left alone, since deleting its file
+/// would destroy a container that may hold other games. The returned list pairs
+/// each deleted file's canonical entry name with its original path, so the
+/// caller can log a reverse that extracts it back out of the archive.
+pub fn execute_repack(
+    sources: &[SourceRef],
+    dest_path: &str,
+    format: &str,
+    move_sources: bool,
+) -> Result<Vec<(String, String)>> {
     let dest = Path::new(dest_path);
 
     // Create destination directory if needed
@@ -294,7 +306,30 @@ pub fn execute_repack(sources: &[SourceRef], dest_path: &str, format: &str) -> R
             "Unsupported repack format: {} (use 'zip', 'torrentzip', or '7z')",
             format
         ),
+    }?;
+
+    // The archive is built and every entry verified against its SHA1. Only now,
+    // in move mode, consume the loose sources.
+    let mut consumed = Vec::new();
+    if move_sources {
+        for source in sources {
+            if source.archive_path.is_some() {
+                continue; // never delete a shared container
+            }
+            let entry_name = get_entry_name(source).to_string();
+            match fs::remove_file(&source.path) {
+                Ok(()) => consumed.push((entry_name, source.path.clone())),
+                // Already gone (e.g. a resumed run): nothing to restore for it.
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    return Err(e).with_context(|| {
+                        format!("Failed to delete source after repack: {}", source.path)
+                    });
+                }
+            }
+        }
     }
+    Ok(consumed)
 }
 
 /// The raw bytes of a source — read from disk for a loose file, or extracted
@@ -467,7 +502,7 @@ fn add_source_to_torrentzip(
 }
 
 /// Extract a file from an archive to destination
-fn extract_from_archive(archive_path: &str, entry_path: &str, dest_path: &str) -> Result<()> {
+pub fn extract_from_archive(archive_path: &str, entry_path: &str, dest_path: &str) -> Result<()> {
     let archive = Path::new(archive_path);
 
     match archive.extension().and_then(|e| e.to_str()) {
@@ -878,7 +913,7 @@ mod tests {
             },
         ];
 
-        execute_repack(&sources, dest_path.to_str().unwrap(), "zip").unwrap();
+        execute_repack(&sources, dest_path.to_str().unwrap(), "zip", false).unwrap();
 
         // Verify ZIP was created with both files
         assert!(dest_path.exists());
@@ -930,7 +965,7 @@ mod tests {
             },
         ];
 
-        let result = execute_repack(&sources, dest_path.to_str().unwrap(), "zip");
+        let result = execute_repack(&sources, dest_path.to_str().unwrap(), "zip", false);
 
         assert!(result.is_err());
         assert!(
@@ -961,7 +996,7 @@ mod tests {
             entry_name: None,
         }];
 
-        let result = execute_repack(&sources, dest_path.to_str().unwrap(), "rar");
+        let result = execute_repack(&sources, dest_path.to_str().unwrap(), "rar", false);
 
         assert!(result.is_err());
         assert!(
@@ -1007,7 +1042,7 @@ mod tests {
             },
         ];
 
-        execute_repack(&sources, dest_path.to_str().unwrap(), "torrentzip").unwrap();
+        execute_repack(&sources, dest_path.to_str().unwrap(), "torrentzip", false).unwrap();
 
         // Verify the ZIP was created with sorted entries
         let file = File::open(&dest_path).unwrap();
@@ -1303,7 +1338,7 @@ mod tests {
             entry_name: Some("canonical.rom".to_string()),
         }];
 
-        execute_repack(&sources, dest.to_str().unwrap(), "7z").unwrap();
+        execute_repack(&sources, dest.to_str().unwrap(), "7z", false).unwrap();
         assert!(dest.exists());
 
         // Read back: one entry, named canonically, with the right content hash.
@@ -1337,7 +1372,7 @@ mod tests {
             entry_name: Some("x.rom".to_string()),
         }];
 
-        assert!(execute_repack(&sources, dest.to_str().unwrap(), "7z").is_err());
+        assert!(execute_repack(&sources, dest.to_str().unwrap(), "7z", false).is_err());
         assert!(!dest.exists());
     }
 }

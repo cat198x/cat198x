@@ -56,6 +56,15 @@ pub enum LoggedOperation {
     Delete { path: String },
     /// Repack operation
     Repack { sources: Vec<String>, dest: String },
+    /// Reverse of a move-mode repack: restore the loose sources the repack
+    /// consumed by extracting each back out of the built archive, then delete
+    /// the archive. `restore` pairs each archive entry name with the original
+    /// path to write it back to. Lossless, because the repack verified every
+    /// entry's content against the source SHA1 before deleting it.
+    UnpackRepack {
+        dest: String,
+        restore: Vec<(String, String)>,
+    },
     /// Quarantine operation — a file moved into the quarantine store. Its
     /// reverse is a Move back to `original_path`.
     Quarantine {
@@ -188,20 +197,36 @@ impl OperationLog {
         });
     }
 
-    /// Add a completed repack operation
-    pub fn log_repack(&mut self, operation_id: u64, sources: &[String], dest: &str, success: bool) {
+    /// Add a completed repack operation. `consumed` lists the loose sources a
+    /// move-mode repack deleted, as (archive entry name, original path) pairs;
+    /// it is empty for a copy-mode repack (which leaves its sources in place).
+    pub fn log_repack(
+        &mut self,
+        operation_id: u64,
+        sources: &[String],
+        dest: &str,
+        consumed: &[(String, String)],
+        success: bool,
+    ) {
         let forward = LoggedOperation::Repack {
             sources: sources.to_vec(),
             dest: dest.to_string(),
         };
 
-        // Reverse of REPACK is DELETE (the created archive)
-        let reverse = if success {
+        // Reverse of a copy-mode repack is just DELETE (the created archive).
+        // A move-mode repack also deleted its loose sources, so its reverse must
+        // first restore them out of the archive before deleting it.
+        let reverse = if !success {
+            None
+        } else if consumed.is_empty() {
             Some(LoggedOperation::Delete {
                 path: dest.to_string(),
             })
         } else {
-            None
+            Some(LoggedOperation::UnpackRepack {
+                dest: dest.to_string(),
+                restore: consumed.to_vec(),
+            })
         };
 
         self.entries.push(LogEntry {
@@ -426,13 +451,14 @@ mod tests {
             1,
             &["/src/a.rom".to_string(), "/src/b.rom".to_string()],
             "/dest/game.zip",
+            &[],
             true,
         );
 
         assert_eq!(log.entries.len(), 1);
         assert_eq!(log.entries[0].status, LogStatus::Completed);
 
-        // Reverse of repack is delete
+        // Reverse of a copy-mode repack is delete
         let reverse = log.entries[0].reverse.as_ref().unwrap();
         match reverse {
             LoggedOperation::Delete { path } => {
@@ -443,9 +469,32 @@ mod tests {
     }
 
     #[test]
+    fn test_log_repack_move_reverse_restores_sources() {
+        let mut log = OperationLog::new("abc123".to_string());
+        log.log_repack(
+            1,
+            &["/src/a.rom".to_string()],
+            "/dest/game.zip",
+            &[("a.rom".to_string(), "/src/a.rom".to_string())],
+            true,
+        );
+
+        // A move-mode repack consumed its loose source, so the reverse restores
+        // it out of the archive (rather than only deleting the archive).
+        let reverse = log.entries[0].reverse.as_ref().unwrap();
+        match reverse {
+            LoggedOperation::UnpackRepack { dest, restore } => {
+                assert_eq!(dest, "/dest/game.zip");
+                assert_eq!(restore, &[("a.rom".to_string(), "/src/a.rom".to_string())]);
+            }
+            _ => panic!("Expected UnpackRepack reverse operation"),
+        }
+    }
+
+    #[test]
     fn test_log_repack_failure() {
         let mut log = OperationLog::new("abc123".to_string());
-        log.log_repack(1, &["/src/a.rom".to_string()], "/dest/game.zip", false);
+        log.log_repack(1, &["/src/a.rom".to_string()], "/dest/game.zip", &[], false);
 
         assert_eq!(log.entries.len(), 1);
         assert_eq!(log.entries[0].status, LogStatus::Failed);

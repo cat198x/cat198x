@@ -2344,6 +2344,93 @@ fn test_apply_skip_repack_defers_then_resumes() {
     );
 }
 
+/// A move-mode repack deletes the loose source once the archive holds a
+/// verified copy, and a rollback restores that source by extracting it back out
+/// of the archive before deleting the archive — a lossless round trip.
+#[test]
+fn test_move_repack_deletes_source_and_rollback_restores_it() {
+    use cat198x::{ConfigCommands, DatCommands, SourceCommands};
+    use sha1::Digest;
+
+    let env = TestEnv::new();
+    env.init();
+
+    let content = b"hello";
+    let sha1_hash = cat198x::util::hex_upper(sha1::Sha1::digest(content));
+    let dat = create_matching_dat(env.temp_dir.path(), "Move Repack Test", &sha1_hash);
+    cli::dat::run(
+        DatCommands::Add {
+            path: dat,
+            collection: None,
+            recursive: false,
+        },
+        env.data_dir_opt(),
+    )
+    .unwrap();
+
+    let source_file = env.roms_dir.join("test.rom");
+    fs::write(&source_file, content).unwrap();
+    cli::source::run(
+        SourceCommands::Add {
+            path: env.roms_dir.clone(),
+        },
+        env.data_dir_opt(),
+    )
+    .unwrap();
+    cli::scan::run(None, false, env.data_dir_opt()).unwrap();
+
+    let dest_root = env.temp_dir.path().join("library");
+    fs::create_dir_all(&dest_root).unwrap();
+    let dest_root = std::fs::canonicalize(&dest_root).unwrap();
+    cli::source::run(
+        SourceCommands::Add {
+            path: dest_root.clone(),
+        },
+        env.data_dir_opt(),
+    )
+    .unwrap();
+    for (k, v) in [
+        ("dest_path", dest_root.to_string_lossy().into_owned()),
+        ("output_format", "zip".to_string()),
+    ] {
+        cli::config::run(
+            ConfigCommands::SetDefault {
+                key: k.to_string(),
+                value: v,
+            },
+            env.data_dir_opt(),
+        )
+        .unwrap();
+    }
+
+    // Plan in move mode (the third argument), then apply.
+    cli::plan::run(None, None, true, env.data_dir_opt()).unwrap();
+    cli::apply::run(false, true, false, env.data_dir_opt()).unwrap();
+
+    let archive = dest_root.join("Move Repack Test").join("Test Game.zip");
+    assert!(archive.is_file(), "the archive should have been built");
+    assert!(
+        !source_file.exists(),
+        "the loose source should have been deleted by the move-mode repack"
+    );
+
+    // Rolling back restores the loose source and removes the archive.
+    cli::apply::run_rollback(false, false, env.data_dir_opt()).unwrap();
+    assert!(
+        source_file.is_file(),
+        "rollback should restore the loose source out of the archive"
+    );
+    assert_eq!(
+        fs::read(&source_file).unwrap(),
+        content,
+        "the restored source should be byte-identical"
+    );
+    assert!(
+        !archive.exists(),
+        "rollback should delete the archive it built"
+    );
+}
+
 /// The plan records a per-collection tally (feeding the by-set breakdown).
 #[test]
 fn test_plan_records_per_collection_breakdown() {

@@ -361,7 +361,13 @@ pub fn generate_plan_filtered(conn: &Connection, opts: &PlanOptions) -> Result<P
                             })
                             .sum();
                         bytes += size;
-                        plan.add_repack(sources, dest.clone(), tag.to_string(), size);
+                        plan.add_repack(
+                            sources,
+                            dest.clone(),
+                            tag.to_string(),
+                            size,
+                            opts.move_files,
+                        );
                         to_write += 1;
                     }
 

@@ -102,6 +102,11 @@ pub enum OperationKind {
         sources: Vec<SourceRef>,
         dest: String,
         format: String,
+        /// Move mode: delete the loose source files once the archive is built
+        /// and verified (a true in-place tidy). Archive-member sources are never
+        /// deleted — that would destroy a container shared with other games.
+        #[serde(default)]
+        move_sources: bool,
     },
     /// Delete a file
     Delete { path: String },
@@ -184,7 +189,14 @@ impl Plan {
 
     /// Add a repack operation: one archive containing a game's ROMs. `size` is
     /// the total uncompressed bytes, used for the plan summary and space check.
-    pub fn add_repack(&mut self, sources: Vec<SourceRef>, dest: String, format: String, size: u64) {
+    pub fn add_repack(
+        &mut self,
+        sources: Vec<SourceRef>,
+        dest: String,
+        format: String,
+        size: u64,
+        move_sources: bool,
+    ) {
         let id = self.operations.len() as u64;
         self.operations.push(Operation {
             id,
@@ -193,6 +205,7 @@ impl Plan {
                 sources,
                 dest,
                 format,
+                move_sources,
             },
         });
         self.summary.repack_count += 1;
@@ -376,6 +389,7 @@ mod tests {
             ],
             dest: "/dest/game.zip".to_string(),
             format: "zip".to_string(),
+            move_sources: false,
         };
 
         let json = serde_json::to_string(&kind).unwrap();

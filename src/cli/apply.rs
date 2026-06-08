@@ -6,7 +6,7 @@ use std::fs;
 use crate::db::quarantine::QuarantineReason;
 use crate::plan::executor::{
     check_disk_space, execute_copy, execute_move, execute_relocate, execute_repack,
-    execute_rollback_move,
+    execute_rollback_move, extract_from_archive,
 };
 use crate::plan::{OperationKind, OperationLog, OperationStatus, compute_state_hash};
 use crate::util::truncate_path;
@@ -246,6 +246,7 @@ pub fn run(
                 sources,
                 dest,
                 format,
+                move_sources,
             } => {
                 println!(
                     "[{}/{}] REPACK ({} files) -> {}",
@@ -260,18 +261,19 @@ pub fn run(
                     continue;
                 }
 
-                let result = execute_repack(sources, dest, format);
-                let success = result.is_ok();
+                let result = execute_repack(sources, dest, format, *move_sources);
 
-                // Log the operation
+                // Log the operation. A move-mode repack reports the loose sources
+                // it consumed so the reverse can extract them back out.
                 if let Some(ref mut log) = op_log {
                     let source_paths: Vec<String> =
                         sources.iter().map(|s| s.path.clone()).collect();
-                    log.log_repack(op.id, &source_paths, dest, success);
+                    let consumed = result.as_deref().unwrap_or(&[]);
+                    log.log_repack(op.id, &source_paths, dest, consumed, result.is_ok());
                 }
 
                 match result {
-                    Ok(()) => {
+                    Ok(_) => {
                         op.status = OperationStatus::Completed;
                         success_count += 1;
                     }
@@ -444,6 +446,7 @@ fn sync_catalogue_after(
         OperationKind::Repack {
             sources: entries,
             dest,
+            move_sources,
             ..
         } => {
             if let Some((nsrc, nrel)) = files::resolve_in_sources(sources, dest) {
@@ -455,6 +458,17 @@ fn sync_catalogue_after(
                         &nrel,
                         e.entry_name.as_deref(),
                     )?;
+                }
+            }
+            // Move mode deleted the loose sources on disk; drop their catalogued
+            // locations too (archive-member sources are left in place).
+            if *move_sources {
+                for e in entries {
+                    if e.archive_path.is_none()
+                        && let Some((src, rel)) = files::resolve_in_sources(sources, &e.path)
+                    {
+                        files::remove_locations_at(conn, src, &rel)?;
+                    }
                 }
             }
         }
@@ -730,6 +744,47 @@ pub fn run_rollback(
                         log.entries[idx].status = LogStatus::RolledBack;
                         success_count += 1;
                         println!("  (already deleted)");
+                    }
+                    Err(e) => {
+                        eprintln!("  ERROR: {}", e);
+                        log.entries[idx].status = LogStatus::Failed;
+                        error_count += 1;
+                    }
+                }
+            }
+            LoggedOperation::UnpackRepack {
+                ref dest,
+                ref restore,
+            } => {
+                // Reverse of a move-mode repack: extract each consumed source
+                // back out of the archive, then delete the archive.
+                println!(
+                    "[{}] UNPACK {} ({} source(s) restored)",
+                    operation_id,
+                    truncate_path(dest, 40),
+                    restore.len()
+                );
+
+                if dry_run {
+                    success_count += 1;
+                    continue;
+                }
+
+                // Restore every source first; only delete the archive once they
+                // are all safely back, so a failure leaves the sources recoverable.
+                let result = restore
+                    .iter()
+                    .try_for_each(|(entry_name, path)| extract_from_archive(dest, entry_name, path))
+                    .and_then(|()| match fs::remove_file(dest) {
+                        Ok(()) => Ok(()),
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                        Err(e) => Err(e.into()),
+                    });
+
+                match result {
+                    Ok(()) => {
+                        log.entries[idx].status = LogStatus::RolledBack;
+                        success_count += 1;
                     }
                     Err(e) => {
                         eprintln!("  ERROR: {}", e);
