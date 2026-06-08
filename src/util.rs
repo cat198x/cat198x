@@ -15,10 +15,16 @@ use std::path::Path;
 /// assert_eq!(truncate_path("very/long/path/file.txt", 15), "...ath/file.txt");
 /// ```
 pub fn truncate_path(path: &str, max_len: usize) -> String {
-    if path.len() <= max_len {
+    // Count and slice by characters, not bytes: a byte-index slice that lands
+    // inside a multi-byte UTF-8 character (e.g. the "ñ" in "Año") panics, which
+    // would crash the whole operation just to print a progress line.
+    let char_count = path.chars().count();
+    if char_count <= max_len {
         path.to_string()
     } else {
-        format!("...{}", &path[path.len() - max_len + 3..])
+        let keep = max_len.saturating_sub(3);
+        let tail: String = path.chars().skip(char_count - keep).collect();
+        format!("...{}", tail)
     }
 }
 
@@ -113,6 +119,18 @@ mod tests {
         let truncated = truncate_path(long, 15);
         assert!(truncated.starts_with("..."));
         assert_eq!(truncated.len(), 15);
+    }
+
+    #[test]
+    fn test_truncate_path_multibyte_does_not_panic() {
+        // A path whose truncation boundary falls inside a multi-byte character
+        // ("ñ" in "Año") must not panic — a byte-index slice there would.
+        let path = "/Volumes/Data/Library/ROMs/TOSEC-PIX/Mundo Amstrad - Año 1 - N.01 (1987-11)(Sygran)(ES).pdf";
+        let truncated = truncate_path(path, 40);
+        assert!(truncated.starts_with("..."));
+        // Keeps the last 37 characters (40 - 3 for the ellipsis).
+        assert_eq!(truncated.chars().count(), 40);
+        assert!(truncated.ends_with("(Sygran)(ES).pdf"));
     }
 
     #[test]
