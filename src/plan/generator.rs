@@ -83,6 +83,35 @@ fn compute_shared_content(conn: &Connection) -> Result<HashSet<String>> {
     Ok(set)
 }
 
+/// The source archive files whose inner entries belong to more than one distinct
+/// DAT game — a single physical container holding ROMs for several games (a
+/// multi-program bundle, a romset shared across parent/clone, etc.). Such a
+/// container must never be *relocated* whole or deleted to satisfy one game, or
+/// the others it also sources are stranded; each game is repacked from it
+/// instead (which extracts only its own entries and leaves the container in
+/// place). The key is the full source path (`source_root/source_path`), matching
+/// the container key used during planning.
+fn compute_shared_containers(conn: &Connection) -> Result<HashSet<String>> {
+    let mut stmt = conn.prepare(
+        "SELECT s.path || '/' || fl.path
+           FROM file_locations fl
+           JOIN sources s ON s.id = fl.source_id
+           JOIN dat_roms r ON r.sha1 = fl.sha1
+           JOIN dat_games g ON g.id = r.game_id
+           JOIN dat_nodes dn ON dn.id = g.node_id
+           JOIN collection_versions cv ON cv.id = dn.version_id
+          WHERE cv.is_active = 1 AND fl.archive_path IS NOT NULL
+          GROUP BY fl.source_id, fl.path
+          HAVING COUNT(DISTINCT g.id) > 1",
+    )?;
+    let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+    let mut set = HashSet::new();
+    for r in rows {
+        set.insert(r?);
+    }
+    Ok(set)
+}
+
 /// Generate a plan from the given options.
 ///
 /// `dat_filter` supports glob patterns (`*`, `?`, case-insensitive) over
@@ -103,6 +132,16 @@ pub fn generate_plan_filtered(conn: &Connection, opts: &PlanOptions) -> Result<P
         println!(
             "{} shared content(s) span multiple entries — copied to each, not moved.",
             shared.len()
+        );
+    }
+
+    // Containers (archive files) whose entries serve more than one game must not
+    // be relocated whole or deleted — each game repacks its own entries instead.
+    let shared_containers = compute_shared_containers(conn)?;
+    if !shared_containers.is_empty() {
+        println!(
+            "{} container(s) source multiple games — repacked per game, not relocated.",
+            shared_containers.len()
         );
     }
 
@@ -380,6 +419,7 @@ pub fn generate_plan_filtered(conn: &Connection, opts: &PlanOptions) -> Result<P
                     } else if let Some(ref src) = staged_complete
                         && opts.move_files
                         && !game_shared
+                        && !shared_containers.contains(src)
                         && tag != "torrentzip"
                         && is_relocatable_archive(&containers[src], src, ext)
                     {
@@ -428,10 +468,15 @@ pub fn generate_plan_filtered(conn: &Connection, opts: &PlanOptions) -> Result<P
                     // neither the destination nor the one we build from holds an
                     // exact-content copy already preserved at the destination. In
                     // move mode remove it; in copy mode, or when the content is
-                    // shared with another entry, leave sources untouched.
+                    // shared with another entry, leave sources untouched. A
+                    // container that also sources other games is never deleted —
+                    // those games still need to repack from it.
                     if opts.move_files && !game_shared {
                         for path in containers.keys() {
-                            if *path == dest || build_from.as_deref() == Some(path.as_str()) {
+                            if *path == dest
+                                || build_from.as_deref() == Some(path.as_str())
+                                || shared_containers.contains(path)
+                            {
                                 continue;
                             }
                             plan.add_delete(path.clone());
@@ -1206,6 +1251,72 @@ mod tests {
         assert!(
             none_consume_source,
             "shared repacks must not consume their source"
+        );
+    }
+
+    #[test]
+    fn shared_container_is_repacked_per_game_not_relocated_whole() {
+        let db = setup_db();
+        let conn = db.conn();
+        // One archive (bundle.zip) holds ROMs for two distinct games — a
+        // multi-game container. Each game's ROM is a different entry/SHA1.
+        let coll = collections::create_collection(conn, "Bundle Coll", "tosec").unwrap();
+        let vid = collections::add_version(conn, coll, "v1", "/dats/b.dat", true).unwrap();
+        let node = dats::create_node(conn, vid, None, "Bundle Coll", "dat", "SET/Sys").unwrap();
+        let g1 = dats::create_game(conn, node, "GameOne", None, None, false, false, false).unwrap();
+        dats::create_rom(conn, g1, "a.rom", 10, Some("AAA"), None, None, "good", None).unwrap();
+        let g2 = dats::create_game(conn, node, "GameTwo", None, None, false, false, false).unwrap();
+        dats::create_rom(conn, g2, "b.rom", 10, Some("BBB"), None, None, "good", None).unwrap();
+        conn.execute(
+            "INSERT INTO files (sha1, size) VALUES ('AAA', 10), ('BBB', 10)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO sources (id, path, case_sensitive) VALUES (210, '/lib/ToSort/SET', 0)",
+            [],
+        )
+        .unwrap();
+        // Both ROMs live as entries inside the SAME archive file.
+        conn.execute(
+            "INSERT INTO file_locations (sha1, source_id, path, archive_path) VALUES
+                ('AAA', 210, 'bundle.zip', 'a.rom'),
+                ('BBB', 210, 'bundle.zip', 'b.rom')",
+            [],
+        )
+        .unwrap();
+        db_config::set_output_format(conn, "SET", "zip").unwrap();
+
+        let plan = generate_plan_filtered(
+            conn,
+            &PlanOptions {
+                default_dest: Some("/lib/ROMs".to_string()),
+                default_format: OutputFormat::Loose,
+                move_files: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        // The shared container is repacked per game (extracting each game's own
+        // entry), never relocated whole (which would strand the other game) and
+        // never deleted (the other game still needs it).
+        let relocates = plan
+            .operations
+            .iter()
+            .filter(|op| matches!(op.kind, OperationKind::Relocate { .. }))
+            .count();
+        assert_eq!(
+            relocates, 0,
+            "a multi-game container is never relocated whole"
+        );
+        assert_eq!(
+            plan.summary.repack_count, 2,
+            "each game repacks its own entry"
+        );
+        assert_eq!(
+            plan.summary.delete_count, 0,
+            "the shared container is never deleted"
         );
     }
 
