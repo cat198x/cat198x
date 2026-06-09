@@ -291,6 +291,20 @@ pub fn execute_repack(
         fs::create_dir_all(parent).context("Failed to create destination directory")?;
     }
 
+    // An archive cannot hold two entries with the same name. The matched source
+    // set can contain the same entry more than once — an entry matched via
+    // several locations, or scattered across overlapping containers — which would
+    // otherwise abort the build with a "Duplicate filename" error. Collapse by
+    // entry name, keeping the first: a repeated name is the same matched content
+    // (same SHA1), so this is lossless.
+    let mut seen = std::collections::HashSet::new();
+    let sources: Vec<SourceRef> = sources
+        .iter()
+        .filter(|s| seen.insert(get_entry_name(s).to_string()))
+        .cloned()
+        .collect();
+    let sources = sources.as_slice();
+
     match format {
         "zip" => execute_repack_zip(sources, dest),
         "torrentzip" => execute_repack_torrentzip(sources, dest),
@@ -927,6 +941,38 @@ mod tests {
         let mut content2 = Vec::new();
         entry2.read_to_end(&mut content2).unwrap();
         assert_eq!(content2, b"graphics data");
+    }
+
+    #[test]
+    fn execute_repack_dedupes_duplicate_entry_names() {
+        use crate::plan::SourceRef;
+        use std::io::Read;
+
+        let temp = TempDir::new().unwrap();
+        let src = temp.path().join("data.rom");
+        fs::write(&src, b"cpu data").unwrap();
+        let dest_path = temp.path().join("game.zip");
+
+        // The same entry name appears twice in the source set (an entry matched
+        // via two locations). A ZIP can't hold a duplicate name, so the repack
+        // must collapse them rather than abort with "Duplicate filename".
+        let one = SourceRef {
+            path: src.to_str().unwrap().to_string(),
+            archive_path: None,
+            sha1: "76218C22675632AEF6A27578DD0A2C6471D995D5".to_string(), // "cpu data"
+            entry_name: Some("game.rom".to_string()),
+        };
+        let sources = vec![one.clone(), one];
+
+        execute_repack(&sources, dest_path.to_str().unwrap(), "zip", false).unwrap();
+
+        let file = fs::File::open(&dest_path).unwrap();
+        let mut archive = zip::ZipArchive::new(file).unwrap();
+        assert_eq!(archive.len(), 1, "duplicate entry name collapsed to one");
+        let mut entry = archive.by_name("game.rom").unwrap();
+        let mut content = Vec::new();
+        entry.read_to_end(&mut content).unwrap();
+        assert_eq!(content, b"cpu data");
     }
 
     #[test]

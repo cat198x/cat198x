@@ -164,7 +164,7 @@ pub fn run(
                         success_count += 1;
                     }
                     Err(e) => {
-                        eprintln!("  ERROR: {}", e);
+                        eprintln!("  ERROR: {:#}", e);
                         op.status = OperationStatus::Failed;
                         error_count += 1;
                     }
@@ -203,7 +203,7 @@ pub fn run(
                         success_count += 1;
                     }
                     Err(e) => {
-                        eprintln!("  ERROR: {}", e);
+                        eprintln!("  ERROR: {:#}", e);
                         op.status = OperationStatus::Failed;
                         error_count += 1;
                     }
@@ -236,7 +236,7 @@ pub fn run(
                         success_count += 1;
                     }
                     Err(e) => {
-                        eprintln!("  ERROR: {}", e);
+                        eprintln!("  ERROR: {:#}", e);
                         op.status = OperationStatus::Failed;
                         error_count += 1;
                     }
@@ -278,7 +278,7 @@ pub fn run(
                         success_count += 1;
                     }
                     Err(e) => {
-                        eprintln!("  ERROR: {}", e);
+                        eprintln!("  ERROR: {:#}", e);
                         op.status = OperationStatus::Failed;
                         error_count += 1;
                     }
@@ -309,7 +309,7 @@ pub fn run(
                         println!("  (already deleted)");
                     }
                     Err(e) => {
-                        eprintln!("  ERROR: {}", e);
+                        eprintln!("  ERROR: {:#}", e);
                         op.status = OperationStatus::Failed;
                         error_count += 1;
                     }
@@ -360,7 +360,7 @@ pub fn run(
                         success_count += 1;
                     }
                     Err(e) => {
-                        eprintln!("  ERROR: {}", e);
+                        eprintln!("  ERROR: {:#}", e);
                         op.status = OperationStatus::Failed;
                         error_count += 1;
                     }
@@ -626,7 +626,7 @@ pub fn run_rollback(
                             success_count += 1;
                             println!("  (already deleted)");
                         } else {
-                            eprintln!("  ERROR: {}", e);
+                            eprintln!("  ERROR: {:#}", e);
                             log.entries[idx].status = LogStatus::Failed;
                             error_count += 1;
                         }
@@ -657,7 +657,7 @@ pub fn run_rollback(
                         success_count += 1;
                     }
                     Err(e) => {
-                        eprintln!("  ERROR: {}", e);
+                        eprintln!("  ERROR: {:#}", e);
                         log.entries[idx].status = LogStatus::Failed;
                         error_count += 1;
                     }
@@ -686,7 +686,7 @@ pub fn run_rollback(
                         success_count += 1;
                     }
                     Err(e) => {
-                        eprintln!("  ERROR: {}", e);
+                        eprintln!("  ERROR: {:#}", e);
                         log.entries[idx].status = LogStatus::Failed;
                         error_count += 1;
                     }
@@ -716,7 +716,7 @@ pub fn run_rollback(
                         println!("  (already deleted)");
                     }
                     Err(e) => {
-                        eprintln!("  ERROR: {}", e);
+                        eprintln!("  ERROR: {:#}", e);
                         log.entries[idx].status = LogStatus::Failed;
                         error_count += 1;
                     }
@@ -746,7 +746,7 @@ pub fn run_rollback(
                         println!("  (already deleted)");
                     }
                     Err(e) => {
-                        eprintln!("  ERROR: {}", e);
+                        eprintln!("  ERROR: {:#}", e);
                         log.entries[idx].status = LogStatus::Failed;
                         error_count += 1;
                     }
@@ -787,7 +787,7 @@ pub fn run_rollback(
                         success_count += 1;
                     }
                     Err(e) => {
-                        eprintln!("  ERROR: {}", e);
+                        eprintln!("  ERROR: {:#}", e);
                         log.entries[idx].status = LogStatus::Failed;
                         error_count += 1;
                     }
