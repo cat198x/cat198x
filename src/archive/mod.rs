@@ -6,5 +6,5 @@
 
 mod writer;
 
-pub(crate) use writer::extract_archive_entry;
 pub use writer::{TorrentZipWriter, ZipWriter, ZipWriterOptions, is_torrentzip_stamped};
+pub(crate) use writer::{extract_archive_entry, resolve_zip_entry_index};

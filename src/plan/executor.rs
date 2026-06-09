@@ -524,9 +524,14 @@ fn extract_from_zip(archive_path: &str, entry_path: &str, dest_path: &str) -> Re
     let file = fs::File::open(archive_path).context("Failed to open ZIP archive")?;
     let mut archive = zip::ZipArchive::new(file).context("Failed to read ZIP archive")?;
 
-    let mut entry = archive
-        .by_name(entry_path)
+    // Avoid `by_name`: it misses CP437-encoded (non-UTF8-flagged) names whose
+    // internal map key disagrees with `ZipFile::name()`. See
+    // `crate::archive::resolve_zip_entry_index`.
+    let idx = crate::archive::resolve_zip_entry_index(&mut archive, entry_path)
         .with_context(|| format!("Entry not found in archive: {}", entry_path))?;
+    let mut entry = archive
+        .by_index(idx)
+        .with_context(|| format!("Failed to read entry: {}", entry_path))?;
 
     let dest = Path::new(dest_path);
     if let Some(parent) = dest.parent() {

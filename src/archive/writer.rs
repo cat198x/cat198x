@@ -278,14 +278,36 @@ pub(crate) fn extract_archive_entry(archive_path: &Path, entry_path: &str) -> Re
     }
 }
 
+/// Resolve a ZIP entry's index by its decoded name.
+///
+/// We deliberately avoid `ZipArchive::by_name` here. For filenames stored
+/// without the UTF-8 flag (CP437-encoded — e.g. `å` as the single byte 0x86),
+/// the `zip` crate's internal name map is keyed inconsistently with what
+/// `ZipFile::name()` returns, so an exact `by_name` lookup misses an entry that
+/// is plainly present (and that the catalogue recorded by the same `name()`
+/// decoding at scan time). A linear scan comparing `name()` matches reliably.
+pub(crate) fn resolve_zip_entry_index<R: std::io::Read + std::io::Seek>(
+    archive: &mut zip::ZipArchive<R>,
+    entry_path: &str,
+) -> Option<usize> {
+    (0..archive.len()).find(|&i| {
+        archive
+            .by_index(i)
+            .map(|e| e.name() == entry_path)
+            .unwrap_or(false)
+    })
+}
+
 /// Extract a file from a ZIP archive to memory
 fn extract_from_zip(archive_path: &Path, entry_path: &str) -> Result<Vec<u8>> {
     let file = File::open(archive_path).context("Failed to open ZIP archive")?;
     let mut archive = zip::ZipArchive::new(file).context("Failed to read ZIP archive")?;
 
-    let mut entry = archive
-        .by_name(entry_path)
+    let idx = resolve_zip_entry_index(&mut archive, entry_path)
         .with_context(|| format!("Entry not found in archive: {}", entry_path))?;
+    let mut entry = archive
+        .by_index(idx)
+        .with_context(|| format!("Failed to read entry: {}", entry_path))?;
 
     let mut data = Vec::new();
     entry.read_to_end(&mut data)?;
@@ -371,6 +393,50 @@ pub fn write_single_file_zip_from_archive(
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    /// A hand-built ZIP holding one stored entry named with the CP437 byte 0x86
+    /// (`å`) and the UTF-8 general-purpose flag CLEARED — the shape of the
+    /// real-world archive (`...Perhåkan...`) whose entry `ZipArchive::by_name`
+    /// could not find. The entry decodes via `name()` to "å.bin" and holds
+    /// b"cat198x".
+    const CP437_NAMED_ZIP: &[u8] = &[
+        0x50, 0x4b, 0x03, 0x04, 0x14, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xd8,
+        0x17, 0xa4, 0xc2, 0x07, 0x00, 0x00, 0x00, 0x07, 0x00, 0x00, 0x00, 0x05, 0x00, 0x00, 0x00,
+        0x86, 0x2e, 0x62, 0x69, 0x6e, 0x63, 0x61, 0x74, 0x31, 0x39, 0x38, 0x78, 0x50, 0x4b, 0x01,
+        0x02, 0x14, 0x00, 0x14, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xd8, 0x17,
+        0xa4, 0xc2, 0x07, 0x00, 0x00, 0x00, 0x07, 0x00, 0x00, 0x00, 0x05, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x86, 0x2e,
+        0x62, 0x69, 0x6e, 0x50, 0x4b, 0x05, 0x06, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x01, 0x00,
+        0x33, 0x00, 0x00, 0x00, 0x2a, 0x00, 0x00, 0x00, 0x00, 0x00,
+    ];
+
+    /// Regression: extracting a CP437-named entry must succeed even though the
+    /// `zip` crate's `by_name` map disagrees with `ZipFile::name()` for such
+    /// names. Guards the `resolve_zip_entry_index` linear-scan fallback that
+    /// rescued the `å`-named WHDLoad archive.
+    #[test]
+    fn extract_cp437_named_entry_by_decoded_name() {
+        let temp = TempDir::new().unwrap();
+        let zip_path = temp.path().join("cp437.zip");
+        fs::write(&zip_path, CP437_NAMED_ZIP).unwrap();
+
+        // The entry decodes to "å.bin" (U+00E5), and `by_name` cannot find it...
+        let file = File::open(&zip_path).unwrap();
+        let mut archive = zip::ZipArchive::new(file).unwrap();
+        assert_eq!(archive.by_index(0).unwrap().name(), "\u{00e5}.bin");
+        assert!(
+            archive.by_name("\u{00e5}.bin").is_err(),
+            "fixture should reproduce the by_name miss this fix works around"
+        );
+        assert_eq!(
+            resolve_zip_entry_index(&mut archive, "\u{00e5}.bin"),
+            Some(0)
+        );
+
+        // ...but our extraction resolves it and returns the content.
+        let data = extract_archive_entry(&zip_path, "\u{00e5}.bin").unwrap();
+        assert_eq!(data, b"cat198x");
+    }
 
     #[test]
     fn test_zip_writer_single_file() {
