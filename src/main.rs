@@ -127,6 +127,13 @@ enum Commands {
         #[arg(long)]
         skip_repack: bool,
 
+        /// Number of repack operations to run concurrently. Repacks are
+        /// latency-bound over a network mount, so keeping several in flight
+        /// overlaps the round trips; other operation kinds still run one at a
+        /// time, in plan order.
+        #[arg(short = 'j', long, default_value_t = 8, value_parser = clap::value_parser!(u8).range(1..=64))]
+        jobs: u8,
+
         /// Rollback the most recent apply operation
         #[arg(long)]
         rollback: bool,
@@ -228,13 +235,20 @@ fn main() -> Result<()> {
             dry_run,
             skip_space_check,
             skip_repack,
+            jobs,
             rollback,
             continue_rollback,
         } => {
             if rollback {
                 apply_cmd::run_rollback(dry_run, continue_rollback, cli.data_dir)
             } else {
-                apply_cmd::run(dry_run, skip_space_check, skip_repack, cli.data_dir)
+                apply_cmd::run(
+                    dry_run,
+                    skip_space_check,
+                    skip_repack,
+                    jobs as usize,
+                    cli.data_dir,
+                )
             }
         }
         Commands::Quarantine(cmd) => quarantine_cmd::run(cmd, cli.data_dir),

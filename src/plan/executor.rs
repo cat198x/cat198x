@@ -339,6 +339,83 @@ pub fn execute_repack(
     Ok(consumed)
 }
 
+/// A repack staged for concurrent execution: the operation's inputs cloned out
+/// of the plan, so a worker thread owns everything it touches.
+#[derive(Debug, Clone)]
+pub struct RepackJob {
+    /// Index of the operation in the plan's operation list, so the caller can
+    /// update the right entry when the outcome arrives out of order.
+    pub plan_index: usize,
+    /// The plan operation's id, for the rollback journal.
+    pub operation_id: u64,
+    pub sources: Vec<SourceRef>,
+    pub dest: String,
+    pub format: String,
+    pub move_sources: bool,
+}
+
+/// The result of one concurrent repack, delivered to the caller's completion
+/// callback. `consumed` carries `execute_repack`'s move-mode deletions.
+pub struct RepackOutcome {
+    pub job: RepackJob,
+    pub result: Result<Vec<(String, String)>>,
+}
+
+/// Execute a batch of repacks concurrently on a bounded pool of worker threads.
+///
+/// A repack is latency-bound over a network mount (read entries + recompress +
+/// write + verify, each a round trip), so running ~8–16 in flight overlaps the
+/// waits. Workers perform **file operations only** — each job runs the same
+/// audited `execute_repack` as the serial path, including per-entry SHA-1
+/// verification and move-mode delete-after-verify. Everything stateful stays
+/// with the caller: `on_complete` is invoked on the calling thread, one outcome
+/// at a time, as jobs finish — so the rollback journal, the plan status, and
+/// the (non-`Sync`) catalogue connection are mutated serially exactly as in
+/// serial execution, just in completion order rather than plan order.
+///
+/// Safe to run jobs concurrently because the planner guarantees disjointness:
+/// each game repacks to its own destination archive, and a loose source shared
+/// by several games is copied to each, never consumed (so no job deletes a file
+/// another job reads).
+pub fn execute_repacks_concurrent(
+    jobs: Vec<RepackJob>,
+    workers: usize,
+    mut on_complete: impl FnMut(RepackOutcome),
+) {
+    if jobs.is_empty() {
+        return;
+    }
+    let workers = workers.clamp(1, jobs.len());
+    let queue = std::sync::Mutex::new(jobs.into_iter());
+    let (tx, rx) = std::sync::mpsc::channel();
+
+    std::thread::scope(|s| {
+        for _ in 0..workers {
+            let tx = tx.clone();
+            let queue = &queue;
+            s.spawn(move || {
+                loop {
+                    // A poisoned lock means another worker panicked between
+                    // `lock` and `next`; the iterator itself is still valid, so
+                    // keep draining rather than abandoning the batch.
+                    let job = queue.lock().unwrap_or_else(|p| p.into_inner()).next();
+                    let Some(job) = job else { break };
+                    let result =
+                        execute_repack(&job.sources, &job.dest, &job.format, job.move_sources);
+                    if tx.send(RepackOutcome { job, result }).is_err() {
+                        break; // receiver gone; nothing left to report to
+                    }
+                }
+            });
+        }
+        drop(tx); // workers hold the remaining senders; rx ends when they finish
+
+        for outcome in rx {
+            on_complete(outcome);
+        }
+    });
+}
+
 /// The raw bytes of a source — read from disk for a loose file, or extracted
 /// from its inner archive entry.
 fn source_bytes(source: &SourceRef) -> Result<Vec<u8>> {
@@ -1395,6 +1472,106 @@ mod tests {
                 .sha1
                 .eq_ignore_ascii_case(expected_sha1)
         );
+    }
+
+    #[test]
+    fn execute_repacks_concurrent_runs_all_jobs() {
+        use crate::plan::SourceRef;
+
+        let temp = TempDir::new().unwrap();
+        // SHA1 of "cpu data"
+        let sha1 = "76218C22675632AEF6A27578DD0A2C6471D995D5";
+
+        // More jobs than workers, so the queue actually round-robins.
+        let jobs: Vec<RepackJob> = (0..10)
+            .map(|i| {
+                let src = temp.path().join(format!("src-{i}.rom"));
+                fs::write(&src, b"cpu data").unwrap();
+                RepackJob {
+                    plan_index: i,
+                    operation_id: i as u64 + 100,
+                    sources: vec![SourceRef {
+                        path: src.to_str().unwrap().to_string(),
+                        archive_path: None,
+                        sha1: sha1.to_string(),
+                        entry_name: Some("game.rom".to_string()),
+                    }],
+                    dest: temp
+                        .path()
+                        .join(format!("game-{i}.zip"))
+                        .to_str()
+                        .unwrap()
+                        .to_string(),
+                    format: "zip".to_string(),
+                    move_sources: false,
+                }
+            })
+            .collect();
+        let dests: Vec<String> = jobs.iter().map(|j| j.dest.clone()).collect();
+
+        // The callback mutates plain locals with no synchronisation — proof it
+        // runs on the calling thread, the property apply relies on to keep the
+        // journal and catalogue updates serial.
+        let mut seen = Vec::new();
+        execute_repacks_concurrent(jobs, 4, |outcome| {
+            assert!(outcome.result.is_ok(), "{:?}", outcome.result.err());
+            seen.push(outcome.job.plan_index);
+        });
+
+        seen.sort_unstable();
+        assert_eq!(seen, (0..10).collect::<Vec<_>>(), "every job reported once");
+        for dest in dests {
+            assert!(Path::new(&dest).exists(), "archive built: {dest}");
+        }
+    }
+
+    #[test]
+    fn execute_repacks_concurrent_reports_failures_individually() {
+        use crate::plan::SourceRef;
+
+        let temp = TempDir::new().unwrap();
+        let good_src = temp.path().join("good.rom");
+        let bad_src = temp.path().join("bad.rom");
+        fs::write(&good_src, b"cpu data").unwrap();
+        fs::write(&bad_src, b"cpu data").unwrap();
+
+        let make_job = |idx: usize, src: &Path, sha1: &str| RepackJob {
+            plan_index: idx,
+            operation_id: idx as u64,
+            sources: vec![SourceRef {
+                path: src.to_str().unwrap().to_string(),
+                archive_path: None,
+                sha1: sha1.to_string(),
+                entry_name: None,
+            }],
+            dest: temp
+                .path()
+                .join(format!("out-{idx}.zip"))
+                .to_str()
+                .unwrap()
+                .to_string(),
+            format: "zip".to_string(),
+            move_sources: false,
+        };
+
+        let jobs = vec![
+            make_job(0, &good_src, "76218C22675632AEF6A27578DD0A2C6471D995D5"),
+            make_job(1, &bad_src, "0000000000000000000000000000000000000000"),
+        ];
+        let good_dest = jobs[0].dest.clone();
+        let bad_dest = jobs[1].dest.clone();
+
+        let mut outcomes: Vec<(usize, bool)> = Vec::new();
+        execute_repacks_concurrent(jobs, 2, |o| {
+            outcomes.push((o.job.plan_index, o.result.is_ok()));
+        });
+        outcomes.sort_unstable();
+
+        // One job failing verification doesn't take the batch down: the good
+        // job still builds, the bad one reports Err and removed its partial.
+        assert_eq!(outcomes, vec![(0, true), (1, false)]);
+        assert!(Path::new(&good_dest).exists());
+        assert!(!Path::new(&bad_dest).exists());
     }
 
     #[test]

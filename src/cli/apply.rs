@@ -5,8 +5,8 @@ use std::fs;
 
 use crate::db::quarantine::QuarantineReason;
 use crate::plan::executor::{
-    check_disk_space, execute_copy, execute_move, execute_relocate, execute_repack,
-    execute_rollback_move, extract_from_archive,
+    RepackJob, RepackOutcome, check_disk_space, execute_copy, execute_move, execute_relocate,
+    execute_repacks_concurrent, execute_rollback_move, extract_from_archive,
 };
 use crate::plan::{OperationKind, OperationLog, OperationStatus, compute_state_hash};
 use crate::util::truncate_path;
@@ -20,6 +20,7 @@ pub fn run(
     dry_run: bool,
     skip_space_check: bool,
     skip_repack: bool,
+    jobs: usize,
     data_dir: Option<std::path::PathBuf>,
 ) -> Result<()> {
     // Load the most recent plan
@@ -119,17 +120,61 @@ pub fn run(
     // file operation (so a re-plan converges without a re-scan).
     let sources = crate::db::files::list_sources(db.conn())?;
 
-    for (i, op) in plan.operations.iter_mut().enumerate() {
-        if op.status != OperationStatus::Pending {
-            continue; // Skip already completed or failed operations
+    // Consecutive pending repacks accumulate here and run concurrently —
+    // they're latency-bound over a network mount, so overlapping them is the
+    // wall-clock win. Any other pending operation flushes the batch first, so
+    // ordering between repacks and everything else is exactly serial apply's.
+    let mut repack_batch: Vec<RepackJob> = Vec::new();
+
+    for i in 0..plan.operations.len() {
+        {
+            let op = &plan.operations[i];
+            if op.status != OperationStatus::Pending {
+                continue; // Skip already completed or failed operations
+            }
+
+            if let OperationKind::Repack {
+                sources: repack_sources,
+                dest,
+                format,
+                move_sources,
+            } = &op.kind
+            {
+                // Leave repacks pending for a later pass when deferred, so the
+                // cheap operations land first and the recompression can run
+                // separately.
+                if skip_repack {
+                    continue;
+                }
+                if !dry_run {
+                    repack_batch.push(RepackJob {
+                        plan_index: i,
+                        operation_id: op.id,
+                        sources: repack_sources.clone(),
+                        dest: dest.clone(),
+                        format: format.clone(),
+                        move_sources: *move_sources,
+                    });
+                    continue;
+                }
+            }
         }
 
-        // Leave repacks pending for a later pass when deferred, so the cheap
-        // operations land first and the recompression can run separately.
-        if skip_repack && matches!(op.kind, OperationKind::Repack { .. }) {
-            continue;
-        }
+        // A non-repack operation: complete the batched repacks before it runs,
+        // preserving the plan's ordering between repacks and other operations.
+        flush_repack_batch(
+            &mut repack_batch,
+            jobs,
+            &mut plan,
+            &mut op_log,
+            db.conn(),
+            &sources,
+            total_ops,
+            &mut success_count,
+            &mut error_count,
+        );
 
+        let op = &mut plan.operations[i];
         match &op.kind {
             OperationKind::Copy { source, dest, .. } => {
                 println!(
@@ -242,12 +287,9 @@ pub fn run(
                     }
                 }
             }
-            OperationKind::Repack {
-                sources,
-                dest,
-                format,
-                move_sources,
-            } => {
+            OperationKind::Repack { sources, dest, .. } => {
+                // Reachable only on a dry run: live repacks were batched above
+                // for concurrent execution and never fall through to here.
                 println!(
                     "[{}/{}] REPACK ({} files) -> {}",
                     i + 1,
@@ -255,34 +297,8 @@ pub fn run(
                     sources.len(),
                     truncate_path(dest, 40)
                 );
-
-                if dry_run {
-                    success_count += 1;
-                    continue;
-                }
-
-                let result = execute_repack(sources, dest, format, *move_sources);
-
-                // Log the operation. A move-mode repack reports the loose sources
-                // it consumed so the reverse can extract them back out.
-                if let Some(ref mut log) = op_log {
-                    let source_paths: Vec<String> =
-                        sources.iter().map(|s| s.path.clone()).collect();
-                    let consumed = result.as_deref().unwrap_or(&[]);
-                    log.log_repack(op.id, &source_paths, dest, consumed, result.is_ok());
-                }
-
-                match result {
-                    Ok(_) => {
-                        op.status = OperationStatus::Completed;
-                        success_count += 1;
-                    }
-                    Err(e) => {
-                        eprintln!("  ERROR: {:#}", e);
-                        op.status = OperationStatus::Failed;
-                        error_count += 1;
-                    }
-                }
+                success_count += 1;
+                continue;
             }
             OperationKind::Delete { path } => {
                 println!(
@@ -379,6 +395,19 @@ pub fn run(
         }
     }
 
+    // Repacks at the tail of the plan (the common case) are still batched.
+    flush_repack_batch(
+        &mut repack_batch,
+        jobs,
+        &mut plan,
+        &mut op_log,
+        db.conn(),
+        &sources,
+        total_ops,
+        &mut success_count,
+        &mut error_count,
+    );
+
     // Save updated plan and operation log
     if !dry_run {
         let plan_json = serde_json::to_string_pretty(&plan).context("Failed to serialize plan")?;
@@ -410,6 +439,81 @@ pub fn run(
     }
 
     Ok(())
+}
+
+/// Execute the accumulated repack batch concurrently, then drain it.
+///
+/// Workers do the file operations; everything stateful happens here on the
+/// calling thread as each outcome streams in — journal entry, plan status,
+/// catalogue sync — in completion order. That keeps the rollback log append
+/// order consistent with what actually happened on disk and never shares the
+/// (non-`Sync`) database connection across threads.
+#[allow(clippy::too_many_arguments)]
+fn flush_repack_batch(
+    batch: &mut Vec<RepackJob>,
+    workers: usize,
+    plan: &mut crate::plan::Plan,
+    op_log: &mut Option<OperationLog>,
+    conn: &rusqlite::Connection,
+    sources: &[crate::db::files::Source],
+    total_ops: usize,
+    success_count: &mut usize,
+    error_count: &mut usize,
+) {
+    if batch.is_empty() {
+        return;
+    }
+    let jobs = std::mem::take(batch);
+    if jobs.len() > 1 && workers > 1 {
+        println!(
+            "Repacking {} archive(s), {} in flight...",
+            jobs.len(),
+            workers.min(jobs.len())
+        );
+    }
+
+    execute_repacks_concurrent(jobs, workers, |outcome: RepackOutcome| {
+        let RepackOutcome { job, result } = outcome;
+        println!(
+            "[{}/{}] REPACK ({} files) -> {}",
+            job.plan_index + 1,
+            total_ops,
+            job.sources.len(),
+            truncate_path(&job.dest, 40)
+        );
+
+        // Log the operation. A move-mode repack reports the loose sources it
+        // consumed so the reverse can extract them back out.
+        if let Some(log) = op_log {
+            let source_paths: Vec<String> = job.sources.iter().map(|s| s.path.clone()).collect();
+            let consumed = result.as_deref().unwrap_or(&[]);
+            log.log_repack(
+                job.operation_id,
+                &source_paths,
+                &job.dest,
+                consumed,
+                result.is_ok(),
+            );
+        }
+
+        let op = &mut plan.operations[job.plan_index];
+        match result {
+            Ok(_) => {
+                op.status = OperationStatus::Completed;
+                *success_count += 1;
+
+                // Keep the catalogue in step, as the serial path does per-op.
+                if let Err(e) = sync_catalogue_after(conn, sources, &op.kind) {
+                    eprintln!("  warning: catalogue not updated for op {}: {}", op.id, e);
+                }
+            }
+            Err(e) => {
+                eprintln!("  ERROR: {:#}", e);
+                op.status = OperationStatus::Failed;
+                *error_count += 1;
+            }
+        }
+    });
 }
 
 /// Update the file catalogue to match a completed operation, so a re-plan
