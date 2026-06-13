@@ -21,6 +21,7 @@ pub fn run(
     skip_space_check: bool,
     skip_repack: bool,
     jobs: usize,
+    prune_empty: bool,
     data_dir: Option<std::path::PathBuf>,
 ) -> Result<()> {
     // Load the most recent plan
@@ -437,6 +438,36 @@ pub fn run(
     if error_count > 0 {
         println!();
         println!("Some operations failed. Run 'cat198x apply' again to retry.");
+    }
+
+    // Self-clean: with --prune-empty, remove the directories the move-tidy left
+    // empty under the source roots. Done once here rather than per operation —
+    // over a network mount a per-op emptiness check would add a round trip to
+    // every operation, and an archive-entry move never removes its source
+    // container, so a folder only truly empties once its last whole file is gone.
+    // Only ever uses fs::remove_dir, which refuses a non-empty directory.
+    if prune_empty && !dry_run {
+        let roots: Vec<std::path::PathBuf> = sources
+            .iter()
+            .map(|s| std::path::PathBuf::from(&s.path))
+            .collect();
+        let report = crate::cli::prune::prune_sources(
+            &roots,
+            &crate::cli::prune::PruneOptions {
+                remove: true,
+                ignore_os_junk: false,
+            },
+        )?;
+        println!();
+        if report.dirs.is_empty() {
+            println!("Prune: no empty directories under the source roots.");
+        } else {
+            println!(
+                "Prune: removed {} empty director{} left by the tidy.",
+                report.dirs.len(),
+                if report.dirs.len() == 1 { "y" } else { "ies" }
+            );
+        }
     }
 
     Ok(())

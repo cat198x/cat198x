@@ -29,19 +29,19 @@ fn is_os_junk(name: &str) -> bool {
 
 /// What a prune pass found / did.
 #[derive(Default)]
-struct PruneReport {
+pub struct PruneReport {
     /// Directories that are (or were) removable, deepest first.
-    dirs: Vec<PathBuf>,
+    pub dirs: Vec<PathBuf>,
     /// OS-junk files that would be / were deleted to empty those directories.
-    junk: Vec<PathBuf>,
+    pub junk: Vec<PathBuf>,
 }
 
 /// Options for a prune pass.
-struct PruneOptions {
+pub struct PruneOptions {
     /// Actually delete (else report only).
-    remove: bool,
+    pub remove: bool,
     /// Treat a directory holding only OS cruft as empty (and delete that cruft).
-    ignore_os_junk: bool,
+    pub ignore_os_junk: bool,
 }
 
 /// Decide whether `dir` is removable, recursing depth-first so a parent emptied
@@ -103,8 +103,9 @@ fn prune_dir(dir: &Path, opts: &PruneOptions, report: &mut PruneReport) -> Resul
 }
 
 /// Prune empty directories beneath each source root. The root itself is never
-/// removed (it stays a registered source) — only directories within it.
-fn prune_sources(roots: &[PathBuf], opts: &PruneOptions) -> Result<PruneReport> {
+/// removed (it stays a registered source) — only directories within it. Shared
+/// with `apply --prune-empty`, which calls it once after a move-tidy completes.
+pub fn prune_sources(roots: &[PathBuf], opts: &PruneOptions) -> Result<PruneReport> {
     let mut report = PruneReport::default();
     for root in roots {
         if !root.is_dir() {

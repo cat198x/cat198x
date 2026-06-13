@@ -160,6 +160,13 @@ enum Commands {
         /// Continue a previously failed rollback
         #[arg(long, requires = "rollback")]
         continue_rollback: bool,
+
+        /// After a `--move` tidy, remove the now-empty source directories it left
+        /// behind (e.g. emptied `ToSort/…` folders). Runs once when the apply
+        /// finishes; only `fs::remove_dir` is used, so a non-empty directory is
+        /// never deleted. For finer control (preview, OS-cruft) use `prune-empty`.
+        #[arg(long)]
+        prune_empty: bool,
     },
 
     /// Manage quarantined files
@@ -262,6 +269,7 @@ fn main() -> Result<()> {
             jobs,
             rollback,
             continue_rollback,
+            prune_empty,
         } => {
             if rollback {
                 apply_cmd::run_rollback(dry_run, continue_rollback, cli.data_dir)
@@ -271,6 +279,7 @@ fn main() -> Result<()> {
                     skip_space_check,
                     skip_repack,
                     jobs as usize,
+                    prune_empty,
                     cli.data_dir,
                 )
             }
