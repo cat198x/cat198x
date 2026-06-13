@@ -18,7 +18,7 @@ const PROGRESS_LOG_INTERVAL: usize = 250;
 
 use crate::db::files::{self, Source};
 use crate::scanner::archive::{ArchiveType, hash_archive_entries};
-use crate::scanner::hasher::{FileHashes, hash_file, hash_file_with_header_detection};
+use crate::scanner::hasher::{FileHashes, hash_file_with_header_detection};
 use crate::util::truncate_path;
 
 use super::open_database;
@@ -53,6 +53,21 @@ enum ScanResult {
 struct ArchiveEntry {
     name: String,
     hashes: FileHashes,
+}
+
+/// Build a CHD's scan hashes from its header and metadata only — never reading
+/// the (multi-GB) body. The match identity is the internal header SHA1; size
+/// comes from metadata; the container's md5/crc are not meaningful for a CHD and
+/// are left empty.
+fn chd_hashes(path: &Path) -> Result<FileHashes> {
+    let sha1 = crate::scanner::chd::read_chd_sha1(path)?;
+    let size = std::fs::metadata(path)?.len();
+    Ok(FileHashes {
+        sha1,
+        md5: String::new(),
+        crc32: String::new(),
+        size,
+    })
 }
 
 /// Whether a `--source` selector picks this source: a purely numeric selector
@@ -289,22 +304,18 @@ fn scan_source(
             } else if crate::scanner::chd::is_chd_path(file_path) {
                 // A CHD's identity is its *internal* logical-data SHA1 from the
                 // header, which is what <disk> DAT entries reference — not the
-                // hash of the .chd file's bytes. Hash the file for size/md5/crc,
-                // then replace the SHA1 with the internal one so it matches the
-                // DAT. An unreadable header surfaces as a scan error rather than
-                // a silently unmatchable (file-hashed) CHD.
-                match hash_file(file_path)
-                    .and_then(|h| crate::scanner::chd::read_chd_sha1(file_path).map(|s| (h, s)))
-                {
-                    Ok((mut hashes, internal_sha1)) => {
-                        hashes.sha1 = internal_sha1;
-                        ScanResult::LooseFile {
-                            relative_path,
-                            hashes,
-                            sha1_no_header: None,
-                            header_skipped: None,
-                        }
-                    }
+                // hash of the .chd file's bytes. Read only the 124-byte header,
+                // never the (multi-GB) body: the internal SHA1 is the match key,
+                // size comes from metadata, and the container's md5/crc aren't
+                // meaningful for a CHD. An unreadable header surfaces as a scan
+                // error rather than a silently unmatchable (file-hashed) CHD.
+                match chd_hashes(file_path) {
+                    Ok(hashes) => ScanResult::LooseFile {
+                        relative_path,
+                        hashes,
+                        sha1_no_header: None,
+                        header_skipped: None,
+                    },
                     Err(e) => ScanResult::Error {
                         relative_path,
                         error: e.to_string(),
