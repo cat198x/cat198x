@@ -29,6 +29,9 @@ pub struct MatchedRom {
     pub source_root: String,
     /// Archive path (None for loose files)
     pub archive_path: Option<String>,
+    /// True for a `<disk>` (CHD): stored loose in a machine folder as
+    /// `<game>/<rom_name>.chd`, never packed into an archive.
+    pub is_disk: bool,
 }
 
 /// Options controlling plan generation.
@@ -252,6 +255,13 @@ pub fn generate_plan_filtered(conn: &Connection, opts: &PlanOptions) -> Result<P
         let mut relocated = 0;
         let mut deduped = 0;
         let mut bytes = 0u64;
+
+        // CHDs (<disk> entries) are always stored loose in a machine folder
+        // (<dest>/<game>/<name>.chd) and never packed, even when the set's
+        // format is an archive — so plan them on their own path and run the
+        // format branch over the remaining <rom> entries only.
+        let (disk_matches, matches): (Vec<MatchedRom>, Vec<MatchedRom>) =
+            matches.into_iter().partition(|m| m.is_disk);
 
         match archive_format_tag(format) {
             None => {
@@ -491,6 +501,15 @@ pub fn generate_plan_filtered(conn: &Connection, opts: &PlanOptions) -> Result<P
             }
         }
 
+        // Plan any CHDs loose, regardless of the set's format. (Disk dedups are
+        // reported within the helper, like the other branches' own counts.)
+        if !disk_matches.is_empty() {
+            let d = plan_disk_matches(disk_matches, &dest_root, opts, &shared, &mut plan);
+            already_correct += d.already_correct;
+            to_write += d.to_write;
+            bytes += d.bytes;
+        }
+
         plan.summary.already_correct += already_correct;
         plan.per_collection.push(CollectionPlanStat {
             name: collection.name.clone(),
@@ -546,7 +565,7 @@ fn find_matched_roms(
 ) -> Result<Vec<MatchedRom>> {
     let mut stmt = conn.prepare(
         "WITH vroms AS (
-            SELECT r.id, r.game_id, r.name, r.sha1, r.crc32, r.size
+            SELECT r.id, r.game_id, r.name, r.sha1, r.crc32, r.size, r.is_disk
             FROM dat_roms r
             JOIN dat_games g ON r.game_id = g.id
             JOIN dat_nodes n ON g.node_id = n.id
@@ -565,7 +584,7 @@ fn find_matched_roms(
             FROM vroms vr JOIN files f ON f.crc32 = vr.crc32 AND f.size = vr.size
             WHERE vr.sha1 IS NULL AND vr.crc32 IS NOT NULL
          )
-         SELECT g.name, vr.name, m.sha1, m.size, fl.path, s.path, fl.archive_path
+         SELECT g.name, vr.name, m.sha1, m.size, fl.path, s.path, fl.archive_path, vr.is_disk
          FROM matched m
          JOIN vroms vr ON vr.id = m.rom_id
          JOIN dat_games g ON vr.game_id = g.id
@@ -585,6 +604,7 @@ fn find_matched_roms(
                 source_path: row.get(4)?,
                 source_root: row.get(5)?,
                 archive_path: row.get(6)?,
+                is_disk: row.get(7)?,
             })
         })?
         .collect::<Result<Vec<_>, _>>()?;
@@ -679,6 +699,97 @@ fn build_dest_path(dest_root: &str, game_name: &str, rom_name: &str, multi_rom: 
     } else {
         format!("{}/{}", root, rom_name)
     }
+}
+
+/// Counts from planning a batch of CHD (disk) matches.
+#[derive(Default)]
+struct DiskPlanCounts {
+    already_correct: usize,
+    to_write: usize,
+    deduped: usize,
+    bytes: u64,
+}
+
+/// Plan CHD (`<disk>`) matches as loose files in a machine folder
+/// (`<dest_root>/<game>/<name>.chd`) — the MAME on-disk convention — never
+/// packed, whatever the set's format. Mirrors loose-ROM planning: one canonical
+/// copy per destination, the rest treated as exact-content duplicates (deleted
+/// only in move mode, and never when the content is shared with another entry).
+///
+/// The DAT disk name has no extension; `.chd` is appended here so the
+/// destination matches the on-disk file.
+fn plan_disk_matches(
+    matches: Vec<MatchedRom>,
+    dest_root: &str,
+    opts: &PlanOptions,
+    shared: &HashSet<String>,
+    plan: &mut Plan,
+) -> DiskPlanCounts {
+    let mut counts = DiskPlanCounts::default();
+    let root = dest_root.trim_end_matches('/');
+
+    // Group every held copy by its canonical destination.
+    let mut by_dest: BTreeMap<String, Vec<MatchedRom>> = BTreeMap::new();
+    for m in matches {
+        let dest = format!("{}/{}/{}.chd", root, m.game_name, m.rom_name);
+        by_dest.entry(dest).or_default().push(m);
+    }
+
+    for (dest, copies) in by_dest {
+        // Shared content must never consume its source — copy it into place even
+        // in move mode, and skip the redundancy delete.
+        let shared_here = copies.iter().any(|m| shared.contains(&m.sha1));
+
+        let at_dest = copies.iter().position(|m| {
+            m.archive_path.is_none() && format!("{}/{}", m.source_root, m.source_path) == dest
+        });
+        let keep = match at_dest {
+            Some(i) => {
+                counts.already_correct += 1;
+                Some(i)
+            }
+            None => {
+                let m = &copies[0];
+                counts.bytes += m.size as u64;
+                let source = SourceRef {
+                    path: format!("{}/{}", m.source_root, m.source_path),
+                    archive_path: m.archive_path.clone(),
+                    sha1: m.sha1.clone(),
+                    entry_name: None,
+                };
+                if opts.move_files && !shared_here {
+                    plan.add_move(source, dest.clone(), m.size as u64);
+                } else {
+                    plan.add_copy(source, dest.clone(), m.size as u64);
+                }
+                counts.to_write += 1;
+                Some(0)
+            }
+        };
+
+        // Every other loose copy is an exact-content duplicate of the kept one.
+        if opts.move_files && !shared_here {
+            for (i, m) in copies.iter().enumerate() {
+                if Some(i) == keep || m.archive_path.is_some() {
+                    continue;
+                }
+                let path = format!("{}/{}", m.source_root, m.source_path);
+                if path == dest {
+                    continue;
+                }
+                plan.add_delete(path);
+                counts.deduped += 1;
+            }
+        }
+    }
+
+    let verb = if opts.move_files { "move" } else { "copy" };
+    println!(
+        "  {} CHD(s) already correct, {} to {}, {} duplicate(s) to delete",
+        counts.already_correct, counts.to_write, verb, counts.deduped
+    );
+
+    counts
 }
 
 /// Compute state hash for plan validation
@@ -1199,6 +1310,61 @@ mod tests {
     }
 
     #[test]
+    fn disk_is_planned_loose_in_a_machine_folder_even_for_a_zip_set() {
+        let db = setup_db();
+        let conn = db.conn();
+        // A CHD (<disk>) in a zip-format set must still be placed loose at
+        // <dest>/<game>/<name>.chd — never packed into an archive.
+        let coll = collections::create_collection(conn, "MAME CHDs", "mame").unwrap();
+        let vid = collections::add_version(conn, coll, "v1", "/dats/chd.dat", true).unwrap();
+        let node = dats::create_node(conn, vid, None, "MAME CHDs", "dat", "MAME").unwrap();
+        let g = dats::create_game(conn, node, "azumanga", None, None, false, false, false).unwrap();
+        // A disk: name without extension, sha1 = the CHD's internal hash.
+        dats::create_disk(conn, g, "gdl-0018", Some("DDD"), None, "good", None).unwrap();
+        conn.execute("INSERT INTO files (sha1, size) VALUES ('DDD', 4096)", [])
+            .unwrap();
+        conn.execute(
+            "INSERT INTO sources (id, path, case_sensitive) VALUES (300, '/lib/ToSort/MAME', 0)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO file_locations (sha1, source_id, path, archive_path)
+             VALUES ('DDD', 300, 'MAME CHDs (merged)/azumanga/gdl-0018.chd', NULL)",
+            [],
+        )
+        .unwrap();
+
+        let plan = generate_plan_filtered(
+            conn,
+            &PlanOptions {
+                default_dest: Some("/lib/ROMs".to_string()),
+                // Zip is the set format — the disk must ignore it and stay loose.
+                default_format: OutputFormat::Zip,
+                move_files: false,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        // No archive is built for a disk.
+        assert_eq!(plan.summary.repack_count, 0, "a CHD is never packed");
+        // It is copied loose to <dest>/MAME/<game>/<name>.chd.
+        let copies: Vec<String> = plan
+            .operations
+            .iter()
+            .filter_map(|op| match &op.kind {
+                OperationKind::Copy { dest, .. } => Some(dest.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            copies,
+            vec!["/lib/ROMs/MAME/azumanga/gdl-0018.chd".to_string()]
+        );
+    }
+
+    #[test]
     fn shared_archive_content_is_repacked_to_each_game_not_consumed() {
         let db = setup_db();
         let conn = db.conn();
@@ -1499,6 +1665,7 @@ mod tests {
             source_root: "/s".into(),
             source_path: path.into(),
             archive_path: Some("r".into()),
+            is_disk: false,
         };
         let loose = |path: &str| MatchedRom {
             archive_path: None,
@@ -1581,6 +1748,7 @@ mod tests {
             source_path: "/source/test.rom".to_string(),
             source_root: "/source".to_string(),
             archive_path: None,
+            is_disk: false,
         }
     }
 
