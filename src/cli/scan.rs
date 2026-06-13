@@ -18,7 +18,7 @@ const PROGRESS_LOG_INTERVAL: usize = 250;
 
 use crate::db::files::{self, Source};
 use crate::scanner::archive::{ArchiveType, hash_archive_entries};
-use crate::scanner::hasher::{FileHashes, hash_file_with_header_detection};
+use crate::scanner::hasher::{FileHashes, hash_file, hash_file_with_header_detection};
 use crate::util::truncate_path;
 
 use super::open_database;
@@ -279,6 +279,30 @@ fn scan_source(
                         ScanResult::Archive {
                             relative_path,
                             entries: archive_entries,
+                        }
+                    }
+                    Err(e) => ScanResult::Error {
+                        relative_path,
+                        error: e.to_string(),
+                    },
+                }
+            } else if crate::scanner::chd::is_chd_path(file_path) {
+                // A CHD's identity is its *internal* logical-data SHA1 from the
+                // header, which is what <disk> DAT entries reference — not the
+                // hash of the .chd file's bytes. Hash the file for size/md5/crc,
+                // then replace the SHA1 with the internal one so it matches the
+                // DAT. An unreadable header surfaces as a scan error rather than
+                // a silently unmatchable (file-hashed) CHD.
+                match hash_file(file_path)
+                    .and_then(|h| crate::scanner::chd::read_chd_sha1(file_path).map(|s| (h, s)))
+                {
+                    Ok((mut hashes, internal_sha1)) => {
+                        hashes.sha1 = internal_sha1;
+                        ScanResult::LooseFile {
+                            relative_path,
+                            hashes,
+                            sha1_no_header: None,
+                            header_skipped: None,
                         }
                     }
                     Err(e) => ScanResult::Error {
