@@ -10,6 +10,22 @@ use crate::config::OutputFormat;
 use crate::db::{collections, config as db_config, dats};
 use crate::filter::{RomCandidate, parse_game_name, select_preferred};
 
+/// Above this many match-rows, a collection is skipped rather than planned.
+/// `find_matched_roms` materialises every (ROM × held-location) pair, at
+/// roughly half a kilobyte each, so tens of millions of rows would need many
+/// gigabytes and risk OOM. The only collections that reach this are MAME-style
+/// meta-aggregates (e.g. `all_non-zipped_content`) whose "games" list content
+/// held across hundreds of files — not real romsets to place. The largest
+/// legitimate set seen, FinalBurn Neo - Arcade Games, expands to ~7.9M rows,
+/// comfortably under the cap.
+const MAX_MATCH_ROWS: i64 = 20_000_000;
+
+/// A version with fewer ROMs than this cannot plausibly reach `MAX_MATCH_ROWS`
+/// (it would take an implausible average per-ROM fan-out), so the expansion
+/// guard's query is skipped for it. This keeps the guard free for the hundreds
+/// of small collections and pays its cost only for the few large ones.
+const GUARD_ROM_THRESHOLD: i64 = 50_000;
+
 /// A matched ROM ready for planning
 #[derive(Debug, Clone)]
 pub struct MatchedRom {
@@ -198,6 +214,23 @@ pub fn generate_plan_filtered(conn: &Connection, opts: &PlanOptions) -> Result<P
                 continue;
             }
         };
+
+        // Guard against pathological collections before materialising any
+        // matches: a MAME-style meta-aggregate expands to tens of millions of
+        // match-rows and would exhaust memory. Skip-and-report instead of OOM.
+        let match_rows = count_match_rows_capped(conn, version.id, MAX_MATCH_ROWS)?;
+        if match_rows > MAX_MATCH_ROWS {
+            println!(
+                "Skipping {} — match expansion exceeds the {}-row memory cap \
+                 (a meta-aggregate, not a placeable romset).",
+                collection.name, MAX_MATCH_ROWS
+            );
+            plan.skipped_oversized.push(format!(
+                "{} (>{} match-rows)",
+                collection.name, MAX_MATCH_ROWS
+            ));
+            continue;
+        }
 
         planned_any = true;
         println!("Planning for: {} (v{})", collection.name, version.version);
@@ -568,16 +601,86 @@ pub fn generate_plan_filtered(conn: &Connection, opts: &PlanOptions) -> Result<P
         println!("  or library-wide:         cat198x config set-default dest_path <path>");
     }
 
+    // Report collections left out because their match expansion is too large to
+    // plan safely (a meta-aggregate, not a romset). Already named individually
+    // above as they were hit; this is the rollup.
+    if !plan.skipped_oversized.is_empty() {
+        println!();
+        println!(
+            "{} collection(s) skipped — match expansion over the {}-row memory cap.",
+            plan.skipped_oversized.len(),
+            MAX_MATCH_ROWS
+        );
+    }
+
     if let Some(pattern) = dat_filter
         && !filter_matched_any
     {
         println!("No collections match the filter: {}", pattern);
-    } else if !planned_any && skipped_no_dest.is_empty() {
+    } else if !planned_any && skipped_no_dest.is_empty() && plan.skipped_oversized.is_empty() {
         println!("No collections with an active version to plan.");
     }
 
     plan.skipped_no_dest = skipped_no_dest;
     Ok(plan)
+}
+
+/// Count the match-rows a version's plan would materialise, bounded to `cap + 1`.
+///
+/// Mirrors the joins of [`find_matched_roms`] but only counts rows, and the
+/// inner `LIMIT cap + 1` stops the join the moment the cap is reached — so a
+/// pathological collection is detected in bounded time without ever producing
+/// (or holding) its full expansion. A version with too few ROMs to plausibly
+/// reach the cap returns its ROM count directly, skipping the join entirely.
+fn count_match_rows_capped(conn: &Connection, version_id: i64, cap: i64) -> Result<i64> {
+    let rom_count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM dat_roms r
+         JOIN dat_games g ON r.game_id = g.id
+         JOIN dat_nodes n ON g.node_id = n.id
+         WHERE n.version_id = ?1 AND r.status != 'nodump'",
+        [version_id],
+        |row| row.get(0),
+    )?;
+    if rom_count < GUARD_ROM_THRESHOLD {
+        // A lower bound well under the cap — cheap proof the collection is safe.
+        return Ok(rom_count.min(cap));
+    }
+    count_expansion_capped(conn, version_id, cap)
+}
+
+/// The exact match expansion, counted only up to `cap + 1` (the inner `LIMIT`
+/// halts the join there). Split out from the ROM-count gate so the bounded count
+/// is testable without a fixture large enough to pass the gate.
+fn count_expansion_capped(conn: &Connection, version_id: i64, cap: i64) -> Result<i64> {
+    // The expansion is one row per (matched ROM × held location), exactly what
+    // the planner materialises; keep `rom_id` so a SHA1 matching several ROMs
+    // counts once per ROM, matching `find_matched_roms`'s UNION cardinality.
+    let count: i64 = conn.query_row(
+        "WITH vroms AS (
+            SELECT r.id, r.sha1, r.crc32, r.size
+            FROM dat_roms r
+            JOIN dat_games g ON r.game_id = g.id
+            JOIN dat_nodes n ON g.node_id = n.id
+            WHERE n.version_id = ?1 AND r.status != 'nodump'
+         ),
+         matched AS (
+            SELECT vr.id AS rom_id, f.sha1 AS msha1
+            FROM vroms vr JOIN files f ON f.sha1 = vr.sha1 WHERE vr.sha1 IS NOT NULL
+            UNION
+            SELECT vr.id, f.sha1
+            FROM vroms vr JOIN files f ON f.sha1_no_header = vr.sha1 WHERE vr.sha1 IS NOT NULL
+            UNION
+            SELECT vr.id, f.sha1
+            FROM vroms vr JOIN files f ON f.crc32 = vr.crc32 AND f.size = vr.size
+            WHERE vr.sha1 IS NULL AND vr.crc32 IS NOT NULL
+         )
+         SELECT COUNT(*) FROM (
+            SELECT 1 FROM matched m JOIN file_locations fl ON fl.sha1 = m.msha1 LIMIT ?2
+         )",
+        rusqlite::params![version_id, cap + 1],
+        |row| row.get(0),
+    )?;
+    Ok(count)
 }
 
 /// Find all ROMs in one collection version that have a matching held file.
@@ -1011,6 +1114,45 @@ mod tests {
         let hash1 = compute_state_hash(conn).unwrap();
         let hash2 = compute_state_hash(conn).unwrap();
         assert_eq!(hash1, hash2);
+    }
+
+    #[test]
+    fn count_expansion_capped_caps_and_counts_with_rom_multiplicity() {
+        let db = setup_db();
+        let conn = db.conn();
+        // Two distinct ROMs share content AAA, which is held in three locations.
+        // The materialised expansion is one row per (matched ROM × location) =
+        // 2 ROMs × 3 locations = 6.
+        let coll = collections::create_collection(conn, "Agg", "mame").unwrap();
+        let vid = collections::add_version(conn, coll, "v1", "/dats/agg.dat", true).unwrap();
+        let node = dats::create_node(conn, vid, None, "Agg", "dat", "MAME").unwrap();
+        let g = dats::create_game(conn, node, "bucket", None, None, false, false, false).unwrap();
+        dats::create_rom(conn, g, "a.rom", 10, Some("AAA"), None, None, "good", None).unwrap();
+        dats::create_rom(conn, g, "b.rom", 10, Some("AAA"), None, None, "good", None).unwrap();
+        conn.execute("INSERT INTO files (sha1, size) VALUES ('AAA', 10)", [])
+            .unwrap();
+        conn.execute(
+            "INSERT INTO sources (id, path, case_sensitive) VALUES (500, '/src', 0)",
+            [],
+        )
+        .unwrap();
+        for i in 0..3 {
+            conn.execute(
+                &format!(
+                    "INSERT INTO file_locations (sha1, source_id, path, archive_path)
+                     VALUES ('AAA', 500, 'loc{i}.zip', 'x.rom')"
+                ),
+                [],
+            )
+            .unwrap();
+        }
+
+        // A generous cap returns the true expansion (6).
+        assert_eq!(count_expansion_capped(conn, vid, 100).unwrap(), 6);
+        // A cap below the expansion is detected without counting past cap + 1.
+        let capped = count_expansion_capped(conn, vid, 4).unwrap();
+        assert_eq!(capped, 5, "the inner LIMIT halts at cap + 1");
+        assert!(capped > 4, "over-cap is reported as exceeding the cap");
     }
 
     #[test]

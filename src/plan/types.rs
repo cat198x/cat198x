@@ -17,6 +17,11 @@ pub struct Plan {
     /// (not part of the persisted plan) — surfaced to the user after planning.
     #[serde(skip)]
     pub skipped_no_dest: Vec<String>,
+    /// Collections skipped because their match expansion exceeds the memory-safe
+    /// cap — a MAME-style meta-aggregate that lists content held across hundreds
+    /// of files. Each entry is `"<name> (<rows> match-rows)"`. Transient.
+    #[serde(skip)]
+    pub skipped_oversized: Vec<String>,
     /// Per-collection operation tallies, for a reviewable breakdown. Transient.
     #[serde(skip)]
     pub per_collection: Vec<CollectionPlanStat>,
@@ -146,6 +151,7 @@ impl Plan {
             operations: Vec::new(),
             summary: PlanSummary::default(),
             skipped_no_dest: Vec::new(),
+            skipped_oversized: Vec::new(),
             per_collection: Vec::new(),
         }
     }
