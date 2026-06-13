@@ -153,5 +153,10 @@ CREATE INDEX idx_dat_roms_crc32 ON dat_roms(crc32);
 CREATE INDEX idx_file_locations_sha1 ON file_locations(sha1);
 CREATE INDEX idx_file_locations_source ON file_locations(source_id);
 CREATE INDEX idx_files_sha1_no_header ON files(sha1_no_header);
+-- The CRC32+size match branch (CRC-only DATs: MAME, FinalBurn Neo) joins files
+-- on (crc32, size); without this index it full-scans the files table per ROM,
+-- which is catastrophic on a large library. Covering, so the join never has to
+-- touch the table itself.
+CREATE INDEX idx_files_crc32_size ON files(crc32, size);
 CREATE INDEX idx_quarantine_sha1 ON quarantine(sha1);
 CREATE INDEX idx_quarantine_collection ON quarantine(collection_name);

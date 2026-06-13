@@ -4,7 +4,7 @@ use anyhow::Result;
 use rusqlite::Connection;
 
 /// Current schema version
-const SCHEMA_VERSION: i32 = 3;
+const SCHEMA_VERSION: i32 = 4;
 
 /// Database wrapper with schema management
 pub struct Database {
@@ -101,6 +101,13 @@ impl Database {
             self.conn.execute_batch(include_str!("schema_v3.sql"))?;
             self.conn
                 .execute("INSERT INTO schema_version (version) VALUES (?)", [3])?;
+        }
+        if from_version < 4 {
+            // Migrate to v4: index files(crc32, size) so the CRC-only match
+            // branch (merged arcade sets) uses an index instead of a full scan.
+            self.conn.execute_batch(include_str!("schema_v4.sql"))?;
+            self.conn
+                .execute("INSERT INTO schema_version (version) VALUES (?)", [4])?;
         }
         Ok(())
     }
