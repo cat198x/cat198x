@@ -52,6 +52,9 @@ pub struct DatRom {
     pub crc32: Option<String>,
     pub status: String,
     pub merge_tag: Option<String>,
+    /// True for a `<disk>` (CHD): `sha1` is the CHD's internal hash, the file is
+    /// `<name>.chd`, and it is stored loose rather than packed.
+    pub is_disk: bool,
 }
 
 /// Create a DAT node
@@ -142,7 +145,7 @@ pub fn create_game(
     Ok(conn.last_insert_rowid())
 }
 
-/// Create a ROM entry
+/// Create a ROM entry (a `<rom>`).
 #[allow(clippy::too_many_arguments)]
 pub fn create_rom(
     conn: &Connection,
@@ -155,6 +158,41 @@ pub fn create_rom(
     status: &str,
     merge_tag: Option<&str>,
 ) -> Result<i64> {
+    insert_dat_rom(
+        conn, game_id, name, size, sha1, md5, crc32, status, merge_tag, false,
+    )
+}
+
+/// Create a disk entry (a `<disk>` / CHD). A disk has no size or CRC, and its
+/// `sha1` is the CHD's internal logical-data hash, not the `.chd` file hash.
+pub fn create_disk(
+    conn: &Connection,
+    game_id: i64,
+    name: &str,
+    sha1: Option<&str>,
+    md5: Option<&str>,
+    status: &str,
+    merge_tag: Option<&str>,
+) -> Result<i64> {
+    insert_dat_rom(
+        conn, game_id, name, 0, sha1, md5, None, status, merge_tag, true,
+    )
+}
+
+/// Insert a `dat_roms` row for either a `<rom>` or a `<disk>` (`is_disk`).
+#[allow(clippy::too_many_arguments)]
+fn insert_dat_rom(
+    conn: &Connection,
+    game_id: i64,
+    name: &str,
+    size: i64,
+    sha1: Option<&str>,
+    md5: Option<&str>,
+    crc32: Option<&str>,
+    status: &str,
+    merge_tag: Option<&str>,
+    is_disk: bool,
+) -> Result<i64> {
     // INSERT OR IGNORE because a game can legitimately list the same ROM name
     // twice — MAME/FBNeo arcade and console DATs repeat a shared BIOS/merge ROM
     // (identical name, size and CRC) across a parent and its merge entries. A
@@ -162,9 +200,9 @@ pub fn create_rom(
     // whole DAT import (this silently dropped FBNeo's arcade.dat and msx.dat).
     // The duplicate is the same file, so skipping it leaves completeness correct.
     let inserted = conn.execute(
-        "INSERT OR IGNORE INTO dat_roms (game_id, name, size, sha1, md5, crc32, status, merge_tag)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-        params![game_id, name, size, sha1, md5, crc32, status, merge_tag],
+        "INSERT OR IGNORE INTO dat_roms (game_id, name, size, sha1, md5, crc32, status, merge_tag, is_disk)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        params![game_id, name, size, sha1, md5, crc32, status, merge_tag, is_disk],
     )?;
     if inserted == 0 {
         // Already present — return the existing row's id, not a stale
@@ -206,7 +244,7 @@ pub fn get_games_for_node(conn: &Connection, node_id: i64) -> Result<Vec<DatGame
 /// Get ROMs for a game
 pub fn get_roms_for_game(conn: &Connection, game_id: i64) -> Result<Vec<DatRom>> {
     let mut stmt = conn.prepare(
-        "SELECT id, game_id, name, size, sha1, md5, crc32, status, merge_tag
+        "SELECT id, game_id, name, size, sha1, md5, crc32, status, merge_tag, is_disk
          FROM dat_roms WHERE game_id = ? ORDER BY name",
     )?;
 
@@ -222,6 +260,7 @@ pub fn get_roms_for_game(conn: &Connection, game_id: i64) -> Result<Vec<DatRom>>
                 crc32: row.get(6)?,
                 status: row.get(7)?,
                 merge_tag: row.get(8)?,
+                is_disk: row.get(9)?,
             })
         })?
         .collect::<Result<Vec<_>, _>>()?;
@@ -311,7 +350,7 @@ pub fn get_games_for_version(conn: &Connection, version_id: i64) -> Result<Vec<D
 /// Find a ROM by SHA1 hash
 pub fn find_rom_by_sha1(conn: &Connection, version_id: i64, sha1: &str) -> Result<Option<DatRom>> {
     let mut stmt = conn.prepare(
-        "SELECT r.id, r.game_id, r.name, r.size, r.sha1, r.md5, r.crc32, r.status, r.merge_tag
+        "SELECT r.id, r.game_id, r.name, r.size, r.sha1, r.md5, r.crc32, r.status, r.merge_tag, r.is_disk
          FROM dat_roms r
          JOIN dat_games g ON r.game_id = g.id
          JOIN dat_nodes n ON g.node_id = n.id
@@ -329,6 +368,7 @@ pub fn find_rom_by_sha1(conn: &Connection, version_id: i64, sha1: &str) -> Resul
             crc32: row.get(6)?,
             status: row.get(7)?,
             merge_tag: row.get(8)?,
+            is_disk: row.get(9)?,
         })
     });
 
@@ -342,7 +382,7 @@ pub fn find_rom_by_sha1(conn: &Connection, version_id: i64, sha1: &str) -> Resul
 /// Get all ROMs for a version (game_name included for convenience)
 pub fn get_roms_for_version(conn: &Connection, version_id: i64) -> Result<Vec<(String, DatRom)>> {
     let mut stmt = conn.prepare(
-        "SELECT g.name, r.id, r.game_id, r.name, r.size, r.sha1, r.md5, r.crc32, r.status, r.merge_tag
+        "SELECT g.name, r.id, r.game_id, r.name, r.size, r.sha1, r.md5, r.crc32, r.status, r.merge_tag, r.is_disk
          FROM dat_roms r
          JOIN dat_games g ON r.game_id = g.id
          JOIN dat_nodes n ON g.node_id = n.id
@@ -364,6 +404,7 @@ pub fn get_roms_for_version(conn: &Connection, version_id: i64) -> Result<Vec<(S
                     crc32: row.get(7)?,
                     status: row.get(8)?,
                     merge_tag: row.get(9)?,
+                    is_disk: row.get(10)?,
                 },
             ))
         })?

@@ -11,6 +11,39 @@ use crate::db::{Database, collections, dats};
 
 use super::{fetch, open_database};
 
+/// Insert one parsed DAT entry, routing a `<disk>` (CHD) to `create_disk` and a
+/// `<rom>` to `create_rom`. A disk has no size/crc and its sha1 is the CHD's
+/// internal hash, so it takes a distinct insert path.
+fn insert_dat_entry(
+    conn: &rusqlite::Connection,
+    game_id: i64,
+    rom: &crate::dat::DatRomEntry,
+) -> Result<i64> {
+    if rom.is_disk {
+        dats::create_disk(
+            conn,
+            game_id,
+            &rom.name,
+            rom.sha1.as_deref(),
+            rom.md5.as_deref(),
+            rom.status.as_str(),
+            rom.merge.as_deref(),
+        )
+    } else {
+        dats::create_rom(
+            conn,
+            game_id,
+            &rom.name,
+            rom.size as i64,
+            rom.sha1.as_deref(),
+            rom.md5.as_deref(),
+            rom.crc32.as_deref(),
+            rom.status.as_str(),
+            rom.merge.as_deref(),
+        )
+    }
+}
+
 /// Run a DAT subcommand
 pub fn run(cmd: DatCommands, data_dir: Option<PathBuf>) -> Result<()> {
     match cmd {
@@ -206,17 +239,7 @@ fn import_dat_file(
         game_count += 1;
 
         for rom in &game.roms {
-            dats::create_rom(
-                conn,
-                game_id,
-                &rom.name,
-                rom.size as i64,
-                rom.sha1.as_deref(),
-                rom.md5.as_deref(),
-                rom.crc32.as_deref(),
-                rom.status.as_str(),
-                rom.merge.as_deref(),
-            )?;
+            insert_dat_entry(conn, game_id, rom)?;
             rom_count += 1;
         }
     }
@@ -1119,17 +1142,7 @@ fn upgrade_dat(
         game_count += 1;
 
         for rom in &game.roms {
-            dats::create_rom(
-                conn,
-                game_id,
-                &rom.name,
-                rom.size as i64,
-                rom.sha1.as_deref(),
-                rom.md5.as_deref(),
-                rom.crc32.as_deref(),
-                rom.status.as_str(),
-                rom.merge.as_deref(),
-            )?;
+            insert_dat_entry(conn, game_id, rom)?;
             rom_count += 1;
         }
     }

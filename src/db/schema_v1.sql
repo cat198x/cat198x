@@ -60,6 +60,7 @@ CREATE TABLE dat_roms (
     crc32 TEXT,
     status TEXT NOT NULL DEFAULT 'good',  -- 'good', 'baddump', 'nodump'
     merge_tag TEXT,           -- For merged sets
+    is_disk INTEGER NOT NULL DEFAULT 0,   -- 1 for a <disk> (CHD); sha1 is the CHD's internal hash
     UNIQUE(game_id, name)
 );
 

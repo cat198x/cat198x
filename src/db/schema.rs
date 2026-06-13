@@ -4,7 +4,7 @@ use anyhow::Result;
 use rusqlite::Connection;
 
 /// Current schema version
-const SCHEMA_VERSION: i32 = 2;
+const SCHEMA_VERSION: i32 = 3;
 
 /// Database wrapper with schema management
 pub struct Database {
@@ -95,6 +95,12 @@ impl Database {
             self.conn.execute_batch(include_str!("schema_v2.sql"))?;
             self.conn
                 .execute("INSERT INTO schema_version (version) VALUES (?)", [2])?;
+        }
+        if from_version < 3 {
+            // Migrate to v3: add is_disk to dat_roms (CHD <disk> support)
+            self.conn.execute_batch(include_str!("schema_v3.sql"))?;
+            self.conn
+                .execute("INSERT INTO schema_version (version) VALUES (?)", [3])?;
         }
         Ok(())
     }

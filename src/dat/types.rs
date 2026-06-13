@@ -26,7 +26,14 @@ pub struct DatGameEntry {
     pub devices: Vec<String>,
 }
 
-/// A ROM entry within a game
+/// A ROM entry within a game.
+///
+/// Also represents a `<disk>` (a CHD hard-disk/CD image) when `is_disk` is set.
+/// A disk carries only a `name` and `sha1` — no `size` or `crc32` — and that
+/// `sha1` is the CHD's *internal* logical-data hash from its header, not the
+/// hash of the `.chd` file's bytes (see `scanner::chd`). The on-disk file is
+/// `<name>.chd`, and disks are always stored loose in a machine folder, never
+/// packed into an archive.
 #[derive(Debug, Clone)]
 pub struct DatRomEntry {
     pub name: String,
@@ -36,6 +43,7 @@ pub struct DatRomEntry {
     pub sha1: Option<String>,
     pub status: RomStatus,
     pub merge: Option<String>,
+    pub is_disk: bool,
 }
 
 /// Status of a ROM dump

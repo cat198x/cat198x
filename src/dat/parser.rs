@@ -168,6 +168,10 @@ fn handle_game_child(e: &quick_xml::events::BytesStart, game: &mut DatGameEntry)
             game.roms.push(parse_rom_attrs(e)?);
             Ok(true)
         }
+        b"disk" => {
+            game.roms.push(parse_disk_attrs(e)?);
+            Ok(true)
+        }
         b"device_ref" => {
             for attr in e.attributes().flatten() {
                 if attr.key.as_ref() == b"name" {
@@ -190,6 +194,7 @@ fn parse_rom_attrs(e: &quick_xml::events::BytesStart) -> Result<DatRomEntry> {
         sha1: None,
         status: RomStatus::Good,
         merge: None,
+        is_disk: false,
     };
 
     for attr in e.attributes().flatten() {
@@ -206,6 +211,37 @@ fn parse_rom_attrs(e: &quick_xml::events::BytesStart) -> Result<DatRomEntry> {
     }
 
     Ok(rom)
+}
+
+/// Parse a `<disk>` element (a CHD image) into a disk-flagged `DatRomEntry`.
+///
+/// Disks carry `name` and `sha1` (the CHD's internal logical-data hash), plus an
+/// optional `md5` and `status` on older DATs. They have no `size` or `crc`. The
+/// matched file on disk is `<name>.chd`, stored loose in a machine folder.
+fn parse_disk_attrs(e: &quick_xml::events::BytesStart) -> Result<DatRomEntry> {
+    let mut disk = DatRomEntry {
+        name: String::new(),
+        size: 0,
+        crc32: None,
+        md5: None,
+        sha1: None,
+        status: RomStatus::Good,
+        merge: None,
+        is_disk: true,
+    };
+
+    for attr in e.attributes().flatten() {
+        match attr.key.as_ref() {
+            b"name" => disk.name = attr_value(&attr)?.to_string(),
+            b"md5" => disk.md5 = Some(attr_value(&attr)?.to_uppercase()),
+            b"sha1" => disk.sha1 = Some(attr_value(&attr)?.to_uppercase()),
+            b"status" => disk.status = RomStatus::parse(&attr_value(&attr)?),
+            b"merge" => disk.merge = Some(attr_value(&attr)?.to_string()),
+            _ => {}
+        }
+    }
+
+    Ok(disk)
 }
 
 /// Decode and unescape an attribute value.
@@ -527,6 +563,45 @@ mod tests {
         assert_eq!(games[0].roms[0].name, "prg0");
         assert_eq!(games[0].roms[1].name, "prg1");
         assert_eq!(games[0].roms[2].name, "chr0");
+    }
+
+    #[test]
+    fn test_parse_disk_element() {
+        // A MAME CHD DAT: <machine> with a self-closing <disk> carrying name +
+        // sha1 (the CHD's internal hash), no size or crc. It must register as a
+        // disk-flagged entry, not be dropped.
+        let xml = r#"<?xml version="1.0"?>
+<datafile>
+  <header><name>MAME CHDs</name></header>
+  <machine name="azumanga">
+    <description>Azumanga Daioh Puzzle Bobble</description>
+    <disk name="gdl-0018" sha1="749a56dd64ab697f17470d8ae797f7e20e9eb646"/>
+  </machine>
+</datafile>"#;
+
+        let (_, games) = parse_dat(xml).unwrap();
+
+        assert_eq!(games[0].roms.len(), 1);
+        let disk = &games[0].roms[0];
+        assert!(disk.is_disk, "disk entry flagged");
+        assert_eq!(disk.name, "gdl-0018");
+        assert_eq!(
+            disk.sha1.as_deref(),
+            Some("749A56DD64AB697F17470D8AE797F7E20E9EB646")
+        );
+        assert_eq!(disk.size, 0);
+        assert!(disk.crc32.is_none());
+    }
+
+    #[test]
+    fn test_parse_rom_is_not_disk() {
+        let xml = r#"<?xml version="1.0"?>
+<datafile>
+  <header><name>Test</name></header>
+  <game name="g"><rom name="a" size="16" sha1="A"/></game>
+</datafile>"#;
+        let (_, games) = parse_dat(xml).unwrap();
+        assert!(!games[0].roms[0].is_disk, "a <rom> is not a disk");
     }
 
     #[test]

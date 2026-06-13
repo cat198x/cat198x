@@ -259,6 +259,7 @@ fn parse_rom_block(tokens: &[String]) -> Option<DatRomEntry> {
         sha1: None,
         status: RomStatus::Good,
         merge: None,
+        is_disk: false,
     };
 
     let mut i = 0;
