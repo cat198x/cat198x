@@ -55,18 +55,33 @@ struct ArchiveEntry {
     hashes: FileHashes,
 }
 
+/// Whether a `--source` selector picks this source: a purely numeric selector
+/// is a source id and matches exactly; anything else matches as a path
+/// substring.
+fn source_matches(source: &files::Source, selector: &str) -> bool {
+    match selector.parse::<i64>() {
+        Ok(id) => source.id == id,
+        Err(_) => source.path.contains(selector),
+    }
+}
+
 /// Run the scan command
 pub fn run(source: Option<Vec<String>>, full: bool, data_dir: Option<PathBuf>) -> Result<()> {
     let db = open_database(data_dir)?;
     let conn = db.conn();
 
     // Get sources to scan
-    let sources = if let Some(paths) = &source {
-        // Filter to specific sources
+    let sources = if let Some(selectors) = &source {
+        // Filter to specific sources. A purely numeric selector is a source id
+        // and matches exactly; anything else matches as a path substring. The
+        // id form exists because substring selection cannot always isolate a
+        // source — one source's path may be a prefix of another's (e.g.
+        // `ToSort/MAME` and `ToSort/MAME 0.288 …`), and digits inside a path
+        // (the `28` in `0.288`) collide with id-like selectors.
         let all_sources = files::list_sources(conn)?;
         all_sources
             .into_iter()
-            .filter(|s| paths.iter().any(|p| s.path.contains(p)))
+            .filter(|s| selectors.iter().any(|sel| source_matches(s, sel)))
             .collect()
     } else {
         files::list_sources(conn)?
@@ -449,5 +464,39 @@ mod tests {
     fn test_parse_sqlite_datetime_invalid() {
         let dt = parse_sqlite_datetime("invalid");
         assert!(dt.is_none());
+    }
+
+    fn source_with(id: i64, path: &str) -> files::Source {
+        files::Source {
+            id,
+            path: path.to_string(),
+            case_sensitive: false,
+            added_at: String::new(),
+            last_scanned: None,
+        }
+    }
+
+    #[test]
+    fn source_matches_numeric_selector_by_id_only() {
+        // The regression this guards: source 31's path contains the digits
+        // "28" (inside "0.288"), so a substring match for the id selector
+        // "28" used to pick the wrong source — and never the intended one.
+        let mame = source_with(28, "/Volumes/Data/ToSort/MAME");
+        let sl = source_with(
+            31,
+            "/Volumes/Data/ToSort/MAME 0.288 Software List ROMs (merged)",
+        );
+
+        assert!(source_matches(&mame, "28"));
+        assert!(!source_matches(&sl, "28"));
+        assert!(source_matches(&sl, "31"));
+        assert!(!source_matches(&mame, "31"));
+    }
+
+    #[test]
+    fn source_matches_non_numeric_selector_by_path_substring() {
+        let mame = source_with(28, "/Volumes/Data/ToSort/MAME");
+        assert!(source_matches(&mame, "ToSort/MAME"));
+        assert!(!source_matches(&mame, "Library/ROMs"));
     }
 }
