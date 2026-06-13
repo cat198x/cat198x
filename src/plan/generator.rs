@@ -10,6 +10,22 @@ use crate::config::OutputFormat;
 use crate::db::{collections, config as db_config, dats};
 use crate::filter::{RomCandidate, parse_game_name, select_preferred};
 
+/// Above this many match-rows, a collection is skipped rather than planned.
+/// `find_matched_roms` materialises every (ROM × held-location) pair, at
+/// roughly half a kilobyte each, so tens of millions of rows would need many
+/// gigabytes and risk OOM. The only collections that reach this are MAME-style
+/// meta-aggregates (e.g. `all_non-zipped_content`) whose "games" list content
+/// held across hundreds of files — not real romsets to place. The largest
+/// legitimate set seen, FinalBurn Neo - Arcade Games, expands to ~7.9M rows,
+/// comfortably under the cap.
+const MAX_MATCH_ROWS: i64 = 20_000_000;
+
+/// A version with fewer ROMs than this cannot plausibly reach `MAX_MATCH_ROWS`
+/// (it would take an implausible average per-ROM fan-out), so the expansion
+/// guard's query is skipped for it. This keeps the guard free for the hundreds
+/// of small collections and pays its cost only for the few large ones.
+const GUARD_ROM_THRESHOLD: i64 = 50_000;
+
 /// A matched ROM ready for planning
 #[derive(Debug, Clone)]
 pub struct MatchedRom {
@@ -199,6 +215,23 @@ pub fn generate_plan_filtered(conn: &Connection, opts: &PlanOptions) -> Result<P
             }
         };
 
+        // Guard against pathological collections before materialising any
+        // matches: a MAME-style meta-aggregate expands to tens of millions of
+        // match-rows and would exhaust memory. Skip-and-report instead of OOM.
+        let match_rows = count_match_rows_capped(conn, version.id, MAX_MATCH_ROWS)?;
+        if match_rows > MAX_MATCH_ROWS {
+            println!(
+                "Skipping {} — match expansion exceeds the {}-row memory cap \
+                 (a meta-aggregate, not a placeable romset).",
+                collection.name, MAX_MATCH_ROWS
+            );
+            plan.skipped_oversized.push(format!(
+                "{} (>{} match-rows)",
+                collection.name, MAX_MATCH_ROWS
+            ));
+            continue;
+        }
+
         planned_any = true;
         println!("Planning for: {} (v{})", collection.name, version.version);
 
@@ -385,12 +418,42 @@ pub fn generate_plan_filtered(conn: &Connection, opts: &PlanOptions) -> Result<P
                         let container = format!("{}/{}", m.source_root, m.source_path);
                         containers.entry(container).or_default().push(m);
                     }
-                    let is_complete = |entries: &[MatchedRom]| {
-                        expected.iter().all(|(name, sha1)| {
-                            entries
-                                .iter()
-                                .any(|m| &m.rom_name == name && m.sha1.eq_ignore_ascii_case(sha1))
-                        })
+                    // Completeness is a set-membership test, not a scan. Merged
+                    // arcade sets share ROMs across thousands of containers (a
+                    // Neo-Geo BIOS ROM can sit in 5,000+ files), so a single
+                    // game's `containers` map is huge; the old per-container
+                    // `expected × entries` scan went quadratic and hung on
+                    // FinalBurn Neo. Build, once per game: a per-container set of
+                    // the (name, sha1) pairs it holds, the size of each ROM by
+                    // name, and an index from each expected entry to the
+                    // containers holding it. SHA1s compare case-insensitively, so
+                    // normalise to lower-case in the keys.
+                    let key =
+                        |name: &str, sha1: &str| (name.to_string(), sha1.to_ascii_lowercase());
+                    let expected_keys: Vec<(String, String)> =
+                        expected.iter().map(|(n, s)| key(n, s)).collect();
+                    let mut container_keys: HashMap<&str, HashSet<(String, String)>> =
+                        HashMap::new();
+                    let mut holders: HashMap<(String, String), Vec<&str>> = HashMap::new();
+                    let mut name_size: HashMap<&str, u64> = HashMap::new();
+                    for (path, entries) in &containers {
+                        let set = container_keys.entry(path.as_str()).or_default();
+                        for m in entries {
+                            name_size
+                                .entry(m.rom_name.as_str())
+                                .or_insert(m.size as u64);
+                            let k = key(&m.rom_name, &m.sha1);
+                            if set.insert(k.clone()) {
+                                holders.entry(k).or_default().push(path.as_str());
+                            }
+                        }
+                    }
+                    // A container is complete iff it holds every expected entry —
+                    // now O(expected) hash lookups, not a nested scan.
+                    let is_complete = |path: &str| {
+                        container_keys
+                            .get(path)
+                            .is_some_and(|set| expected_keys.iter().all(|k| set.contains(k)))
                     };
 
                     // If any of this game's content is shared with another entry,
@@ -400,15 +463,26 @@ pub fn generate_plan_filtered(conn: &Connection, opts: &PlanOptions) -> Result<P
                     let game_shared = expected.iter().any(|(_, sha1)| shared.contains(sha1));
 
                     // The canonical container is the complete one at dest if it
-                    // exists, otherwise a complete one elsewhere we build from.
-                    let complete_at_dest = containers.get(&dest).is_some_and(|e| is_complete(e));
+                    // exists, otherwise a complete one elsewhere we build from. A
+                    // complete container must hold the *rarest* expected entry, so
+                    // only the containers holding it can qualify: in a merged set
+                    // the game's own ROM sits in one or two files while shared ROMs
+                    // sit in thousands, turning a full scan into a few checks.
+                    let complete_at_dest = is_complete(&dest);
                     let build_from = if complete_at_dest {
                         Some(dest.clone())
                     } else {
-                        containers
+                        expected_keys
                             .iter()
-                            .find(|(_, e)| is_complete(e))
-                            .map(|(p, _)| p.clone())
+                            .map(|k| holders.get(k).map(Vec::as_slice).unwrap_or(&[]))
+                            .min_by_key(|paths| paths.len())
+                            .and_then(|candidates| {
+                                candidates
+                                    .iter()
+                                    .copied()
+                                    .find(|&p| is_complete(p))
+                                    .map(str::to_string)
+                            })
                     };
 
                     // A complete archive already staged somewhere other than the
@@ -452,13 +526,7 @@ pub fn generate_plan_filtered(conn: &Connection, opts: &PlanOptions) -> Result<P
                         };
                         let size: u64 = expected
                             .iter()
-                            .filter_map(|(name, _)| {
-                                containers
-                                    .values()
-                                    .flatten()
-                                    .find(|m| &m.rom_name == name)
-                                    .map(|m| m.size as u64)
-                            })
+                            .filter_map(|(name, _)| name_size.get(name.as_str()).copied())
                             .sum();
                         bytes += size;
                         // Consume loose sources only in move mode and only when the
@@ -533,16 +601,86 @@ pub fn generate_plan_filtered(conn: &Connection, opts: &PlanOptions) -> Result<P
         println!("  or library-wide:         cat198x config set-default dest_path <path>");
     }
 
+    // Report collections left out because their match expansion is too large to
+    // plan safely (a meta-aggregate, not a romset). Already named individually
+    // above as they were hit; this is the rollup.
+    if !plan.skipped_oversized.is_empty() {
+        println!();
+        println!(
+            "{} collection(s) skipped — match expansion over the {}-row memory cap.",
+            plan.skipped_oversized.len(),
+            MAX_MATCH_ROWS
+        );
+    }
+
     if let Some(pattern) = dat_filter
         && !filter_matched_any
     {
         println!("No collections match the filter: {}", pattern);
-    } else if !planned_any && skipped_no_dest.is_empty() {
+    } else if !planned_any && skipped_no_dest.is_empty() && plan.skipped_oversized.is_empty() {
         println!("No collections with an active version to plan.");
     }
 
     plan.skipped_no_dest = skipped_no_dest;
     Ok(plan)
+}
+
+/// Count the match-rows a version's plan would materialise, bounded to `cap + 1`.
+///
+/// Mirrors the joins of [`find_matched_roms`] but only counts rows, and the
+/// inner `LIMIT cap + 1` stops the join the moment the cap is reached — so a
+/// pathological collection is detected in bounded time without ever producing
+/// (or holding) its full expansion. A version with too few ROMs to plausibly
+/// reach the cap returns its ROM count directly, skipping the join entirely.
+fn count_match_rows_capped(conn: &Connection, version_id: i64, cap: i64) -> Result<i64> {
+    let rom_count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM dat_roms r
+         JOIN dat_games g ON r.game_id = g.id
+         JOIN dat_nodes n ON g.node_id = n.id
+         WHERE n.version_id = ?1 AND r.status != 'nodump'",
+        [version_id],
+        |row| row.get(0),
+    )?;
+    if rom_count < GUARD_ROM_THRESHOLD {
+        // A lower bound well under the cap — cheap proof the collection is safe.
+        return Ok(rom_count.min(cap));
+    }
+    count_expansion_capped(conn, version_id, cap)
+}
+
+/// The exact match expansion, counted only up to `cap + 1` (the inner `LIMIT`
+/// halts the join there). Split out from the ROM-count gate so the bounded count
+/// is testable without a fixture large enough to pass the gate.
+fn count_expansion_capped(conn: &Connection, version_id: i64, cap: i64) -> Result<i64> {
+    // The expansion is one row per (matched ROM × held location), exactly what
+    // the planner materialises; keep `rom_id` so a SHA1 matching several ROMs
+    // counts once per ROM, matching `find_matched_roms`'s UNION cardinality.
+    let count: i64 = conn.query_row(
+        "WITH vroms AS (
+            SELECT r.id, r.sha1, r.crc32, r.size
+            FROM dat_roms r
+            JOIN dat_games g ON r.game_id = g.id
+            JOIN dat_nodes n ON g.node_id = n.id
+            WHERE n.version_id = ?1 AND r.status != 'nodump'
+         ),
+         matched AS (
+            SELECT vr.id AS rom_id, f.sha1 AS msha1
+            FROM vroms vr JOIN files f ON f.sha1 = vr.sha1 WHERE vr.sha1 IS NOT NULL
+            UNION
+            SELECT vr.id, f.sha1
+            FROM vroms vr JOIN files f ON f.sha1_no_header = vr.sha1 WHERE vr.sha1 IS NOT NULL
+            UNION
+            SELECT vr.id, f.sha1
+            FROM vroms vr JOIN files f ON f.crc32 = vr.crc32 AND f.size = vr.size
+            WHERE vr.sha1 IS NULL AND vr.crc32 IS NOT NULL
+         )
+         SELECT COUNT(*) FROM (
+            SELECT 1 FROM matched m JOIN file_locations fl ON fl.sha1 = m.msha1 LIMIT ?2
+         )",
+        rusqlite::params![version_id, cap + 1],
+        |row| row.get(0),
+    )?;
+    Ok(count)
 }
 
 /// Find all ROMs in one collection version that have a matching held file.
@@ -554,8 +692,11 @@ pub fn generate_plan_filtered(conn: &Connection, opts: &PlanOptions) -> Result<P
 /// from this version's ROMs into the file index and instead scans the whole
 /// `files` table per call (~13s each on a real library). Splitting the modes
 /// into a `UNION` lets each branch use an index (files PK on `sha1`,
-/// `idx_files_sha1_no_header`), so the query starts from the version's ROMs and
-/// runs in milliseconds. We select the *file's* sha1 and size (not the DAT's) —
+/// `idx_files_sha1_no_header`, and `idx_files_crc32_size` for the CRC-only
+/// branch that CRC-only DATs like MAME/FinalBurn Neo rely on), so the query
+/// starts from the version's ROMs and runs in milliseconds rather than
+/// full-scanning the files table per ROM. We select the *file's* sha1 and size
+/// (not the DAT's) —
 /// that's the true content placed at the destination, which
 /// `is_file_correct_at_dest` verifies.
 fn find_matched_roms(
@@ -973,6 +1114,45 @@ mod tests {
         let hash1 = compute_state_hash(conn).unwrap();
         let hash2 = compute_state_hash(conn).unwrap();
         assert_eq!(hash1, hash2);
+    }
+
+    #[test]
+    fn count_expansion_capped_caps_and_counts_with_rom_multiplicity() {
+        let db = setup_db();
+        let conn = db.conn();
+        // Two distinct ROMs share content AAA, which is held in three locations.
+        // The materialised expansion is one row per (matched ROM × location) =
+        // 2 ROMs × 3 locations = 6.
+        let coll = collections::create_collection(conn, "Agg", "mame").unwrap();
+        let vid = collections::add_version(conn, coll, "v1", "/dats/agg.dat", true).unwrap();
+        let node = dats::create_node(conn, vid, None, "Agg", "dat", "MAME").unwrap();
+        let g = dats::create_game(conn, node, "bucket", None, None, false, false, false).unwrap();
+        dats::create_rom(conn, g, "a.rom", 10, Some("AAA"), None, None, "good", None).unwrap();
+        dats::create_rom(conn, g, "b.rom", 10, Some("AAA"), None, None, "good", None).unwrap();
+        conn.execute("INSERT INTO files (sha1, size) VALUES ('AAA', 10)", [])
+            .unwrap();
+        conn.execute(
+            "INSERT INTO sources (id, path, case_sensitive) VALUES (500, '/src', 0)",
+            [],
+        )
+        .unwrap();
+        for i in 0..3 {
+            conn.execute(
+                &format!(
+                    "INSERT INTO file_locations (sha1, source_id, path, archive_path)
+                     VALUES ('AAA', 500, 'loc{i}.zip', 'x.rom')"
+                ),
+                [],
+            )
+            .unwrap();
+        }
+
+        // A generous cap returns the true expansion (6).
+        assert_eq!(count_expansion_capped(conn, vid, 100).unwrap(), 6);
+        // A cap below the expansion is detected without counting past cap + 1.
+        let capped = count_expansion_capped(conn, vid, 4).unwrap();
+        assert_eq!(capped, 5, "the inner LIMIT halts at cap + 1");
+        assert!(capped > 4, "over-cap is reported as exceeding the cap");
     }
 
     #[test]
@@ -1483,6 +1663,110 @@ mod tests {
         assert_eq!(
             plan.summary.delete_count, 0,
             "the shared container is never deleted"
+        );
+    }
+
+    #[test]
+    fn complete_container_found_among_many_shared_only_containers() {
+        let db = setup_db();
+        let conn = db.conn();
+        // A game whose BIOS ROM is held in many containers (as a Neo-Geo BIOS
+        // would be) but whose clone-specific ROM lives in just one — only that
+        // container is complete. The planner must find it by the rarest entry
+        // rather than scanning every BIOS-bearing container (the merged-arcade
+        // quadratic that hung Q7). The BIOS is single-game here, so it is not
+        // "shared content" and the build path is unconstrained.
+        let coll = collections::create_collection(conn, "Arcade", "mame").unwrap();
+        let vid = collections::add_version(conn, coll, "v1", "/dats/a.dat", true).unwrap();
+        let node = dats::create_node(conn, vid, None, "Arcade", "dat", "SET/Sys").unwrap();
+        let g = dats::create_game(conn, node, "neoclone", None, None, false, false, false).unwrap();
+        dats::create_rom(
+            conn,
+            g,
+            "bios.rom",
+            10,
+            Some("B105"),
+            None,
+            None,
+            "good",
+            None,
+        )
+        .unwrap();
+        dats::create_rom(
+            conn,
+            g,
+            "clone.rom",
+            10,
+            Some("C10E"),
+            None,
+            None,
+            "good",
+            None,
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO files (sha1, size) VALUES ('B105', 10), ('C10E', 10)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO sources (id, path, case_sensitive) VALUES (400, '/lib/ToSort/SET', 0)",
+            [],
+        )
+        .unwrap();
+        // The one complete container holds both ROMs.
+        conn.execute(
+            "INSERT INTO file_locations (sha1, source_id, path, archive_path) VALUES
+                ('B105', 400, 'Sys/neoclone.zip', 'bios.rom'),
+                ('C10E', 400, 'Sys/neoclone.zip', 'clone.rom')",
+            [],
+        )
+        .unwrap();
+        // The BIOS ROM is also present in 50 other (BIOS-only) containers.
+        for i in 0..50 {
+            conn.execute(
+                &format!(
+                    "INSERT INTO file_locations (sha1, source_id, path, archive_path)
+                     VALUES ('B105', 400, 'Sys/other{i}.zip', 'bios.rom')"
+                ),
+                [],
+            )
+            .unwrap();
+        }
+        db_config::set_output_format(conn, "SET", "zip").unwrap();
+
+        // Copy mode: no relocates/deletes, just the build — so the assertion
+        // isolates which container the planner chose to build from.
+        let plan = generate_plan_filtered(
+            conn,
+            &PlanOptions {
+                default_dest: Some("/lib/ROMs".to_string()),
+                default_format: OutputFormat::Loose,
+                move_files: false,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        // Exactly one archive built, sourced entirely from the one complete
+        // container — never from a BIOS-only container (which lacks clone.rom).
+        assert_eq!(plan.summary.repack_count, 1);
+        let sources: Vec<String> = plan
+            .operations
+            .iter()
+            .filter_map(|op| match &op.kind {
+                OperationKind::Repack { sources, .. } => Some(sources.clone()),
+                _ => None,
+            })
+            .flatten()
+            .map(|s| s.path)
+            .collect();
+        assert!(!sources.is_empty());
+        assert!(
+            sources
+                .iter()
+                .all(|p| p == "/lib/ToSort/SET/Sys/neoclone.zip"),
+            "repack must build from the one complete container, got {sources:?}"
         );
     }
 

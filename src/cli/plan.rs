@@ -62,6 +62,18 @@ pub fn run(
         println!("  Full list written to: {}", skipped_path.display());
     }
 
+    // Write the oversized-collection list (match expansion over the memory cap)
+    // for review — these are meta-aggregates, not placeable romsets.
+    if !plan.skipped_oversized.is_empty() {
+        let oversized_path = data_dir.join("skipped-oversized.txt");
+        let mut names = plan.skipped_oversized.clone();
+        names.sort();
+        names.push(String::new()); // trailing newline
+        fs::write(&oversized_path, names.join("\n"))
+            .context("Failed to write oversized-collection list")?;
+        println!("  Oversized list written to: {}", oversized_path.display());
+    }
+
     if plan.is_empty() {
         println!();
         println!("No operations needed.");

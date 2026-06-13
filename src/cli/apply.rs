@@ -138,6 +138,7 @@ pub fn run(
                 dest,
                 format,
                 move_sources,
+                ..
             } = &op.kind
             {
                 // Leave repacks pending for a later pass when deferred, so the

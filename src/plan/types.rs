@@ -17,6 +17,11 @@ pub struct Plan {
     /// (not part of the persisted plan) — surfaced to the user after planning.
     #[serde(skip)]
     pub skipped_no_dest: Vec<String>,
+    /// Collections skipped because their match expansion exceeds the memory-safe
+    /// cap — a MAME-style meta-aggregate that lists content held across hundreds
+    /// of files. Each entry is `"<name> (<rows> match-rows)"`. Transient.
+    #[serde(skip)]
+    pub skipped_oversized: Vec<String>,
     /// Per-collection operation tallies, for a reviewable breakdown. Transient.
     #[serde(skip)]
     pub per_collection: Vec<CollectionPlanStat>,
@@ -102,6 +107,11 @@ pub enum OperationKind {
         sources: Vec<SourceRef>,
         dest: String,
         format: String,
+        /// Bytes the rebuilt archive will hold — the planner already knows this,
+        /// so the space check uses it instead of stat-ing every source over the
+        /// (network) mount. Defaults to 0 for plans written before it was stored.
+        #[serde(default)]
+        size: u64,
         /// Move mode: delete the loose source files once the archive is built
         /// and verified (a true in-place tidy). Archive-member sources are never
         /// deleted — that would destroy a container shared with other games.
@@ -146,6 +156,7 @@ impl Plan {
             operations: Vec::new(),
             summary: PlanSummary::default(),
             skipped_no_dest: Vec::new(),
+            skipped_oversized: Vec::new(),
             per_collection: Vec::new(),
         }
     }
@@ -205,6 +216,7 @@ impl Plan {
                 sources,
                 dest,
                 format,
+                size,
                 move_sources,
             },
         });
@@ -402,6 +414,7 @@ mod tests {
             ],
             dest: "/dest/game.zip".to_string(),
             format: "zip".to_string(),
+            size: 2048,
             move_sources: false,
         };
 
