@@ -661,74 +661,66 @@ fn extract_from_7z(archive_path: &str, entry_path: &str, dest_path: &str) -> Res
     Ok(())
 }
 
-/// Check if there's enough disk space for all planned operations
+/// Check there's enough free space for everything the plan will write.
 ///
-/// Groups operations by destination filesystem mount point and checks
-/// available space against total bytes to write.
+/// Counts only genuinely new bytes, grouped by destination volume. A same-volume
+/// `Move` or `Relocate` is a rename — it frees as much as it consumes, so it
+/// needs no space; only copies, cross-volume moves, and the transient archive a
+/// repack builds count. This matters for a `--move` in-place tidy, where the
+/// moves dominate the byte total yet need no space at all.
+///
+/// Bucketing by volume (not per destination directory) also keeps this to one
+/// free-space query per volume instead of thousands of `stat`s over a network
+/// mount, and the repack size comes from the plan rather than from stat-ing
+/// every source file.
 pub fn check_disk_space(plan: &Plan) -> Result<()> {
-    // Group bytes needed by destination directory (filesystem mount approximation)
-    let mut bytes_by_dest: HashMap<String, u64> = HashMap::new();
+    let mut bytes_by_volume: HashMap<String, u64> = HashMap::new();
 
     for op in &plan.operations {
         if op.status != OperationStatus::Pending {
             continue;
         }
 
-        match &op.kind {
-            OperationKind::Copy { dest, size, .. }
-            | OperationKind::Move { dest, size, .. }
-            | OperationKind::Relocate { dest, size, .. } => {
-                // Get the parent directory as a rough mount point indicator
-                let dest_dir = Path::new(dest)
-                    .parent()
-                    .and_then(|p| p.to_str())
-                    .unwrap_or("/")
-                    .to_string();
+        let (dest, needed): (&str, u64) = match &op.kind {
+            OperationKind::Copy { dest, size, .. } => (dest, *size),
+            OperationKind::Move { source, dest, size } => (
+                dest,
+                if same_volume(&source.path, dest) {
+                    0
+                } else {
+                    *size
+                },
+            ),
+            OperationKind::Relocate { source, dest, size } => {
+                (dest, if same_volume(source, dest) { 0 } else { *size })
+            }
+            // A repack builds a new archive at dest; while it is written its
+            // sources still exist (move-mode deletion happens only after the
+            // archive verifies), so the transient peak is the archive size.
+            OperationKind::Repack { dest, size, .. } => (dest, *size),
+            // Deletes free space.
+            OperationKind::Delete { .. } => continue,
+            // Quarantine writes into the data dir, a separate space concern from
+            // the library volume — not checked here.
+            OperationKind::Quarantine { .. } => continue,
+        };
 
-                *bytes_by_dest.entry(dest_dir).or_insert(0) += size;
-            }
-            OperationKind::Repack { sources, dest, .. } => {
-                // For repack, estimate size as sum of source sizes
-                let total_size: u64 = sources
-                    .iter()
-                    .filter_map(|s| {
-                        // Try to get file size from source path
-                        fs::metadata(&s.path).ok().map(|m| m.len())
-                    })
-                    .sum();
-
-                let dest_dir = Path::new(dest)
-                    .parent()
-                    .and_then(|p| p.to_str())
-                    .unwrap_or("/")
-                    .to_string();
-
-                *bytes_by_dest.entry(dest_dir).or_insert(0) += total_size;
-            }
-            OperationKind::Delete { .. } => {
-                // Deletes free space, don't count
-            }
-            OperationKind::Quarantine { size, .. } => {
-                // Quarantine moves to data_dir/quarantine, need space there
-                // We'll approximate by using a standard quarantine path
-                // In practice this should be the data_dir but we don't have it here
-                // For now, just account for the size in a general bucket
-                *bytes_by_dest.entry("quarantine".to_string()).or_insert(0) += size;
-            }
+        if needed == 0 {
+            continue;
         }
+        *bytes_by_volume.entry(volume_root(dest)).or_insert(0) += needed;
     }
 
-    // Check available space for each destination
-    for (dest_dir, bytes_needed) in &bytes_by_dest {
-        let available = get_available_space(dest_dir)?;
+    for (volume, bytes_needed) in &bytes_by_volume {
+        let available = get_available_space(volume)?;
 
         // Add 10% safety margin
         let bytes_with_margin = (*bytes_needed as f64 * 1.1) as u64;
 
         if available < bytes_with_margin {
             anyhow::bail!(
-                "Insufficient space in '{}': need {} (with 10% margin), have {}",
-                dest_dir,
+                "Insufficient space on '{}': need {} (with 10% margin), have {}",
+                volume,
                 format_bytes(bytes_with_margin),
                 format_bytes(available)
             );
@@ -736,6 +728,25 @@ pub fn check_disk_space(plan: &Plan) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// The volume root of an absolute path — `/Volumes/<name>` for a mounted volume,
+/// otherwise `/`. A string test, so it costs no `stat` over a network mount.
+/// A nested mount under `/Volumes/<name>` is treated as the same volume; the
+/// library is one tree per volume, so this is exact in practice and only ever
+/// conservative (it never under-reserves space).
+fn volume_root(path: &str) -> String {
+    let mut comps = path.trim_start_matches('/').split('/');
+    match (comps.next(), comps.next()) {
+        (Some("Volumes"), Some(name)) if !name.is_empty() => format!("/Volumes/{name}"),
+        _ => "/".to_string(),
+    }
+}
+
+/// Whether two paths live on the same volume, so a move between them is a rename
+/// that needs no new space.
+fn same_volume(a: &str, b: &str) -> bool {
+    volume_root(a) == volume_root(b)
 }
 
 /// Get available disk space for a path (in bytes)
@@ -1593,5 +1604,53 @@ mod tests {
 
         assert!(execute_repack(&sources, dest.to_str().unwrap(), "7z", false).is_err());
         assert!(!dest.exists());
+    }
+
+    #[test]
+    fn volume_root_and_same_volume() {
+        assert_eq!(
+            volume_root("/Volumes/Data/Library/ROMs/x.zip"),
+            "/Volumes/Data"
+        );
+        assert_eq!(volume_root("/Volumes/Data"), "/Volumes/Data");
+        assert_eq!(volume_root("/Users/me/roms/x.zip"), "/");
+        assert_eq!(volume_root("/"), "/");
+        // ToSort and Library on the same volume compare equal.
+        assert!(same_volume(
+            "/Volumes/Data/ToSort/MAME/g.zip",
+            "/Volumes/Data/Library/ROMs/MAME/g.zip"
+        ));
+        // Different volumes do not.
+        assert!(!same_volume("/Volumes/Data/x.zip", "/Volumes/Backup/x.zip"));
+    }
+
+    #[test]
+    fn check_disk_space_ignores_same_volume_moves() {
+        // A same-volume move is a rename — it needs no space, however large. Were
+        // it counted, this u64::MAX move would fail the check; it must pass.
+        let mut plan = Plan::new("h".to_string());
+        let src = SourceRef {
+            path: "/Volumes/Data/ToSort/big.bin".to_string(),
+            archive_path: None,
+            sha1: "a".to_string(),
+            entry_name: None,
+        };
+        plan.add_move(src, "/Volumes/Data/Library/big.bin".to_string(), u64::MAX);
+        assert!(check_disk_space(&plan).is_ok());
+    }
+
+    #[test]
+    fn check_disk_space_counts_cross_volume_moves() {
+        // A cross-volume move genuinely needs space at the destination, so an
+        // impossible u64::MAX move must be refused.
+        let mut plan = Plan::new("h".to_string());
+        let src = SourceRef {
+            path: "/Volumes/Data/big.bin".to_string(),
+            archive_path: None,
+            sha1: "a".to_string(),
+            entry_name: None,
+        };
+        plan.add_move(src, "/Volumes/Backup/big.bin".to_string(), u64::MAX);
+        assert!(check_disk_space(&plan).is_err());
     }
 }
