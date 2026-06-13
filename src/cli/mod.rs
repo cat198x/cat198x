@@ -8,6 +8,7 @@ pub mod export;
 pub mod fetch;
 pub mod init;
 pub mod plan;
+pub mod prune;
 pub mod quarantine;
 pub mod scan;
 pub mod source;
