@@ -4,10 +4,10 @@ use clap_complete::{Shell, generate};
 use std::io;
 
 use cat198x::cli::{
-    apply as apply_cmd, config as config_cmd, dat as dat_cmd, doctor as doctor_cmd,
-    export as export_cmd, init, plan as plan_cmd, prune as prune_cmd, quarantine as quarantine_cmd,
-    scan, source, stats as stats_cmd, status, torrent as torrent_cmd, unknowns as unknowns_cmd,
-    update as update_cmd,
+    apply as apply_cmd, catalogue as catalogue_cmd, config as config_cmd, dat as dat_cmd,
+    doctor as doctor_cmd, export as export_cmd, init, plan as plan_cmd, prune as prune_cmd,
+    quarantine as quarantine_cmd, scan, source, stats as stats_cmd, status, torrent as torrent_cmd,
+    unknowns as unknowns_cmd, update as update_cmd,
 };
 use cat198x::{ConfigCommands, DatCommands, QuarantineCommands, SourceCommands, TorrentCommands};
 
@@ -80,6 +80,20 @@ enum Commands {
 
     /// List scanned files matched by no active DAT (written to a file for review)
     Unknowns,
+
+    /// Record into the catalogue the library files a completed plan placed, and
+    /// register the library as a source, so re-plans converge without re-hashing
+    /// or re-transferring already-placed content. Reports by default.
+    CataloguePlacements {
+        /// Preview the count without writing to the catalogue.
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Restrict to saved plans whose file name contains this value (e.g. a
+        /// plan hash). Default: every saved plan.
+        #[arg(long)]
+        plan: Option<String>,
+    },
 
     /// Remove directories left empty after a `--move` tidy (e.g. emptied
     /// `ToSort/…` folders). Reports by default; only `fs::remove_dir` is used, so
@@ -254,6 +268,9 @@ fn main() -> Result<()> {
             merge_mode,
         } => status::run(collection, detailed, merge_mode, cli.data_dir),
         Commands::Unknowns => unknowns_cmd::run(cli.data_dir),
+        Commands::CataloguePlacements { dry_run, plan } => {
+            catalogue_cmd::run(dry_run, plan, cli.data_dir)
+        }
         Commands::PruneEmpty {
             source,
             remove,
