@@ -1,6 +1,7 @@
 //! CLI command implementations
 
 pub mod apply;
+pub mod catalogue;
 pub mod config;
 pub mod dat;
 pub mod doctor;

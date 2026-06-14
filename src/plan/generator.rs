@@ -377,7 +377,7 @@ pub fn generate_plan_filtered(conn: &Connection, opts: &PlanOptions) -> Result<P
                                 continue;
                             }
                             let path = format!("{}/{}", m.source_root, m.source_path);
-                            if path == dest {
+                            if path == dest || is_in_library(&path, default_dest, &dest_root) {
                                 continue;
                             }
                             plan.add_delete(path);
@@ -554,6 +554,7 @@ pub fn generate_plan_filtered(conn: &Connection, opts: &PlanOptions) -> Result<P
                             if *path == dest
                                 || build_from.as_deref() == Some(path.as_str())
                                 || shared_containers.contains(path)
+                                || is_in_library(path, default_dest, &dest_root)
                             {
                                 continue;
                             }
@@ -859,6 +860,22 @@ struct DiskPlanCounts {
 ///
 /// The DAT disk name has no extension; `.chd` is appended here so the
 /// destination matches the on-disk file.
+/// Whether `path` is a file already placed under a destination library root, so
+/// it must never be removed as a "duplicate". A file in the library is the
+/// canonical copy for its own game, not a stray staging copy. Without this guard
+/// the move-mode dedup would delete one game's placement while deduping another's
+/// — notably a merged-set ROM shared across a parent and its clones, which is a
+/// single DAT game (so [`compute_shared_content`] does not flag it as shared) yet
+/// is legitimately placed at every clone's destination. Staging copies (under
+/// `ToSort/`, outside any destination root) are still removed as before.
+fn is_in_library(path: &str, default_dest: Option<&str>, dest_root: &str) -> bool {
+    let under = |root: &str| {
+        let root = root.trim_end_matches('/');
+        path == root || path.starts_with(&format!("{root}/"))
+    };
+    under(dest_root) || default_dest.is_some_and(under)
+}
+
 fn plan_disk_matches(
     matches: Vec<MatchedRom>,
     dest_root: &str,
@@ -915,7 +932,7 @@ fn plan_disk_matches(
                     continue;
                 }
                 let path = format!("{}/{}", m.source_root, m.source_path);
-                if path == dest {
+                if path == dest || is_in_library(&path, opts.default_dest.as_deref(), dest_root) {
                     continue;
                 }
                 plan.add_delete(path);
@@ -1212,6 +1229,108 @@ mod tests {
         assert_eq!(
             resolve_dest_root(Some("/explicit/here"), Some("/lib"), "Acorn/BBC"),
             Some("/explicit/here".to_string())
+        );
+    }
+
+    #[test]
+    fn is_in_library_protects_destination_files_not_staging() {
+        let dd = Some("/lib/ROMs");
+        // Any file under the library root is a placement — protected, even one
+        // belonging to a different collection than the one being planned.
+        assert!(is_in_library(
+            "/lib/ROMs/MAME/g/r.bin",
+            dd,
+            "/lib/ROMs/FBNeo"
+        ));
+        assert!(is_in_library(
+            "/lib/ROMs/FBNeo/g/r.bin",
+            dd,
+            "/lib/ROMs/FBNeo"
+        ));
+        // A staging copy outside every destination root is still removable.
+        assert!(!is_in_library(
+            "/Volumes/ToSort/x.zip",
+            dd,
+            "/lib/ROMs/FBNeo"
+        ));
+        // With no library-wide default, the collection's own dest_root still
+        // protects its placements.
+        assert!(is_in_library(
+            "/lib/ROMs/FBNeo/g/r.bin",
+            None,
+            "/lib/ROMs/FBNeo"
+        ));
+        // A sibling path that merely shares a prefix is not "under" the root.
+        assert!(!is_in_library("/lib/ROMs2/x", dd, "/lib/ROMs/FBNeo"));
+    }
+
+    #[test]
+    fn dedup_never_deletes_a_placed_library_copy() {
+        let db = setup_db();
+        let conn = db.conn();
+        // One single-ROM game whose content is held at three places: the canonical
+        // destination (already correct), a *second* library path — a sibling
+        // placement, as a merged-set clone would have (one DAT game, so not
+        // flagged as shared content) — and a stray copy under ToSort.
+        let coll = collections::create_collection(conn, "Merge Coll", "mame").unwrap();
+        let vid = collections::add_version(conn, coll, "v1", "/dats/m.dat", true).unwrap();
+        let node = dats::create_node(conn, vid, None, "Merge Coll", "dat", "SET/Sys").unwrap();
+        let g = dats::create_game(conn, node, "Game", None, None, false, false, false).unwrap();
+        dats::create_rom(
+            conn,
+            g,
+            "shared.bin",
+            10,
+            Some("SSS"),
+            None,
+            None,
+            "good",
+            None,
+        )
+        .unwrap();
+        conn.execute("INSERT INTO files (sha1, size) VALUES ('SSS', 10)", [])
+            .unwrap();
+        conn.execute(
+            "INSERT INTO sources (id, path, case_sensitive) VALUES
+                (1, '/lib/ROMs/SET/Sys', 0),
+                (2, '/lib/ROMs/SET/Sys/clone', 0),
+                (3, '/lib/ToSort/SET', 0)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO file_locations (sha1, source_id, path, archive_path) VALUES
+                ('SSS', 1, 'shared.bin', NULL),
+                ('SSS', 2, 'shared.bin', NULL),
+                ('SSS', 3, 'shared.bin', NULL)",
+            [],
+        )
+        .unwrap();
+
+        let plan = generate_plan_filtered(
+            conn,
+            &PlanOptions {
+                default_dest: Some("/lib/ROMs".to_string()),
+                default_format: OutputFormat::Loose,
+                move_files: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        // Only the ToSort stray is deleted; both library copies are left in place.
+        let deleted: Vec<_> = plan
+            .operations
+            .iter()
+            .filter_map(|op| match &op.kind {
+                OperationKind::Delete { path } => Some(path.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            deleted,
+            vec!["/lib/ToSort/SET/shared.bin".to_string()],
+            "a placed library copy must never be deleted as a duplicate"
         );
     }
 
