@@ -80,25 +80,50 @@ pub fn generate_plan(conn: &Connection) -> Result<Plan> {
     generate_plan_filtered(conn, &PlanOptions::default())
 }
 
-/// The SHA1s whose content belongs to more than one distinct DAT game across all
-/// active versions — genuinely distinct catalogue entries that happen to be
-/// byte-identical (multi-disk sets sharing a data disk, re-releases, common
-/// loaders). Such content must be *copied* to each destination and never moved
-/// or deleted: a single physical file can be the matched source for many
-/// destinations, and consuming it to satisfy one strands the rest. Restricted to
-/// content we actually hold, since only held content can be placed anywhere.
+/// The held-content SHA1s whose content satisfies more than one distinct DAT game
+/// across all active versions — genuinely distinct catalogue entries that happen
+/// to be byte-identical (multi-disk sets sharing a data disk, re-releases, common
+/// loaders, a parent/clone romset). Such content must be *copied* to each
+/// destination and never moved or deleted: a single physical file can be the
+/// matched source for many destinations, and consuming it to satisfy one strands
+/// the rest.
+///
+/// The key is the **held file's** SHA1 (what `MatchedRom.sha1` carries), and the
+/// match mirrors `find_matched_roms` exactly — direct SHA1, headerless SHA1, or
+/// CRC32 + size for SHA1-less DAT entries. The CRC32 arm is load-bearing for
+/// arcade: MAME/FinalBurn Neo DATs are CRC-only (NULL `sha1`), so a SHA1-only
+/// match silently classed their shared romsets as *not* shared, letting the
+/// planner relocate or delete a container several games depend on.
 fn compute_shared_content(conn: &Connection) -> Result<HashSet<String>> {
     let mut stmt = conn.prepare(
-        "SELECT r.sha1
-           FROM dat_roms r
-           JOIN dat_games g ON g.id = r.game_id
-           JOIN dat_nodes dn ON dn.id = g.node_id
-           JOIN collection_versions cv ON cv.id = dn.version_id
-          WHERE cv.is_active = 1
-            AND r.sha1 IS NOT NULL AND r.sha1 <> ''
-            AND r.sha1 IN (SELECT sha1 FROM file_locations)
-          GROUP BY r.sha1
-          HAVING COUNT(DISTINCT g.id) > 1",
+        "WITH active_roms AS (
+             SELECT r.sha1 AS rom_sha1, r.crc32 AS rom_crc32, r.size AS rom_size,
+                    g.id AS game_id
+               FROM dat_roms r
+               JOIN dat_games g ON g.id = r.game_id
+               JOIN dat_nodes dn ON dn.id = g.node_id
+               JOIN collection_versions cv ON cv.id = dn.version_id
+              WHERE cv.is_active = 1
+         ),
+         matched AS (
+             SELECT f.sha1 AS file_sha1, ar.game_id
+               FROM files f JOIN active_roms ar ON f.sha1 = ar.rom_sha1
+              WHERE ar.rom_sha1 IS NOT NULL AND ar.rom_sha1 <> ''
+             UNION
+             SELECT f.sha1, ar.game_id
+               FROM files f JOIN active_roms ar ON f.sha1_no_header = ar.rom_sha1
+              WHERE ar.rom_sha1 IS NOT NULL AND ar.rom_sha1 <> ''
+             UNION
+             SELECT f.sha1, ar.game_id
+               FROM files f JOIN active_roms ar
+                    ON f.crc32 = ar.rom_crc32 AND f.size = ar.rom_size
+              WHERE ar.rom_sha1 IS NULL AND ar.rom_crc32 IS NOT NULL
+         )
+         SELECT file_sha1
+           FROM matched
+          WHERE file_sha1 IN (SELECT sha1 FROM file_locations)
+          GROUP BY file_sha1
+         HAVING COUNT(DISTINCT game_id) > 1",
     )?;
     let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
     let mut set = HashSet::new();
@@ -108,7 +133,7 @@ fn compute_shared_content(conn: &Connection) -> Result<HashSet<String>> {
     Ok(set)
 }
 
-/// The source archive files whose inner entries belong to more than one distinct
+/// The source archive files whose inner entries satisfy more than one distinct
 /// DAT game — a single physical container holding ROMs for several games (a
 /// multi-program bundle, a romset shared across parent/clone, etc.). Such a
 /// container must never be *relocated* whole or deleted to satisfy one game, or
@@ -116,18 +141,52 @@ fn compute_shared_content(conn: &Connection) -> Result<HashSet<String>> {
 /// instead (which extracts only its own entries and leaves the container in
 /// place). The key is the full source path (`source_root/source_path`), matching
 /// the container key used during planning.
+///
+/// Entries match DAT ROMs the same three ways as `find_matched_roms` — direct
+/// SHA1, headerless SHA1, or CRC32 + size for SHA1-less entries — joining through
+/// `files` to reach the CRC32/size of each held entry. The CRC32 arm is what
+/// makes this correct for CRC-only arcade DATs (MAME/FinalBurn Neo): without it a
+/// merged container sourcing a parent and its clones reads as serving one game,
+/// so the planner relocates it to the parent and the clones' relocations then
+/// race on a vanished source.
 fn compute_shared_containers(conn: &Connection) -> Result<HashSet<String>> {
     let mut stmt = conn.prepare(
-        "SELECT s.path || '/' || fl.path
-           FROM file_locations fl
-           JOIN sources s ON s.id = fl.source_id
-           JOIN dat_roms r ON r.sha1 = fl.sha1
-           JOIN dat_games g ON g.id = r.game_id
-           JOIN dat_nodes dn ON dn.id = g.node_id
-           JOIN collection_versions cv ON cv.id = dn.version_id
-          WHERE cv.is_active = 1 AND fl.archive_path IS NOT NULL
-          GROUP BY fl.source_id, fl.path
-          HAVING COUNT(DISTINCT g.id) > 1",
+        "WITH container_games AS (
+             SELECT fl.source_id, fl.path, g.id AS game_id
+               FROM file_locations fl
+               JOIN files f ON f.sha1 = fl.sha1
+               JOIN dat_roms r ON r.sha1 = f.sha1
+               JOIN dat_games g ON g.id = r.game_id
+               JOIN dat_nodes dn ON dn.id = g.node_id
+               JOIN collection_versions cv ON cv.id = dn.version_id
+              WHERE cv.is_active = 1 AND fl.archive_path IS NOT NULL
+                AND r.sha1 IS NOT NULL AND r.sha1 <> ''
+             UNION
+             SELECT fl.source_id, fl.path, g.id
+               FROM file_locations fl
+               JOIN files f ON f.sha1 = fl.sha1
+               JOIN dat_roms r ON r.sha1 = f.sha1_no_header
+               JOIN dat_games g ON g.id = r.game_id
+               JOIN dat_nodes dn ON dn.id = g.node_id
+               JOIN collection_versions cv ON cv.id = dn.version_id
+              WHERE cv.is_active = 1 AND fl.archive_path IS NOT NULL
+                AND r.sha1 IS NOT NULL AND r.sha1 <> ''
+             UNION
+             SELECT fl.source_id, fl.path, g.id
+               FROM file_locations fl
+               JOIN files f ON f.sha1 = fl.sha1
+               JOIN dat_roms r ON r.crc32 = f.crc32 AND r.size = f.size
+               JOIN dat_games g ON g.id = r.game_id
+               JOIN dat_nodes dn ON dn.id = g.node_id
+               JOIN collection_versions cv ON cv.id = dn.version_id
+              WHERE cv.is_active = 1 AND fl.archive_path IS NOT NULL
+                AND r.sha1 IS NULL AND r.crc32 IS NOT NULL
+         )
+         SELECT s.path || '/' || cg.path
+           FROM container_games cg
+           JOIN sources s ON s.id = cg.source_id
+          GROUP BY cg.source_id, cg.path
+         HAVING COUNT(DISTINCT cg.game_id) > 1",
     )?;
     let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
     let mut set = HashSet::new();
@@ -1752,6 +1811,89 @@ mod tests {
         assert_eq!(
             copies,
             vec!["/lib/ROMs/MAME/azumanga/gdl-0018.chd".to_string()]
+        );
+    }
+
+    #[test]
+    fn shared_detection_matches_crc_only_arcade_content() {
+        // Arcade DATs (MAME / FinalBurn Neo) are CRC-only: their ROMs have a NULL
+        // sha1 and match held content by CRC32 + size. A SHA1-only shared check
+        // missed them, so a container several games depend on read as unshared and
+        // became eligible for a whole-archive relocate. Both detectors must see it.
+        let db = setup_db();
+        let conn = db.conn();
+        let coll = collections::create_collection(conn, "Arcade", "mame").unwrap();
+        let vid = collections::add_version(conn, coll, "v1", "/dats/a.dat", true).unwrap();
+        let node = dats::create_node(conn, vid, None, "Arcade", "dat", "ARCADE").unwrap();
+
+        // Two distinct games whose ROM is the same content, declared CRC-only
+        // (sha1 = None) as arcade DATs do.
+        let parent =
+            dats::create_game(conn, node, "2010", None, None, false, false, false).unwrap();
+        dats::create_rom(
+            conn,
+            parent,
+            "p.rom",
+            100,
+            None,
+            None,
+            Some("AABBCCDD"),
+            "good",
+            None,
+        )
+        .unwrap();
+        let clone = dats::create_game(
+            conn,
+            node,
+            "2010p1",
+            None,
+            Some("2010"),
+            false,
+            false,
+            false,
+        )
+        .unwrap();
+        dats::create_rom(
+            conn,
+            clone,
+            "p.rom",
+            100,
+            None,
+            None,
+            Some("AABBCCDD"),
+            "good",
+            None,
+        )
+        .unwrap();
+
+        // One held file (real sha1) carrying that CRC32/size, inside one archive.
+        conn.execute(
+            "INSERT INTO files (sha1, crc32, size) VALUES ('FILESHA', 'AABBCCDD', 100)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO sources (id, path, case_sensitive) VALUES (500, '/lib/ToSort/ARCADE', 0)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO file_locations (sha1, source_id, path, archive_path)
+             VALUES ('FILESHA', 500, '2010.zip', 'p.rom')",
+            [],
+        )
+        .unwrap();
+
+        let shared = compute_shared_content(conn).unwrap();
+        assert!(
+            shared.contains("FILESHA"),
+            "CRC-only content shared across two games must be flagged shared"
+        );
+
+        let containers = compute_shared_containers(conn).unwrap();
+        assert!(
+            containers.contains("/lib/ToSort/ARCADE/2010.zip"),
+            "a container sourcing two games by CRC32 must be flagged shared (repack, not relocate)"
         );
     }
 
