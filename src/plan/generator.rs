@@ -6,7 +6,7 @@ use sha2::{Digest as Sha2Digest, Sha256};
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use super::{CollectionPlanStat, Plan, SourceRef};
-use crate::config::OutputFormat;
+use crate::config::{MergeMode, OutputFormat};
 use crate::db::{collections, config as db_config, dats};
 use crate::filter::{RomCandidate, parse_game_name, select_preferred};
 
@@ -64,6 +64,12 @@ pub struct PlanOptions {
     pub default_dest: Option<String>,
     /// Output format for collections without their own setting.
     pub default_format: OutputFormat,
+    /// Merge mode for collections without their own setting. Controls MAME-style
+    /// parent/clone placement: `Split` (the implemented target) drops a clone's
+    /// merge-tagged inherited ROMs from its placement — they live in the parent —
+    /// so the clone's archive/folder holds only its own unique ROMs. `NonMerged`
+    /// (the default) places every ROM a game's DAT entry lists, parent or clone.
+    pub default_merge_mode: MergeMode,
     /// Move files into place (and delete the source) instead of copying — a true
     /// in-place tidy rather than a duplicating copy. Off (copy) by default.
     pub move_files: bool,
@@ -235,8 +241,45 @@ pub fn generate_plan_filtered(conn: &Connection, opts: &PlanOptions) -> Result<P
         planned_any = true;
         println!("Planning for: {} (v{})", collection.name, version.version);
 
-        // Find all matched ROMs for this version.
-        let matches = find_matched_roms(conn, version.id, &collection.name)?;
+        // Effective merge mode, resolved like the output format: an explicit
+        // per-collection setting wins, then a per-set rule (a config row keyed on
+        // the set — the top segment of the library path), then the library-wide
+        // default. Split mode drops a clone's inherited (merge-tagged) ROMs from
+        // its placement so they live only in the parent; non-merged places every
+        // ROM the DAT lists per game. Merged is not yet wired in the planner.
+        let explicit_merge = cfg.as_ref().and_then(|c| c.merge_mode.clone());
+        let set_merge = match explicit_merge {
+            Some(_) => None,
+            None => {
+                let set = hierarchy.split('/').next().unwrap_or(hierarchy.as_str());
+                if set != hierarchy {
+                    db_config::get_collection_config(conn, set)?.and_then(|c| c.merge_mode)
+                } else {
+                    None
+                }
+            }
+        };
+        let merge_mode = resolve_merge_mode(
+            explicit_merge.as_deref().or(set_merge.as_deref()),
+            opts.default_merge_mode,
+        );
+        if merge_mode == MergeMode::Merged {
+            println!(
+                "  note: merged mode is not yet implemented in the planner; \
+                 planning {} as non-merged.",
+                collection.name
+            );
+        }
+
+        // Find all matched ROMs for this version. In split mode, a clone's
+        // merge-tagged inherited ROMs are excluded here (they belong to the
+        // parent), so the clone is placed with only its own unique ROMs.
+        let matches = find_matched_roms(
+            conn,
+            version.id,
+            &collection.name,
+            merge_mode == MergeMode::Split,
+        )?;
 
         // Apply 1G1R filtering if enabled for this collection.
         let matches = match cfg.as_ref().and_then(|c| c.extra_config.as_ref()) {
@@ -704,14 +747,22 @@ fn find_matched_roms(
     conn: &Connection,
     version_id: i64,
     collection_name: &str,
+    split: bool,
 ) -> Result<Vec<MatchedRom>> {
     let mut stmt = conn.prepare(
+        // The split filter (`?2`) drops a clone's inherited ROMs: when split is
+        // on, keep a ROM only if its game is a parent (`parent_name IS NULL`) or
+        // the ROM carries no merge tag (a clone's own unique ROM). This mirrors
+        // the split rule in `calculate_rom_requirements` so placement and
+        // completeness agree. When split is off, `?2` is 0 and the term is true
+        // for every ROM, leaving non-merged behaviour unchanged.
         "WITH vroms AS (
             SELECT r.id, r.game_id, r.name, r.sha1, r.crc32, r.size, r.is_disk
             FROM dat_roms r
             JOIN dat_games g ON r.game_id = g.id
             JOIN dat_nodes n ON g.node_id = n.id
             WHERE n.version_id = ?1 AND r.status != 'nodump'
+              AND (?2 = 0 OR g.parent_name IS NULL OR r.merge_tag IS NULL)
          ),
          matched AS (
             SELECT vr.id AS rom_id, f.sha1, f.size
@@ -736,7 +787,7 @@ fn find_matched_roms(
     )?;
 
     let matches = stmt
-        .query_map([version_id], |row| {
+        .query_map(rusqlite::params![version_id, split], |row| {
             Ok(MatchedRom {
                 collection: collection_name.to_string(),
                 game_name: row.get(0)?,
@@ -764,6 +815,19 @@ fn resolve_output_format(explicit: Option<&str>, default: OutputFormat) -> Outpu
         Some("zip") => OutputFormat::Zip,
         Some("torrentzip") => OutputFormat::TorrentZip,
         Some("7z") => OutputFormat::SevenZip,
+        _ => default,
+    }
+}
+
+/// The effective merge mode for a collection: an explicit setting (per-collection
+/// or per-set) wins, otherwise the library-wide default. An unrecognised string
+/// falls back to the default rather than failing the whole plan. The kebab-case
+/// strings match the `MergeMode` serde representation in `config::types`.
+fn resolve_merge_mode(explicit: Option<&str>, default: MergeMode) -> MergeMode {
+    match explicit.map(str::to_ascii_lowercase).as_deref() {
+        Some("non-merged") => MergeMode::NonMerged,
+        Some("merged") => MergeMode::Merged,
+        Some("split") => MergeMode::Split,
         _ => default,
     }
 }
@@ -1404,6 +1468,34 @@ mod tests {
         assert_eq!(archive_extension("torrentzip"), "zip");
     }
 
+    #[test]
+    fn resolve_merge_mode_prefers_explicit_then_default() {
+        // The kebab-case strings match the MergeMode serde representation.
+        assert_eq!(
+            resolve_merge_mode(Some("split"), MergeMode::NonMerged),
+            MergeMode::Split
+        );
+        assert_eq!(
+            resolve_merge_mode(Some("merged"), MergeMode::NonMerged),
+            MergeMode::Merged
+        );
+        assert_eq!(
+            resolve_merge_mode(Some("non-merged"), MergeMode::Split),
+            MergeMode::NonMerged
+        );
+        // Case-insensitive.
+        assert_eq!(
+            resolve_merge_mode(Some("Split"), MergeMode::NonMerged),
+            MergeMode::Split
+        );
+        // Absent or unrecognised falls back to the default rather than failing.
+        assert_eq!(resolve_merge_mode(None, MergeMode::Split), MergeMode::Split);
+        assert_eq!(
+            resolve_merge_mode(Some("clone"), MergeMode::NonMerged),
+            MergeMode::NonMerged
+        );
+    }
+
     /// Build a one-ROM collection whose held file exists in two places: already
     /// at its canonical destination under the library, and a staged duplicate
     /// elsewhere. `archived` controls whether the file is a loose file or an
@@ -1660,6 +1752,166 @@ mod tests {
         assert_eq!(
             copies,
             vec!["/lib/ROMs/MAME/azumanga/gdl-0018.chd".to_string()]
+        );
+    }
+
+    /// A parent/clone pair where the clone holds one inherited (merge-tagged) ROM
+    /// shared with the parent plus one of its own. The same fixture drives both
+    /// merge modes, asserting only the split filter changes placement.
+    fn setup_parent_clone_fixture(conn: &Connection) {
+        let coll = collections::create_collection(conn, "Arcade", "mame").unwrap();
+        let vid = collections::add_version(conn, coll, "v1", "/dats/mame.dat", true).unwrap();
+        let node = dats::create_node(conn, vid, None, "Arcade", "dat", "ARCADE").unwrap();
+
+        // Parent: owns shared.rom (AAA), no merge tag.
+        let parent =
+            dats::create_game(conn, node, "puckman", None, None, false, false, false).unwrap();
+        dats::create_rom(
+            conn,
+            parent,
+            "shared.rom",
+            10,
+            Some("AAA"),
+            None,
+            None,
+            "good",
+            None,
+        )
+        .unwrap();
+
+        // Clone of puckman: shared.rom is inherited (merge-tagged → lives in the
+        // parent under split); clone.rom (BBB) is its own unique ROM.
+        let clone = dats::create_game(
+            conn,
+            node,
+            "pacmanm",
+            None,
+            Some("puckman"),
+            false,
+            false,
+            false,
+        )
+        .unwrap();
+        dats::create_rom(
+            conn,
+            clone,
+            "shared.rom",
+            10,
+            Some("AAA"),
+            None,
+            None,
+            "good",
+            Some("shared.rom"),
+        )
+        .unwrap();
+        dats::create_rom(
+            conn,
+            clone,
+            "clone.rom",
+            10,
+            Some("BBB"),
+            None,
+            None,
+            "good",
+            None,
+        )
+        .unwrap();
+
+        conn.execute(
+            "INSERT INTO files (sha1, size) VALUES ('AAA', 10), ('BBB', 10)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO sources (id, path, case_sensitive) VALUES (400, '/lib/ToSort/ARCADE', 0)",
+            [],
+        )
+        .unwrap();
+        // Both ROMs held loose in ToSort.
+        conn.execute(
+            "INSERT INTO file_locations (sha1, source_id, path, archive_path) VALUES
+                ('AAA', 400, 'shared.rom', NULL),
+                ('BBB', 400, 'clone.rom', NULL)",
+            [],
+        )
+        .unwrap();
+    }
+
+    /// Map each game's planned archive to the sorted canonical entry names it
+    /// will hold — read from the repack sources' `entry_name`. Zip is the arcade
+    /// target, so split/non-merged are compared on archive *contents*.
+    fn repack_entries(plan: &Plan) -> BTreeMap<String, Vec<String>> {
+        let mut by_dest: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for op in &plan.operations {
+            if let OperationKind::Repack { sources, dest, .. } = &op.kind {
+                let mut entries: Vec<String> = sources
+                    .iter()
+                    .filter_map(|s| s.entry_name.clone())
+                    .collect();
+                entries.sort();
+                by_dest.insert(dest.clone(), entries);
+            }
+        }
+        by_dest
+    }
+
+    #[test]
+    fn split_mode_drops_a_clones_inherited_rom_from_its_archive() {
+        let db = setup_db();
+        let conn = db.conn();
+        setup_parent_clone_fixture(conn);
+
+        // Zip + split — the chosen arcade layout. The clone's archive must hold
+        // only its own unique ROM; the inherited (merge-tagged) shared.rom lives
+        // in the parent's archive, not the clone's.
+        let plan = generate_plan_filtered(
+            conn,
+            &PlanOptions {
+                default_dest: Some("/lib/ROMs".to_string()),
+                default_format: OutputFormat::Zip,
+                default_merge_mode: MergeMode::Split,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let entries = repack_entries(&plan);
+        assert_eq!(
+            entries.get("/lib/ROMs/ARCADE/pacmanm.zip"),
+            Some(&vec!["clone.rom".to_string()]),
+            "split: the clone archive holds only its own unique ROM"
+        );
+        assert_eq!(
+            entries.get("/lib/ROMs/ARCADE/puckman.zip"),
+            Some(&vec!["shared.rom".to_string()]),
+            "split: the inherited ROM lives in the parent archive"
+        );
+    }
+
+    #[test]
+    fn non_merged_mode_keeps_a_clones_inherited_rom_in_its_archive() {
+        let db = setup_db();
+        let conn = db.conn();
+        setup_parent_clone_fixture(conn);
+
+        // Default merge mode (NonMerged): every ROM the DAT lists per game is
+        // placed, so the clone's archive carries its own copy of the inherited
+        // shared.rom alongside its unique ROM.
+        let plan = generate_plan_filtered(
+            conn,
+            &PlanOptions {
+                default_dest: Some("/lib/ROMs".to_string()),
+                default_format: OutputFormat::Zip,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let entries = repack_entries(&plan);
+        assert_eq!(
+            entries.get("/lib/ROMs/ARCADE/pacmanm.zip"),
+            Some(&vec!["clone.rom".to_string(), "shared.rom".to_string()]),
+            "non-merged: the clone archive carries its own copy of the inherited ROM"
         );
     }
 
