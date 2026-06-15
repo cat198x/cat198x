@@ -317,6 +317,24 @@ pub fn count_files_in_source(conn: &Connection, source_id: i64) -> Result<i64> {
     Ok(count)
 }
 
+/// Collect the relative paths already catalogued for a source.
+///
+/// Used by incremental scans to pick up files that exist on disk but were
+/// never recorded — added with an older mtime, or missed when an earlier scan
+/// was interrupted — which the modified-since-last-scan filter alone skips.
+pub fn catalogued_paths(
+    conn: &Connection,
+    source_id: i64,
+) -> Result<std::collections::HashSet<String>> {
+    let mut stmt = conn.prepare("SELECT DISTINCT path FROM file_locations WHERE source_id = ?")?;
+    let rows = stmt.query_map([source_id], |row| row.get::<_, String>(0))?;
+    let mut paths = std::collections::HashSet::new();
+    for path in rows {
+        paths.insert(path?);
+    }
+    Ok(paths)
+}
+
 /// Remove stale file locations (not seen since a given time)
 pub fn remove_stale_locations(conn: &Connection, source_id: i64, before: &str) -> Result<i64> {
     let deleted = conn.execute(
@@ -371,6 +389,34 @@ mod tests {
         assert_eq!(resolve_in_sources(&sources, "/elsewhere/x.rom"), None);
         // A path equal to a source root (no file under it) → None.
         assert_eq!(resolve_in_sources(&sources, "/lib/ROMs"), None);
+    }
+
+    #[test]
+    fn test_catalogued_paths_returns_distinct_paths_per_source() {
+        let db = setup_db();
+        let conn = db.conn();
+        let s1 = add_source(conn, "/lib/a", false).unwrap();
+        let s2 = add_source(conn, "/lib/b", false).unwrap();
+
+        upsert_file(conn, "AAAA", None, None, None, 1).unwrap();
+        upsert_file(conn, "BBBB", None, None, None, 1).unwrap();
+        upsert_file(conn, "CCCC", None, None, None, 1).unwrap();
+
+        // Two loose files and a two-entry archive under source 1.
+        upsert_file_location(conn, "AAAA", s1, "loose1.rom", None).unwrap();
+        upsert_file_location(conn, "BBBB", s1, "pack.zip", Some("inner1.rom")).unwrap();
+        upsert_file_location(conn, "CCCC", s1, "pack.zip", Some("inner2.rom")).unwrap();
+        // A file under source 2 must not leak into source 1's set.
+        upsert_file_location(conn, "AAAA", s2, "other.rom", None).unwrap();
+
+        let paths = catalogued_paths(conn, s1).unwrap();
+        // The archive's two entries collapse to one distinct container path.
+        assert_eq!(paths.len(), 2);
+        assert!(paths.contains("loose1.rom"));
+        assert!(paths.contains("pack.zip"));
+        assert!(!paths.contains("other.rom"));
+
+        assert!(catalogued_paths(conn, 999).unwrap().is_empty());
     }
 
     #[test]
