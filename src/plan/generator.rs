@@ -196,6 +196,29 @@ fn compute_shared_containers(conn: &Connection) -> Result<HashSet<String>> {
     Ok(set)
 }
 
+/// Whether a version is disk-only: it has at least one `<disk>` and no `<rom>`.
+/// Such a collection places loose `<game>/<name>.chd` and never a `<game>.zip`,
+/// so it can share a destination root with a ROM collection without colliding.
+fn version_is_disk_only(conn: &Connection, version_id: i64) -> Result<bool> {
+    let has_disk: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM dat_roms r
+                         JOIN dat_games g ON g.id = r.game_id
+                         JOIN dat_nodes n ON n.id = g.node_id
+                        WHERE n.version_id = ?1 AND r.is_disk = 1)",
+        [version_id],
+        |row| row.get(0),
+    )?;
+    let has_rom: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM dat_roms r
+                         JOIN dat_games g ON g.id = r.game_id
+                         JOIN dat_nodes n ON n.id = g.node_id
+                        WHERE n.version_id = ?1 AND r.is_disk = 0)",
+        [version_id],
+        |row| row.get(0),
+    )?;
+    Ok(has_disk && !has_rom)
+}
+
 /// Refuse to plan when two collections in scope resolve to the same destination
 /// root.
 ///
@@ -209,12 +232,20 @@ fn compute_shared_containers(conn: &Connection) -> Result<HashSet<String>> {
 /// Scope matches the plan: only collections that pass `dat_filter`/`set_filter`
 /// and resolve to a destination are checked, so a narrow plan isn't blocked by a
 /// collision outside it.
+///
+/// Collections are grouped by `(root, output namespace)`, not root alone. A
+/// disk-only (CHD) collection writes loose `<game>/<name>.chd`, which never
+/// collides with a ROM collection's `<game>.zip` at the same root — so a game's
+/// ROMs and its CHD can live together, the standard arcade layout. Only
+/// same-namespace collections (two ROM sets, or two CHD sets) collide.
 fn check_unique_destinations(
     conn: &Connection,
     opts: &PlanOptions,
     all_collections: &[collections::Collection],
 ) -> Result<()> {
-    let mut owners: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    // Key: (destination root, is the collection disk-only). Value: collection
+    // names sharing that key — a collision when more than one.
+    let mut owners: BTreeMap<(String, bool), Vec<String>> = BTreeMap::new();
     for collection in all_collections {
         if let Some(pattern) = opts.dat_filter.as_deref()
             && !glob_match(pattern, &collection.name)
@@ -236,27 +267,34 @@ fn check_unique_destinations(
         let cfg = db_config::get_collection_config(conn, &collection.name)?;
         let explicit = cfg.as_ref().and_then(|c| c.dest_path.as_deref());
         if let Some(root) = resolve_dest_root(explicit, opts.default_dest.as_deref(), &hierarchy) {
+            let disk_only = version_is_disk_only(conn, version.id)?;
             owners
-                .entry(root)
+                .entry((root, disk_only))
                 .or_default()
                 .push(collection.name.clone());
         }
     }
 
-    let mut collisions: Vec<(&String, &Vec<String>)> =
+    let mut collisions: Vec<(&(String, bool), &Vec<String>)> =
         owners.iter().filter(|(_, c)| c.len() > 1).collect();
     if collisions.is_empty() {
         return Ok(());
     }
-    collisions.sort_by_key(|(root, _)| (*root).clone());
+    collisions.sort_by_key(|((root, disk), _)| (root.clone(), *disk));
 
     let mut msg = String::from(
         "Refusing to plan: collections share a destination root, so their \
          same-named games would overwrite each other. Give each collection a \
          distinct dest_path (e.g. a per-machine subfolder).\n",
     );
-    for (root, colls) in collisions {
-        msg.push_str(&format!("  {} <- {}\n", root, colls.join(", ")));
+    for ((root, disk_only), colls) in collisions {
+        let kind = if *disk_only { "CHD" } else { "ROM" };
+        msg.push_str(&format!(
+            "  {} ({} outputs) <- {}\n",
+            root,
+            kind,
+            colls.join(", ")
+        ));
     }
     anyhow::bail!(msg);
 }
@@ -1473,6 +1511,36 @@ mod tests {
             plan.is_empty(),
             "no held content, so an empty but valid plan"
         );
+    }
+
+    #[test]
+    fn allows_a_chd_collection_to_share_a_root_with_a_rom_collection() {
+        let db = setup_db();
+        let conn = db.conn();
+        // A ROM collection and a disk-only CHD collection, both at root "Demul".
+        // A game's `<game>.zip` and its `<game>/<name>.chd` don't collide.
+        let rc = collections::create_collection(conn, "Demul ROMs", "mame").unwrap();
+        let rv = collections::add_version(conn, rc, "v1", "/d/r.dat", true).unwrap();
+        let rn = dats::create_node(conn, rv, None, "Demul ROMs", "dat", "Demul").unwrap();
+        let rg = dats::create_game(conn, rn, "azumanga", None, None, false, false, false).unwrap();
+        dats::create_rom(conn, rg, "a.rom", 10, Some("AAA"), None, None, "good", None).unwrap();
+
+        let cc = collections::create_collection(conn, "Demul CHDs", "mame").unwrap();
+        let cv = collections::add_version(conn, cc, "v1", "/d/c.dat", true).unwrap();
+        let cn = dats::create_node(conn, cv, None, "Demul CHDs", "dat", "Demul").unwrap();
+        let cg = dats::create_game(conn, cn, "azumanga", None, None, false, false, false).unwrap();
+        dats::create_disk(conn, cg, "gdl-0018", Some("DDD"), None, "good", None).unwrap();
+
+        // The guard must NOT refuse — ROM and CHD are different output namespaces.
+        let plan = generate_plan_filtered(
+            conn,
+            &PlanOptions {
+                default_dest: Some("/lib/ROMs".to_string()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(plan.is_empty(), "no held content, but an un-refused plan");
     }
 
     #[test]
