@@ -7,6 +7,75 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0](https://github.com/cat198x/cat198x/compare/v0.3.1...v0.4.0) - 2026-06-15
+
+### Added
+
+- *(plan)* honour split merge-mode so clone archives drop inherited ROMs
+- *(catalogue)* add catalogue-placements to converge after a reorg
+- *(apply)* add --prune-empty to self-clean emptied source dirs
+- *(prune)* add prune-empty to clear directories left by a --move tidy
+- *(plan)* skip collections whose match expansion would exhaust memory
+- *(plan)* store CHDs loose in a machine folder, never packed
+- *(scanner)* identify CHDs by their internal header SHA1
+- *(dat)* parse <disk> (CHD) entries into dat_roms
+- *(apply)* run repacks concurrently (-j/--jobs, default 8)
+- *(plan)* delete exact-content duplicates instead of quarantining them
+- *(apply)* move-mode repack deletes its loose sources, reversibly
+- *(apply)* defer repacks with --skip-repack, and resume partial plans
+- *(plan)* relocate complete staged archives instead of repacking them
+- *(quarantine)* add a Duplicate reason so deduped copies group correctly
+- *(plan)* dedupe ROM copies by destination, quarantining duplicates
+- *(plan)* add 7z as an output format
+- *(dat)* add `dat sort` to nest a flat DAT pack by collection name
+- *(cli)* add `unknowns` to report files matched by no active DAT
+- *(plan)* `plan --move` for a true in-place tidy
+- *(plan)* repack when an archive is the wrong container format
+- *(plan)* per-set breakdown of pending operations
+- *(stats)* generalise grouping to `stats --group-by system|set`
+- *(plan)* write the skipped-collection list to a file
+- *(doctor)* point at `dat relink` when DAT files are missing
+- *(config)* add `config get-default` and show defaults in `config list`
+- *(plan)* emit archives for zip/torrentzip output formats
+- *(plan)* let SourceRef carry a canonical archive entry name
+- *(dat)* add `dat relink` to re-point moved DAT files
+- *(stats)* roll collections up by group with `stats --group`
+- *(config)* add `config set-default` for library-wide defaults
+- *(plan)* resolve destinations from a library-wide default + hierarchy
+- *(plan)* lay multi-ROM games out in their own folder
+- *(dat)* record each collection's library path on recursive add
+
+### Fixed
+
+- *(db)* replace a loose file's hash on re-scan instead of accumulating a second row
+- *(plan)* detect shared CRC-only arcade content so containers aren't relocated whole
+- *(plan)* never delete a placed library file as a duplicate
+- *(apply)* verify CHD copies by internal header SHA1, not file bytes
+- *(apply)* make the disk-space guard move-aware and stat-free
+- *(scan)* honour numeric --source selectors as source ids
+- *(repack)* collapse duplicate entry names instead of aborting the build
+- *(plan)* never relocate or delete a container that sources multiple games
+- *(plan)* copy content shared across entries, never consume its source
+- *(util)* truncate_path must not panic on multi-byte UTF-8 paths
+- *(quarantine)* make the store location configurable, default on-volume
+- *(plan)* show quarantine operations in the plan summary
+- *(plan)* repack loose files into archives instead of renaming them
+- *(apply)* keep the catalogue in step with file operations
+- *(dat)* preserve XML entities in DAT names and survive duplicate games
+- *(dat)* make re-adding an existing DAT version a no-op
+
+### Other
+
+- *(plan)* resolve archive completeness by lookup, not nested scan
+- *(plan)* index files(crc32, size) for CRC-only DAT matching
+- *(scanner)* read only the CHD header, not the whole file
+- Find ZIP entries by decoded name, not the crate's by_name map
+- *(apply)* same-filesystem loose move renames without re-hashing
+- *(plan)* make planning viable on large libraries and add per-set format
+- *(apply)* rename same-volume loose-file moves instead of copy+delete
+- *(plan)* trust the catalogue instead of re-hashing destination files
+- *(plan)* end-to-end hierarchical reorganise plan
+
 ## [0.3.1](https://github.com/cat198x/cat198x/compare/v0.3.0...v0.3.1) - 2026-06-03
 
 ### Other
