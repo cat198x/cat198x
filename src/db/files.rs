@@ -194,7 +194,17 @@ pub fn get_file_by_sha1(conn: &Connection, sha1: &str) -> Result<Option<File>> {
 
 // === File location operations ===
 
-/// Add or update a file location
+/// Add or update a file location.
+///
+/// A loose path physically holds exactly one content, so re-scanning it must
+/// *replace* the recorded hash. The `ON CONFLICT(source_id, path, archive_path)`
+/// upsert handles that for archive entries, but **not** for loose files:
+/// SQLite's UNIQUE index treats NULL `archive_path` values as distinct, so two
+/// rows with the same `(source_id, path)` and a NULL `archive_path` never
+/// conflict — a re-scan of a path whose content changed would accumulate a second
+/// row beside the stale one. (That gap is what let two different ROMs share one
+/// loose path in the catalogue and collide on repack.) So for a loose file,
+/// delete any existing row at this `(source_id, path)` first, then insert.
 pub fn upsert_file_location(
     conn: &Connection,
     sha1: &str,
@@ -202,13 +212,29 @@ pub fn upsert_file_location(
     path: &str,
     archive_path: Option<&str>,
 ) -> Result<i64> {
-    conn.execute(
-        "INSERT INTO file_locations (sha1, source_id, path, archive_path) VALUES (?, ?, ?, ?)
-         ON CONFLICT(source_id, path, archive_path) DO UPDATE SET
-            sha1 = excluded.sha1,
-            last_seen = datetime('now')",
-        params![sha1, source_id, path, archive_path],
-    )?;
+    match archive_path {
+        None => {
+            conn.execute(
+                "DELETE FROM file_locations
+                  WHERE source_id = ?1 AND path = ?2 AND archive_path IS NULL",
+                params![source_id, path],
+            )?;
+            conn.execute(
+                "INSERT INTO file_locations (sha1, source_id, path, archive_path)
+                 VALUES (?1, ?2, ?3, NULL)",
+                params![sha1, source_id, path],
+            )?;
+        }
+        Some(ap) => {
+            conn.execute(
+                "INSERT INTO file_locations (sha1, source_id, path, archive_path) VALUES (?, ?, ?, ?)
+                 ON CONFLICT(source_id, path, archive_path) DO UPDATE SET
+                    sha1 = excluded.sha1,
+                    last_seen = datetime('now')",
+                params![sha1, source_id, path, ap],
+            )?;
+        }
+    }
     Ok(conn.last_insert_rowid())
 }
 
@@ -571,6 +597,63 @@ mod tests {
         assert_eq!(locations.len(), 1);
         assert_eq!(locations[0].path, "nes/mario.nes");
         assert!(locations[0].archive_path.is_none());
+    }
+
+    #[test]
+    fn rescanning_a_loose_path_replaces_the_hash_not_accumulates() {
+        let db = setup_db();
+        let conn = db.conn();
+        let source_id = add_source(conn, "/roms", true).unwrap();
+        let a = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let b = "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB";
+        upsert_file(conn, a, None, None, None, 100).unwrap();
+        upsert_file(conn, b, None, None, None, 200).unwrap();
+
+        // First scan sees content A at the loose path; a later scan sees the path
+        // now holding content B (e.g. a flat layout overwrote it).
+        upsert_file_location(conn, a, source_id, "FBN/zoop (usa).bin", None).unwrap();
+        upsert_file_location(conn, b, source_id, "FBN/zoop (usa).bin", None).unwrap();
+
+        // Exactly one row remains at that loose path, carrying the latest content —
+        // not two rows that would let the planner source a stale hash.
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM file_locations
+                  WHERE source_id = ?1 AND path = ?2 AND archive_path IS NULL",
+                params![source_id, "FBN/zoop (usa).bin"],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            count, 1,
+            "a loose path holds one content; the row is replaced"
+        );
+        assert!(get_file_locations(conn, a).unwrap().is_empty());
+        assert_eq!(get_file_locations(conn, b).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn distinct_archive_entries_at_one_path_coexist() {
+        let db = setup_db();
+        let conn = db.conn();
+        let source_id = add_source(conn, "/roms", true).unwrap();
+        let a = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let b = "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB";
+        upsert_file(conn, a, None, None, None, 100).unwrap();
+        upsert_file(conn, b, None, None, None, 200).unwrap();
+
+        // Two different entries inside one archive are distinct rows — the loose
+        // replacement must not touch the archive-entry path.
+        upsert_file_location(conn, a, source_id, "games.zip", Some("a.rom")).unwrap();
+        upsert_file_location(conn, b, source_id, "games.zip", Some("b.rom")).unwrap();
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM file_locations WHERE source_id = ?1 AND path = ?2",
+                params![source_id, "games.zip"],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 2, "distinct archive entries coexist");
     }
 
     #[test]
