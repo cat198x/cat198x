@@ -6,8 +6,8 @@ use std::io;
 use cat198x::cli::{
     apply as apply_cmd, catalogue as catalogue_cmd, config as config_cmd, dat as dat_cmd,
     doctor as doctor_cmd, export as export_cmd, init, plan as plan_cmd, prune as prune_cmd,
-    quarantine as quarantine_cmd, scan, source, stats as stats_cmd, status, torrent as torrent_cmd,
-    unknowns as unknowns_cmd, update as update_cmd,
+    quarantine as quarantine_cmd, reclaim as reclaim_cmd, scan, source, stats as stats_cmd, status,
+    torrent as torrent_cmd, unknowns as unknowns_cmd, update as update_cmd,
 };
 use cat198x::{ConfigCommands, DatCommands, QuarantineCommands, SourceCommands, TorrentCommands};
 
@@ -112,6 +112,20 @@ enum Commands {
         /// `Thumbs.db`, `desktop.ini`), deleting that cruft with it.
         #[arg(long)]
         ignore_os_junk: bool,
+    },
+
+    /// Free space by deleting a source's files whose every content is already
+    /// held in another source (e.g. a `ToSort/…` staging input after its set was
+    /// moved into the library). Dry-run unless `--execute`.
+    Reclaim {
+        /// The source to reclaim from: a source id or a path substring.
+        #[arg(value_name = "ID|PATH")]
+        source: Option<String>,
+
+        /// Actually delete the redundant files (default: report only). Each is an
+        /// existence-verified hard delete and is journaled for audit.
+        #[arg(long)]
+        execute: bool,
     },
 
     /// Show overall statistics across all collections
@@ -276,6 +290,7 @@ fn main() -> Result<()> {
             remove,
             ignore_os_junk,
         } => prune_cmd::run(source, remove, ignore_os_junk, cli.data_dir),
+        Commands::Reclaim { source, execute } => reclaim_cmd::run(source, execute, cli.data_dir),
         Commands::Stats { group_by } => stats_cmd::run(group_by.as_deref(), cli.data_dir),
         Commands::Config(cmd) => config_cmd::run(cmd, cli.data_dir),
         Commands::Plan { dat, set, r#move } => plan_cmd::run(dat, set, r#move, cli.data_dir),

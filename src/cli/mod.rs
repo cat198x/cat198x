@@ -11,6 +11,7 @@ pub mod init;
 pub mod plan;
 pub mod prune;
 pub mod quarantine;
+pub mod reclaim;
 pub mod scan;
 pub mod source;
 pub mod stats;
