@@ -196,6 +196,71 @@ fn compute_shared_containers(conn: &Connection) -> Result<HashSet<String>> {
     Ok(set)
 }
 
+/// Refuse to plan when two collections in scope resolve to the same destination
+/// root.
+///
+/// A destination must uniquely identify its source. Two collections sharing a
+/// root silently overwrite each other's same-named games — `Arcade/klax` and
+/// `Game Gear/klax` both writing `<root>/klax.zip`, last-writer-wins. That is the
+/// FinalBurn Neo flat-layout failure that destroyed ~1,600 games before
+/// per-machine folders. The error names the colliding collections and their
+/// shared root; the remedy is its own message — give each a distinct `dest_path`.
+///
+/// Scope matches the plan: only collections that pass `dat_filter`/`set_filter`
+/// and resolve to a destination are checked, so a narrow plan isn't blocked by a
+/// collision outside it.
+fn check_unique_destinations(
+    conn: &Connection,
+    opts: &PlanOptions,
+    all_collections: &[collections::Collection],
+) -> Result<()> {
+    let mut owners: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for collection in all_collections {
+        if let Some(pattern) = opts.dat_filter.as_deref()
+            && !glob_match(pattern, &collection.name)
+        {
+            continue;
+        }
+        let version = match collections::get_active_version(conn, collection.id)? {
+            Some(v) => v,
+            None => continue,
+        };
+        let hierarchy =
+            dats::primary_node_path(conn, version.id)?.unwrap_or_else(|| collection.name.clone());
+        if let Some(sets) = opts.set_filter.as_ref() {
+            let set = hierarchy.split('/').next().unwrap_or(hierarchy.as_str());
+            if !sets.iter().any(|s| s == set) {
+                continue;
+            }
+        }
+        let cfg = db_config::get_collection_config(conn, &collection.name)?;
+        let explicit = cfg.as_ref().and_then(|c| c.dest_path.as_deref());
+        if let Some(root) = resolve_dest_root(explicit, opts.default_dest.as_deref(), &hierarchy) {
+            owners
+                .entry(root)
+                .or_default()
+                .push(collection.name.clone());
+        }
+    }
+
+    let mut collisions: Vec<(&String, &Vec<String>)> =
+        owners.iter().filter(|(_, c)| c.len() > 1).collect();
+    if collisions.is_empty() {
+        return Ok(());
+    }
+    collisions.sort_by_key(|(root, _)| (*root).clone());
+
+    let mut msg = String::from(
+        "Refusing to plan: collections share a destination root, so their \
+         same-named games would overwrite each other. Give each collection a \
+         distinct dest_path (e.g. a per-machine subfolder).\n",
+    );
+    for (root, colls) in collisions {
+        msg.push_str(&format!("  {} <- {}\n", root, colls.join(", ")));
+    }
+    anyhow::bail!(msg);
+}
+
 /// Generate a plan from the given options.
 ///
 /// `dat_filter` supports glob patterns (`*`, `?`, case-insensitive) over
@@ -233,6 +298,11 @@ pub fn generate_plan_filtered(conn: &Connection, opts: &PlanOptions) -> Result<P
     // library-wide `default_dest_path` should reach collections that were never
     // individually configured. Each collection's destination is resolved below.
     let all_collections = collections::list_collections(conn)?;
+
+    // A destination must uniquely identify its source. Refuse before doing any
+    // work if two collections in scope resolve to the same root — they would
+    // silently overwrite each other's same-named games.
+    check_unique_destinations(conn, opts, &all_collections)?;
 
     let mut planned_any = false;
     let mut filter_matched_any = false;
@@ -1343,6 +1413,66 @@ mod tests {
         let plan = generate_plan_filtered(conn, &PlanOptions::default()).unwrap();
         assert!(plan.is_empty(), "no destination → no operations");
         assert_eq!(plan.skipped_no_dest, vec!["No Dest Coll".to_string()]);
+    }
+
+    #[test]
+    fn refuses_when_two_collections_share_a_destination_root() {
+        let db = setup_db();
+        let conn = db.conn();
+        // Both collections have the flat hierarchy "FBN", so both resolve to
+        // <default>/FBN — the flat-namespace trap that overwrites same-named games.
+        for name in ["Arcade Games", "Game Gear Games"] {
+            let c = collections::create_collection(conn, name, "mame").unwrap();
+            let vid =
+                collections::add_version(conn, c, "v1", &format!("/d/{name}.dat"), true).unwrap();
+            dats::create_node(conn, vid, None, name, "dat", "FBN").unwrap();
+        }
+        let err = generate_plan_filtered(
+            conn,
+            &PlanOptions {
+                default_dest: Some("/lib/ROMs".to_string()),
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("share a destination root"), "got: {msg}");
+        assert!(
+            msg.contains("/lib/ROMs/FBN"),
+            "names the shared root: {msg}"
+        );
+        assert!(
+            msg.contains("Arcade Games") && msg.contains("Game Gear Games"),
+            "names the colliding collections: {msg}"
+        );
+    }
+
+    #[test]
+    fn allows_collections_with_distinct_destination_roots() {
+        let db = setup_db();
+        let conn = db.conn();
+        // Per-machine hierarchies → distinct roots → no collision, plan proceeds.
+        for (name, path) in [
+            ("Arcade Games", "FBN/Arcade"),
+            ("Game Gear Games", "FBN/Game Gear"),
+        ] {
+            let c = collections::create_collection(conn, name, "mame").unwrap();
+            let vid =
+                collections::add_version(conn, c, "v1", &format!("/d/{name}.dat"), true).unwrap();
+            dats::create_node(conn, vid, None, name, "dat", path).unwrap();
+        }
+        let plan = generate_plan_filtered(
+            conn,
+            &PlanOptions {
+                default_dest: Some("/lib/ROMs".to_string()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(
+            plan.is_empty(),
+            "no held content, so an empty but valid plan"
+        );
     }
 
     #[test]
