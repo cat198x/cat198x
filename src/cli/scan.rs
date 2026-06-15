@@ -187,10 +187,26 @@ fn scan_source(
     let files_to_scan: Vec<PathBuf> = if full {
         all_files
     } else {
+        // An incremental scan must also catch files that are on disk but absent
+        // from the catalogue — added with an older mtime, or left behind when a
+        // previous scan was interrupted before its write phase. Without this, a
+        // partial scan that still stamped `last_scanned` would strand the rest
+        // forever (their mtime predates the stamp), and a dropped scan over a
+        // flaky mount could never resume. Treating uncatalogued files as
+        // always-scan makes incremental scans self-healing and resumable.
+        let known = files::catalogued_paths(conn, source.id)?;
         all_files
             .into_iter()
             .filter(|path| {
-                // For incremental scan, check if file was modified since last scan
+                let relative = path
+                    .strip_prefix(source_path)
+                    .unwrap_or(path)
+                    .to_string_lossy();
+                // Never catalogued here yet — always scan.
+                if !known.contains(relative.as_ref()) {
+                    return true;
+                }
+                // Already catalogued: scan only if modified since last scan.
                 if let Some(threshold) = last_scanned
                     && let Ok(metadata) = std::fs::metadata(path)
                     && let Ok(modified) = metadata.modified()
