@@ -16,6 +16,15 @@ use walkdir::WalkDir;
 /// instead, plus one for the final file.
 const PROGRESS_LOG_INTERVAL: usize = 250;
 
+/// Files are hashed and committed in batches of this size rather than hashing
+/// the whole source into memory and writing once at the end. Reading files over
+/// a flaky network mount is the slow, failure-prone phase, so committing every
+/// batch bounds what a dropped or interrupted scan loses to one batch — at a few
+/// thousand files per minute that is well under a minute of work, and every
+/// committed batch survives. The incremental-scan resume logic then re-runs only
+/// the files no batch has recorded.
+const BATCH_SIZE: usize = 2000;
+
 use crate::db::files::{self, Source};
 use crate::scanner::archive::{ArchiveType, hash_archive_entries};
 use crate::scanner::hasher::{FileHashes, hash_file_with_header_detection};
@@ -260,8 +269,100 @@ fn scan_source(
         interrupted_clone.store(true, Ordering::SeqCst);
     });
 
-    // Parallel hashing phase
-    let results: Vec<ScanResult> = files_to_scan
+    let mut processed_files = 0;
+    let mut processed_entries = 0;
+    let mut headers_skipped = 0;
+    let mut errors: Vec<(String, String)> = Vec::new();
+
+    // Hash and commit in batches so a dropped or interrupted scan keeps every
+    // completed batch instead of losing the whole run (see BATCH_SIZE).
+    for batch in files_to_scan.chunks(BATCH_SIZE) {
+        if interrupted.load(Ordering::SeqCst) {
+            break;
+        }
+        let stats = process_batch(
+            conn,
+            source,
+            source_path,
+            batch,
+            &processed_count,
+            &interrupted,
+            interactive,
+            &pb,
+            total_to_scan,
+        )?;
+        processed_files += stats.files;
+        processed_entries += stats.entries;
+        headers_skipped += stats.headers_skipped;
+        errors.extend(stats.errors);
+    }
+
+    pb.set_position(processed_count.load(Ordering::SeqCst) as u64);
+
+    // Report per-file errors surfaced while hashing the batches.
+    for (path, error) in &errors {
+        println!("  Warning: {}: {}", path, error);
+    }
+
+    // An interrupted scan keeps its committed batches but must not stamp
+    // last_scanned: the files it never reached have to be picked up next run,
+    // which the resume logic handles by treating uncatalogued files as new.
+    if interrupted.load(Ordering::SeqCst) {
+        pb.finish_with_message("interrupted");
+        println!(
+            "  Scan interrupted after {} files. Progress saved — run scan again to resume.",
+            processed_files
+        );
+        return Ok((processed_files, processed_entries, skipped));
+    }
+
+    pb.finish_with_message("done");
+
+    // Update source last_scanned (only on a fully completed scan).
+    files::update_source_scanned(conn, source.id)?;
+
+    if headers_skipped > 0 {
+        println!(
+            "  {} files, {} archive entries ({} headers skipped)",
+            processed_files, processed_entries, headers_skipped
+        );
+    } else {
+        println!(
+            "  {} files, {} archive entries",
+            processed_files, processed_entries
+        );
+    }
+
+    Ok((processed_files, processed_entries, skipped))
+}
+
+/// Tallies from processing one batch, accumulated across batches by the caller.
+#[derive(Default)]
+struct BatchStats {
+    files: usize,
+    entries: usize,
+    headers_skipped: usize,
+    /// `(relative_path, error)` for each file that failed to hash.
+    errors: Vec<(String, String)>,
+}
+
+/// Hash one batch of files in parallel, then commit them in a single
+/// transaction. One transaction per batch: a DB error rolls back just this
+/// batch, and the per-file upserts commit together rather than once each.
+#[allow(clippy::too_many_arguments)]
+fn process_batch(
+    conn: &rusqlite::Connection,
+    source: &Source,
+    source_path: &Path,
+    batch: &[PathBuf],
+    processed_count: &AtomicUsize,
+    interrupted: &AtomicBool,
+    interactive: bool,
+    pb: &ProgressBar,
+    total_to_scan: usize,
+) -> Result<BatchStats> {
+    // Parallel hashing phase for this batch
+    let results: Vec<ScanResult> = batch
         .par_iter()
         .map(|file_path| {
             // Check for interruption
@@ -368,32 +469,9 @@ fn scan_source(
         })
         .collect();
 
-    pb.set_position(total_to_scan as u64);
+    // Sequential database write phase for this batch
+    let mut stats = BatchStats::default();
 
-    // Check if we were interrupted
-    if interrupted.load(Ordering::SeqCst) {
-        pb.finish_with_message("interrupted");
-        println!("  Scan interrupted. Progress saved - run scan again to resume.");
-        // Don't update last_scanned so we'll rescan on next run
-        return Ok((0, 0, 0));
-    }
-
-    if interactive {
-        pb.set_message("writing to database...");
-    } else {
-        println!("  writing results to database...");
-    }
-
-    // Sequential database write phase
-    let mut processed_files = 0;
-    let mut processed_entries = 0;
-    let mut errors = Vec::new();
-
-    let mut headers_skipped = 0;
-
-    // One transaction for the whole write-back phase: a DB error part-way
-    // through rolls back rather than leaving the catalogue half-updated, and
-    // the many per-file upserts commit once instead of once each.
     let tx = conn.unchecked_transaction()?;
 
     for result in results {
@@ -413,9 +491,9 @@ fn scan_source(
                     hashes.size as i64,
                 )?;
                 files::upsert_file_location(conn, &hashes.sha1, source.id, &relative_path, None)?;
-                processed_files += 1;
+                stats.files += 1;
                 if header_skipped.is_some() {
-                    headers_skipped += 1;
+                    stats.headers_skipped += 1;
                 }
             }
             ScanResult::Archive {
@@ -438,46 +516,24 @@ fn scan_source(
                         &relative_path,
                         Some(&entry.name),
                     )?;
-                    processed_entries += 1;
+                    stats.entries += 1;
                 }
-                processed_files += 1;
+                stats.files += 1;
             }
             ScanResult::Error {
                 relative_path,
                 error,
             } => {
                 if !error.is_empty() && error != "Interrupted" {
-                    errors.push((relative_path, error));
+                    stats.errors.push((relative_path, error));
                 }
             }
         }
     }
 
-    pb.finish_with_message("done");
-
-    // Report errors
-    for (path, error) in &errors {
-        println!("  Warning: {}: {}", path, error);
-    }
-
-    // Update source last_scanned
-    files::update_source_scanned(conn, source.id)?;
-
     tx.commit()?;
 
-    if headers_skipped > 0 {
-        println!(
-            "  {} files, {} archive entries ({} headers skipped)",
-            processed_files, processed_entries, headers_skipped
-        );
-    } else {
-        println!(
-            "  {} files, {} archive entries",
-            processed_files, processed_entries
-        );
-    }
-
-    Ok((processed_files, processed_entries, skipped))
+    Ok(stats)
 }
 
 /// Parse SQLite datetime format to SystemTime
@@ -549,5 +605,44 @@ mod tests {
         let mame = source_with(28, "/Volumes/Data/ToSort/MAME");
         assert!(source_matches(&mame, "ToSort/MAME"));
         assert!(!source_matches(&mame, "Library/ROMs"));
+    }
+
+    #[test]
+    fn scan_catalogues_files_then_resumes_uncatalogued() {
+        use crate::db::Database;
+        use crate::db::files::{add_source, catalogued_paths, get_source_by_path};
+
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(dir.path().join("a.rom"), b"alpha").unwrap();
+        std::fs::write(dir.path().join("b.rom"), b"bravo").unwrap();
+        let root = dir.path().to_str().unwrap();
+
+        let db = Database::open_in_memory().unwrap();
+        let conn = db.conn();
+        add_source(conn, root, false).unwrap();
+        let source = get_source_by_path(conn, root).unwrap().unwrap();
+
+        // A full scan catalogues every file via the batch path.
+        let (files, _entries, _skipped) = scan_source(conn, &source, false).unwrap();
+        assert_eq!(files, 2);
+        assert_eq!(catalogued_paths(conn, source.id).unwrap().len(), 2);
+
+        // Force last_scanned into the future so the modified-since filter would
+        // skip every file. A newly added, still-uncatalogued file must be
+        // scanned anyway — this is the resume guarantee, independent of mtime.
+        conn.execute(
+            "UPDATE sources SET last_scanned = '2999-01-01 00:00:00' WHERE id = ?",
+            [source.id],
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("c.rom"), b"charlie").unwrap();
+
+        let source = get_source_by_path(conn, root).unwrap().unwrap();
+        let (files2, _entries2, skipped2) = scan_source(conn, &source, false).unwrap();
+        assert_eq!(files2, 1, "only the uncatalogued newcomer is hashed");
+        assert_eq!(skipped2, 2, "the two already-catalogued files are skipped");
+        let paths = catalogued_paths(conn, source.id).unwrap();
+        assert_eq!(paths.len(), 3);
+        assert!(paths.contains("c.rom"));
     }
 }
