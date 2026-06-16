@@ -335,6 +335,21 @@ pub fn catalogued_paths(
     Ok(paths)
 }
 
+/// Every distinct content SHA1 catalogued at a physical path within a source.
+///
+/// A loose file holds one content; an archive holds one per entry. Used to check
+/// that deleting a path can't destroy the only copy of any content it holds.
+pub fn contents_at_location(conn: &Connection, source_id: i64, path: &str) -> Result<Vec<String>> {
+    let mut stmt = conn
+        .prepare("SELECT DISTINCT sha1 FROM file_locations WHERE source_id = ?1 AND path = ?2")?;
+    let rows = stmt.query_map(params![source_id, path], |row| row.get::<_, String>(0))?;
+    let mut out = Vec::new();
+    for sha1 in rows {
+        out.push(sha1?);
+    }
+    Ok(out)
+}
+
 /// Remove stale file locations (not seen since a given time)
 pub fn remove_stale_locations(conn: &Connection, source_id: i64, before: &str) -> Result<i64> {
     let deleted = conn.execute(

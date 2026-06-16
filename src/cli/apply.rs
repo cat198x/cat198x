@@ -15,6 +15,56 @@ use super::quarantine::move_to_quarantine;
 
 use super::{open_database, plan::load_latest_plan};
 
+/// Confirm every content held at `abs_path` also exists in another physical
+/// location on disk, so a plan's delete operation cannot destroy the only copy.
+///
+/// A plan marks a file for deletion because its content is held elsewhere, but
+/// the plan reflects the catalogue when it was generated — a copy recorded then
+/// may since have been moved or removed. Re-checking at apply time (the same
+/// existence-verified-delete net `reclaim` uses) means a stale record can't turn
+/// a delete into data loss. Returns false — refuse the delete — if the path's
+/// source can't be resolved, its contents aren't catalogued, or any content has
+/// no surviving on-disk copy outside this path.
+fn delete_has_surviving_copy(
+    conn: &rusqlite::Connection,
+    sources: &[crate::db::files::Source],
+    abs_path: &str,
+) -> Result<bool> {
+    use crate::db::files;
+
+    let Some((source_id, rel)) = files::resolve_in_sources(sources, abs_path) else {
+        return Ok(false);
+    };
+    let sha1s = files::contents_at_location(conn, source_id, &rel)?;
+    if sha1s.is_empty() {
+        return Ok(false);
+    }
+    for sha1 in &sha1s {
+        let mut survives = false;
+        for loc in files::get_file_locations(conn, sha1)? {
+            // The copy we're about to delete doesn't count as its own backup.
+            if loc.source_id == source_id && loc.path == rel {
+                continue;
+            }
+            let Some(root) = sources
+                .iter()
+                .find(|s| s.id == loc.source_id)
+                .map(|s| s.path.trim_end_matches('/').to_string())
+            else {
+                continue;
+            };
+            if std::path::Path::new(&format!("{}/{}", root, loc.path)).exists() {
+                survives = true;
+                break;
+            }
+        }
+        if !survives {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
 /// Run the apply command
 pub fn run(
     dry_run: bool,
@@ -313,6 +363,28 @@ pub fn run(
                 if dry_run {
                     success_count += 1;
                     continue;
+                }
+
+                // Verify-before-delete: a plan deletes a file only because its
+                // content is held elsewhere, but never destroy the last copy on
+                // a stale record. Refuse if no surviving copy physically exists.
+                match delete_has_surviving_copy(db.conn(), &sources, path) {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        eprintln!(
+                            "  REFUSED: no surviving copy of {} found on disk — not deleting",
+                            truncate_path(path, 40)
+                        );
+                        op.status = OperationStatus::Failed;
+                        error_count += 1;
+                        continue;
+                    }
+                    Err(e) => {
+                        eprintln!("  ERROR verifying surviving copy — not deleting: {:#}", e);
+                        op.status = OperationStatus::Failed;
+                        error_count += 1;
+                        continue;
+                    }
                 }
 
                 match fs::remove_file(path) {
@@ -962,4 +1034,59 @@ pub fn run_rollback(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::Database;
+    use crate::db::files::{add_source, get_source_by_path, upsert_file, upsert_file_location};
+
+    // A delete is allowed only while a surviving copy physically exists; once the
+    // other copy is gone, the same record must no longer authorise the delete.
+    #[test]
+    fn delete_refused_when_no_surviving_copy_on_disk() {
+        let tosort = tempfile::TempDir::new().unwrap();
+        let library = tempfile::TempDir::new().unwrap();
+        let tosort_root = tosort.path().to_str().unwrap();
+        let library_root = library.path().to_str().unwrap();
+
+        // The same content exists physically in both the staging source and the
+        // library, and is catalogued in both.
+        std::fs::write(tosort.path().join("game.zip"), b"content").unwrap();
+        std::fs::write(library.path().join("game.zip"), b"content").unwrap();
+
+        let db = Database::open_in_memory().unwrap();
+        let conn = db.conn();
+        add_source(conn, tosort_root, false).unwrap();
+        add_source(conn, library_root, false).unwrap();
+        upsert_file(conn, "AAAA", None, None, None, 7).unwrap();
+        let ts = get_source_by_path(conn, tosort_root).unwrap().unwrap();
+        let lib = get_source_by_path(conn, library_root).unwrap().unwrap();
+        upsert_file_location(conn, "AAAA", ts.id, "game.zip", None).unwrap();
+        upsert_file_location(conn, "AAAA", lib.id, "game.zip", None).unwrap();
+
+        let sources = crate::db::files::list_sources(conn).unwrap();
+        let tosort_abs = format!("{}/game.zip", tosort_root);
+
+        // Library copy present on disk → safe to delete the staging copy.
+        assert!(delete_has_surviving_copy(conn, &sources, &tosort_abs).unwrap());
+
+        // Library copy gone on disk (stale catalogue record) → refuse the delete.
+        std::fs::remove_file(library.path().join("game.zip")).unwrap();
+        assert!(!delete_has_surviving_copy(conn, &sources, &tosort_abs).unwrap());
+    }
+
+    // A path whose contents aren't catalogued can't be reasoned about — refuse.
+    #[test]
+    fn delete_refused_for_uncatalogued_path() {
+        let tosort = tempfile::TempDir::new().unwrap();
+        let root = tosort.path().to_str().unwrap();
+        let db = Database::open_in_memory().unwrap();
+        let conn = db.conn();
+        add_source(conn, root, false).unwrap();
+        let sources = crate::db::files::list_sources(conn).unwrap();
+        let abs = format!("{}/unknown.zip", root);
+        assert!(!delete_has_surviving_copy(conn, &sources, &abs).unwrap());
+    }
 }
