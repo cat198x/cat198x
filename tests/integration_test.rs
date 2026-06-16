@@ -141,7 +141,7 @@ fn test_full_workflow_init_to_status() {
     // Create an empty file (matches one of our test DAT entries)
     create_test_rom(&env.roms_dir, "game1.rom", b"");
 
-    cli::scan::run(None, false, env.data_dir_opt()).expect("Scan failed");
+    cli::scan::run(None, false, None, env.data_dir_opt()).expect("Scan failed");
 
     // Verify file was indexed
     let file_count = cat198x::db::files::count_files_in_source(conn, sources[0].id).unwrap();
@@ -304,7 +304,7 @@ fn test_scan_indexes_loose_files() {
     .unwrap();
 
     // Scan
-    cli::scan::run(None, false, env.data_dir_opt()).unwrap();
+    cli::scan::run(None, false, None, env.data_dir_opt()).unwrap();
 
     let db = env.db();
     let conn = db.conn();
@@ -339,7 +339,7 @@ fn test_scan_updates_last_scanned() {
     assert!(sources[0].last_scanned.is_none());
 
     // Scan
-    cli::scan::run(None, false, env.data_dir_opt()).unwrap();
+    cli::scan::run(None, false, None, env.data_dir_opt()).unwrap();
 
     // Check last_scanned is updated
     let sources = cat198x::db::files::list_sources(conn).unwrap();
@@ -531,7 +531,7 @@ fn test_file_hashing_correctness() {
     )
     .unwrap();
 
-    cli::scan::run(None, false, env.data_dir_opt()).unwrap();
+    cli::scan::run(None, false, None, env.data_dir_opt()).unwrap();
 
     let db = env.db();
     let conn = db.conn();
@@ -654,7 +654,7 @@ fn test_plan_generation() {
     )
     .unwrap();
 
-    cli::scan::run(None, false, env.data_dir_opt()).unwrap();
+    cli::scan::run(None, false, None, env.data_dir_opt()).unwrap();
 
     // Create destination directory
     let dest_dir = env.temp_dir.path().join("output");
@@ -690,7 +690,7 @@ fn test_incremental_scan_skips_unchanged() {
     .unwrap();
 
     // First scan - should process the file
-    cli::scan::run(None, false, env.data_dir_opt()).unwrap();
+    cli::scan::run(None, false, None, env.data_dir_opt()).unwrap();
 
     let db = env.db();
     let conn = db.conn();
@@ -703,7 +703,7 @@ fn test_incremental_scan_skips_unchanged() {
     std::thread::sleep(std::time::Duration::from_millis(100));
 
     // Second scan - should skip unchanged file
-    cli::scan::run(None, false, env.data_dir_opt()).unwrap();
+    cli::scan::run(None, false, None, env.data_dir_opt()).unwrap();
 
     // last_scanned should be updated even if no files changed
     let sources = cat198x::db::files::list_sources(conn).unwrap();
@@ -780,7 +780,7 @@ fn test_plan_apply_rollback_cycle() {
     .expect("Source add failed");
 
     // Scan to index the file
-    cli::scan::run(None, false, env.data_dir_opt()).expect("Scan failed");
+    cli::scan::run(None, false, None, env.data_dir_opt()).expect("Scan failed");
 
     // Create destination directory
     let dest_dir = env.temp_dir.path().join("output");
@@ -904,7 +904,7 @@ fn test_apply_from_zip_archive() {
     )
     .expect("Source add failed");
 
-    cli::scan::run(None, false, env.data_dir_opt()).expect("Scan failed");
+    cli::scan::run(None, false, None, env.data_dir_opt()).expect("Scan failed");
 
     // Verify the file inside the archive was indexed
     let db = env.db();
@@ -982,7 +982,7 @@ fn test_stale_plan_detection() {
     )
     .unwrap();
 
-    cli::scan::run(None, false, env.data_dir_opt()).unwrap();
+    cli::scan::run(None, false, None, env.data_dir_opt()).unwrap();
 
     let dest_dir = env.temp_dir.path().join("output");
     fs::create_dir_all(&dest_dir).unwrap();
@@ -997,7 +997,7 @@ fn test_stale_plan_detection() {
 
     // Now modify the state by adding a new file and rescanning
     create_test_rom(&env.roms_dir, "new_file.rom", b"new content");
-    cli::scan::run(None, true, env.data_dir_opt()).unwrap(); // Full rescan
+    cli::scan::run(None, true, None, env.data_dir_opt()).unwrap(); // Full rescan
 
     // Apply should detect stale plan and not execute
     // (The apply command prints a message but doesn't error)
@@ -1100,7 +1100,7 @@ fn test_multi_file_plan_apply() {
     )
     .unwrap();
 
-    cli::scan::run(None, false, env.data_dir_opt()).unwrap();
+    cli::scan::run(None, false, None, env.data_dir_opt()).unwrap();
 
     // Configure destination
     let dest_dir = env.temp_dir.path().join("output");
@@ -1202,7 +1202,7 @@ fn test_apply_skips_already_correct_files() {
         env.data_dir_opt(),
     )
     .unwrap();
-    cli::scan::run(None, false, env.data_dir_opt()).unwrap();
+    cli::scan::run(None, false, None, env.data_dir_opt()).unwrap();
 
     let db = env.db();
     cat198x::db::config::set_dest_path(db.conn(), "Skip Test", dest_dir.to_str().unwrap()).unwrap();
@@ -1821,7 +1821,7 @@ fn test_export_filters() {
     )
     .unwrap();
 
-    cli::scan::run(None, false, env.data_dir_opt()).unwrap();
+    cli::scan::run(None, false, None, env.data_dir_opt()).unwrap();
 
     // Export with --have filter
     let have_path = env.temp_dir.path().join("have.json");
@@ -1996,7 +1996,7 @@ fn test_stats_command() {
     )
     .expect("Source add failed");
 
-    cli::scan::run(None, false, env.data_dir_opt()).unwrap();
+    cli::scan::run(None, false, None, env.data_dir_opt()).unwrap();
 
     // Stats should run without error
     cli::stats::run(None, env.data_dir_opt()).expect("Stats command failed");
@@ -2043,7 +2043,7 @@ fn test_recursive_add_plans_into_hierarchical_destination() {
         env.data_dir_opt(),
     )
     .unwrap();
-    cli::scan::run(None, false, env.data_dir_opt()).unwrap();
+    cli::scan::run(None, false, None, env.data_dir_opt()).unwrap();
 
     // A library-wide default destination — no per-collection config at all.
     let dest_root = env.temp_dir.path().join("library");
@@ -2175,7 +2175,7 @@ fn test_zip_output_format_plans_applies_and_converges() {
         env.data_dir_opt(),
     )
     .unwrap();
-    cli::scan::run(None, false, env.data_dir_opt()).unwrap();
+    cli::scan::run(None, false, None, env.data_dir_opt()).unwrap();
 
     // Library-wide defaults: a destination and zip output.
     let dest_root = env.temp_dir.path().join("library");
@@ -2288,7 +2288,7 @@ fn test_apply_skip_repack_defers_then_resumes() {
     for dir in [env.roms_dir.clone(), roms2.clone()] {
         cli::source::run(SourceCommands::Add { path: dir }, env.data_dir_opt()).unwrap();
     }
-    cli::scan::run(None, false, env.data_dir_opt()).unwrap();
+    cli::scan::run(None, false, None, env.data_dir_opt()).unwrap();
 
     let dest_root = env.temp_dir.path().join("library");
     fs::create_dir_all(&dest_root).unwrap();
@@ -2379,7 +2379,7 @@ fn test_move_repack_deletes_source_and_rollback_restores_it() {
         env.data_dir_opt(),
     )
     .unwrap();
-    cli::scan::run(None, false, env.data_dir_opt()).unwrap();
+    cli::scan::run(None, false, None, env.data_dir_opt()).unwrap();
 
     let dest_root = env.temp_dir.path().join("library");
     fs::create_dir_all(&dest_root).unwrap();
@@ -2465,7 +2465,7 @@ fn test_plan_records_per_collection_breakdown() {
         env.data_dir_opt(),
     )
     .unwrap();
-    cli::scan::run(None, false, env.data_dir_opt()).unwrap();
+    cli::scan::run(None, false, None, env.data_dir_opt()).unwrap();
 
     let dest = env.temp_dir.path().join("out");
     let db = env.db();
@@ -2523,7 +2523,7 @@ fn test_move_mode_relocates_and_removes_source() {
         env.data_dir_opt(),
     )
     .unwrap();
-    cli::scan::run(None, false, env.data_dir_opt()).unwrap();
+    cli::scan::run(None, false, None, env.data_dir_opt()).unwrap();
 
     let dest_root = env.temp_dir.path().join("library");
     cli::config::run(
@@ -2603,7 +2603,7 @@ fn test_apply_prune_empty_removes_emptied_source_subdir() {
         env.data_dir_opt(),
     )
     .unwrap();
-    cli::scan::run(None, false, env.data_dir_opt()).unwrap();
+    cli::scan::run(None, false, None, env.data_dir_opt()).unwrap();
 
     let dest_root = env.temp_dir.path().join("library");
     cli::config::run(

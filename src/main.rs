@@ -62,6 +62,13 @@ enum Commands {
         /// Force full rescan (ignore cached hashes)
         #[arg(short, long)]
         full: bool,
+
+        /// Only scan a subtree within the source, relative to its root (e.g.
+        /// "Sinclair"). Lets a huge source be scanned in bounded chunks over a
+        /// slow mount; files are still catalogued under the source. Requires a
+        /// single source.
+        #[arg(long, value_name = "SUBPATH")]
+        path: Option<String>,
     },
 
     /// Show collection status and completeness
@@ -275,7 +282,7 @@ fn main() -> Result<()> {
         Commands::Init { path } => init::run(path, cli.data_dir),
         Commands::Dat(cmd) => dat_cmd::run(cmd, cli.data_dir),
         Commands::Source(cmd) => source::run(cmd, cli.data_dir),
-        Commands::Scan { source, full } => scan::run(source, full, cli.data_dir),
+        Commands::Scan { source, full, path } => scan::run(source, full, path, cli.data_dir),
         Commands::Status {
             collection,
             detailed,
