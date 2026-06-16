@@ -90,7 +90,12 @@ fn source_matches(source: &files::Source, selector: &str) -> bool {
 }
 
 /// Run the scan command
-pub fn run(source: Option<Vec<String>>, full: bool, data_dir: Option<PathBuf>) -> Result<()> {
+pub fn run(
+    source: Option<Vec<String>>,
+    full: bool,
+    subtree: Option<String>,
+    data_dir: Option<PathBuf>,
+) -> Result<()> {
     let db = open_database(data_dir)?;
     let conn = db.conn();
 
@@ -119,6 +124,15 @@ pub fn run(source: Option<Vec<String>>, full: bool, data_dir: Option<PathBuf>) -
         return Ok(());
     }
 
+    // A subtree only makes sense against one source — its meaning is ambiguous
+    // across several, and chunked scanning targets one big source at a time.
+    if subtree.is_some() && sources.len() != 1 {
+        anyhow::bail!(
+            "--path scans a subtree of a single source; narrow with --source (matched {} sources)",
+            sources.len()
+        );
+    }
+
     println!(
         "Scanning {} source{}...",
         sources.len(),
@@ -134,7 +148,7 @@ pub fn run(source: Option<Vec<String>>, full: bool, data_dir: Option<PathBuf>) -
     let mut skipped_files = 0;
 
     for source in &sources {
-        let (files, entries, skipped) = scan_source(conn, source, full)?;
+        let (files, entries, skipped) = scan_source(conn, source, full, subtree.as_deref())?;
         total_files += files;
         total_entries += entries;
         skipped_files += skipped;
@@ -156,17 +170,54 @@ pub fn run(source: Option<Vec<String>>, full: bool, data_dir: Option<PathBuf>) -
     Ok(())
 }
 
-/// Scan a single source directory with parallel hashing
+/// Scan a single source directory with parallel hashing.
+///
+/// When `subtree` is set, only that subdirectory (relative to the source root)
+/// is walked, but files are still catalogued under the source with paths
+/// relative to its root. This lets a huge source on a slow mount be scanned in
+/// bounded chunks — one walk per subtree completes and commits instead of one
+/// unbounded walk of the whole tree. A subtree scan is partial by definition, so
+/// it never stamps `last_scanned` (that would falsely mark the whole source
+/// done); the resume logic still picks up the rest on later runs.
 fn scan_source(
     conn: &rusqlite::Connection,
     source: &Source,
     full: bool,
+    subtree: Option<&str>,
 ) -> Result<(usize, usize, usize)> {
-    println!("Scanning: {}", source.path);
-
     let source_path = Path::new(&source.path);
-    if !source_path.exists() {
-        println!("  Warning: Source path does not exist, skipping");
+
+    // Resolve and validate the walk root: the source itself, or a subtree of it.
+    let walk_root = match subtree {
+        Some(sub) => {
+            // Keep the walk inside the source. `Path::starts_with` is lexical and
+            // wouldn't catch `..` (it compares components, not resolved paths), so
+            // reject any subtree that isn't a plain relative descent — no absolute
+            // path, no `..`, no leading `/`.
+            use std::path::Component;
+            let valid = Path::new(sub)
+                .components()
+                .all(|c| matches!(c, Component::Normal(_) | Component::CurDir));
+            if sub.is_empty() || !valid {
+                anyhow::bail!("--path {sub:?} escapes the source root");
+            }
+            source_path.join(sub)
+        }
+        None => source_path.to_path_buf(),
+    };
+
+    match subtree {
+        Some(sub) => println!("Scanning: {} (subtree {})", source.path, sub),
+        None => println!("Scanning: {}", source.path),
+    }
+
+    if !walk_root.exists() {
+        let what = if subtree.is_some() {
+            "Subtree"
+        } else {
+            "Source path"
+        };
+        println!("  Warning: {what} does not exist, skipping");
         return Ok((0, 0, 0));
     }
 
@@ -182,7 +233,7 @@ fn scan_source(
 
     // Single pass: collect all files, then partition into to-scan and skipped
     // Follow symlinks so users can symlink ROM folders from external drives
-    let all_files: Vec<PathBuf> = WalkDir::new(source_path)
+    let all_files: Vec<PathBuf> = WalkDir::new(&walk_root)
         .follow_links(true)
         .into_iter()
         .filter_map(|e| e.ok())
@@ -233,7 +284,11 @@ fn scan_source(
 
     if total_to_scan == 0 {
         println!("  No new or modified files to scan");
-        files::update_source_scanned(conn, source.id)?;
+        // A subtree scan covers only part of the source, so it must not stamp
+        // the source as fully scanned.
+        if subtree.is_none() {
+            files::update_source_scanned(conn, source.id)?;
+        }
         return Ok((0, 0, skipped));
     }
 
@@ -318,8 +373,11 @@ fn scan_source(
 
     pb.finish_with_message("done");
 
-    // Update source last_scanned (only on a fully completed scan).
-    files::update_source_scanned(conn, source.id)?;
+    // Update source last_scanned (only on a fully completed scan of the whole
+    // source — a subtree scan is partial and must not stamp it).
+    if subtree.is_none() {
+        files::update_source_scanned(conn, source.id)?;
+    }
 
     if headers_skipped > 0 {
         println!(
@@ -623,7 +681,7 @@ mod tests {
         let source = get_source_by_path(conn, root).unwrap().unwrap();
 
         // A full scan catalogues every file via the batch path.
-        let (files, _entries, _skipped) = scan_source(conn, &source, false).unwrap();
+        let (files, _entries, _skipped) = scan_source(conn, &source, false, None).unwrap();
         assert_eq!(files, 2);
         assert_eq!(catalogued_paths(conn, source.id).unwrap().len(), 2);
 
@@ -638,11 +696,69 @@ mod tests {
         std::fs::write(dir.path().join("c.rom"), b"charlie").unwrap();
 
         let source = get_source_by_path(conn, root).unwrap().unwrap();
-        let (files2, _entries2, skipped2) = scan_source(conn, &source, false).unwrap();
+        let (files2, _entries2, skipped2) = scan_source(conn, &source, false, None).unwrap();
         assert_eq!(files2, 1, "only the uncatalogued newcomer is hashed");
         assert_eq!(skipped2, 2, "the two already-catalogued files are skipped");
         let paths = catalogued_paths(conn, source.id).unwrap();
         assert_eq!(paths.len(), 3);
         assert!(paths.contains("c.rom"));
+    }
+
+    #[test]
+    fn scan_subtree_catalogues_only_that_subtree_and_keeps_source_relative_paths() {
+        use crate::db::Database;
+        use crate::db::files::{add_source, catalogued_paths, get_source_by_path};
+
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(dir.path().join("Sinclair")).unwrap();
+        std::fs::create_dir_all(dir.path().join("Atari")).unwrap();
+        std::fs::write(dir.path().join("Sinclair/game.rom"), b"spectrum").unwrap();
+        std::fs::write(dir.path().join("Atari/game.rom"), b"atari").unwrap();
+        let root = dir.path().to_str().unwrap();
+
+        let db = Database::open_in_memory().unwrap();
+        let conn = db.conn();
+        add_source(conn, root, false).unwrap();
+        let source = get_source_by_path(conn, root).unwrap().unwrap();
+
+        // Scanning the Sinclair subtree catalogues only its file, under a path
+        // relative to the source root — and does not stamp last_scanned.
+        let (files, _entries, _skipped) =
+            scan_source(conn, &source, false, Some("Sinclair")).unwrap();
+        assert_eq!(files, 1);
+        let paths = catalogued_paths(conn, source.id).unwrap();
+        assert_eq!(paths.len(), 1);
+        assert!(paths.contains("Sinclair/game.rom"));
+        assert!(
+            get_source_by_path(conn, root)
+                .unwrap()
+                .unwrap()
+                .last_scanned
+                .is_none(),
+            "a subtree scan must not stamp the source as fully scanned"
+        );
+
+        // A second subtree adds to the same source's catalogue.
+        let (files2, _e2, _s2) = scan_source(conn, &source, false, Some("Atari")).unwrap();
+        assert_eq!(files2, 1);
+        let paths = catalogued_paths(conn, source.id).unwrap();
+        assert_eq!(paths.len(), 2);
+        assert!(paths.contains("Atari/game.rom"));
+    }
+
+    #[test]
+    fn scan_subtree_escaping_source_root_is_rejected() {
+        use crate::db::Database;
+        use crate::db::files::{add_source, get_source_by_path};
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path().to_str().unwrap();
+        let db = Database::open_in_memory().unwrap();
+        let conn = db.conn();
+        add_source(conn, root, false).unwrap();
+        let source = get_source_by_path(conn, root).unwrap().unwrap();
+
+        let err = scan_source(conn, &source, false, Some("../escape")).unwrap_err();
+        assert!(err.to_string().contains("escapes the source root"));
     }
 }
