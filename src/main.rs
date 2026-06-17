@@ -4,10 +4,11 @@ use clap_complete::{Shell, generate};
 use std::io;
 
 use cat198x::cli::{
-    apply as apply_cmd, catalogue as catalogue_cmd, config as config_cmd, dat as dat_cmd,
-    doctor as doctor_cmd, export as export_cmd, init, plan as plan_cmd, prune as prune_cmd,
-    quarantine as quarantine_cmd, reclaim as reclaim_cmd, scan, source, stats as stats_cmd, status,
-    torrent as torrent_cmd, unknowns as unknowns_cmd, update as update_cmd,
+    apply as apply_cmd, catalogue as catalogue_cmd, clean_superseded as clean_superseded_cmd,
+    config as config_cmd, dat as dat_cmd, doctor as doctor_cmd, export as export_cmd, init,
+    plan as plan_cmd, prune as prune_cmd, quarantine as quarantine_cmd, reclaim as reclaim_cmd,
+    scan, source, stats as stats_cmd, status, torrent as torrent_cmd, unknowns as unknowns_cmd,
+    update as update_cmd,
 };
 use cat198x::{ConfigCommands, DatCommands, QuarantineCommands, SourceCommands, TorrentCommands};
 
@@ -119,6 +120,25 @@ enum Commands {
         /// `Thumbs.db`, `desktop.ini`), deleting that cruft with it.
         #[arg(long)]
         ignore_os_junk: bool,
+    },
+
+    /// Remove loose files stranded under the library beside the canonical
+    /// archive that already holds their content (e.g. the MAME loose layer left
+    /// after the per-machine-zip split). A file goes only when its content is
+    /// preserved in the canonical archive the active DAT assigns it, that archive
+    /// is a desired-state member, the file is not itself a canonical destination,
+    /// and a surviving copy is verified on disk. Dry-run unless `--execute`.
+    CleanSuperseded {
+        /// Limit the candidate scan to these sets — the first path segment under
+        /// the library (e.g. `MAME`). Repeatable. Default: the whole library. The
+        /// safety checks always consider every collection, whatever the scope.
+        #[arg(long = "set", value_name = "SET")]
+        set: Option<Vec<String>>,
+
+        /// Actually remove the files (default: report only). Each is a
+        /// verify-before-delete hard delete and is journaled for audit.
+        #[arg(long)]
+        execute: bool,
     },
 
     /// Free space by deleting a source's files whose every content is already
@@ -297,6 +317,9 @@ fn main() -> Result<()> {
             remove,
             ignore_os_junk,
         } => prune_cmd::run(source, remove, ignore_os_junk, cli.data_dir),
+        Commands::CleanSuperseded { set, execute } => {
+            clean_superseded_cmd::run(set, execute, cli.data_dir)
+        }
         Commands::Reclaim { source, execute } => reclaim_cmd::run(source, execute, cli.data_dir),
         Commands::Stats { group_by } => stats_cmd::run(group_by.as_deref(), cli.data_dir),
         Commands::Config(cmd) => config_cmd::run(cmd, cli.data_dir),
