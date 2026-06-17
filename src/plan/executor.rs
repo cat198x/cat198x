@@ -19,6 +19,59 @@ use crate::plan::{OperationKind, OperationStatus, Plan, SourceRef};
 use crate::scanner::chd;
 use crate::util::{format_bytes, verify_sha1};
 
+/// Confirm every content held at `abs_path` also exists in another physical
+/// location on disk, so removing the file cannot destroy the only copy.
+///
+/// A delete is decided from the catalogue, but the catalogue may have drifted
+/// since — a copy recorded then may have moved or gone. Re-checking on disk at
+/// delete time means a stale record can't turn a delete into data loss. Returns
+/// false — refuse the delete — if the path's source can't be resolved, its
+/// contents aren't catalogued, or any content has no surviving on-disk copy
+/// outside this path.
+///
+/// This is the shared verify-before-delete net: `apply`'s delete operations and
+/// `clean-superseded` both gate on it so the safety check can't drift between
+/// them.
+pub fn delete_has_surviving_copy(
+    conn: &rusqlite::Connection,
+    sources: &[crate::db::files::Source],
+    abs_path: &str,
+) -> Result<bool> {
+    use crate::db::files;
+
+    let Some((source_id, rel)) = files::resolve_in_sources(sources, abs_path) else {
+        return Ok(false);
+    };
+    let sha1s = files::contents_at_location(conn, source_id, &rel)?;
+    if sha1s.is_empty() {
+        return Ok(false);
+    }
+    for sha1 in &sha1s {
+        let mut survives = false;
+        for loc in files::get_file_locations(conn, sha1)? {
+            // The copy we're about to delete doesn't count as its own backup.
+            if loc.source_id == source_id && loc.path == rel {
+                continue;
+            }
+            let Some(root) = sources
+                .iter()
+                .find(|s| s.id == loc.source_id)
+                .map(|s| s.path.trim_end_matches('/').to_string())
+            else {
+                continue;
+            };
+            if std::path::Path::new(&format!("{}/{}", root, loc.path)).exists() {
+                survives = true;
+                break;
+            }
+        }
+        if !survives {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
 /// Verify a written file against its catalogued SHA1.
 ///
 /// A CHD is catalogued by its *internal* (logical-data) SHA1, read from the
