@@ -306,7 +306,6 @@ fn check_unique_destinations(
 pub fn generate_plan_filtered(conn: &Connection, opts: &PlanOptions) -> Result<Plan> {
     let dat_filter = opts.dat_filter.as_deref();
     let default_dest = opts.default_dest.as_deref();
-    let default_format = opts.default_format;
 
     // Calculate state hash
     let state_hash = compute_state_hash(conn)?;
@@ -408,28 +407,12 @@ pub fn generate_plan_filtered(conn: &Connection, opts: &PlanOptions) -> Result<P
         planned_any = true;
         println!("Planning for: {} (v{})", collection.name, version.version);
 
-        // Effective merge mode, resolved like the output format: an explicit
-        // per-collection setting wins, then a per-set rule (a config row keyed on
-        // the set — the top segment of the library path), then the library-wide
-        // default. Split mode drops a clone's inherited (merge-tagged) ROMs from
-        // its placement so they live only in the parent; non-merged places every
-        // ROM the DAT lists per game. Merged is not yet wired in the planner.
-        let explicit_merge = cfg.as_ref().and_then(|c| c.merge_mode.clone());
-        let set_merge = match explicit_merge {
-            Some(_) => None,
-            None => {
-                let set = hierarchy.split('/').next().unwrap_or(hierarchy.as_str());
-                if set != hierarchy {
-                    db_config::get_collection_config(conn, set)?.and_then(|c| c.merge_mode)
-                } else {
-                    None
-                }
-            }
-        };
-        let merge_mode = resolve_merge_mode(
-            explicit_merge.as_deref().or(set_merge.as_deref()),
-            opts.default_merge_mode,
-        );
+        // Effective merge mode (explicit per-collection → per-set rule →
+        // library-wide default). Split mode drops a clone's inherited
+        // (merge-tagged) ROMs from its placement so they live only in the parent;
+        // non-merged places every ROM the DAT lists per game. Merged is not yet
+        // wired in the planner. Shared with `compute_desired_state`.
+        let merge_mode = effective_merge_mode(conn, opts, cfg.as_ref(), &hierarchy)?;
         if merge_mode == MergeMode::Merged {
             println!(
                 "  note: merged mode is not yet implemented in the planner; \
@@ -467,31 +450,13 @@ pub fn generate_plan_filtered(conn: &Connection, opts: &PlanOptions) -> Result<P
             _ => matches,
         };
 
-        // Effective output format, in precedence order: an explicit
-        // per-collection setting, then a per-set rule (a config row keyed on the
-        // set — the top segment of the library path, e.g. "TOSEC-PIX"), then the
-        // library-wide default. The per-set tier lets whole sets diverge — TOSEC
+        // Effective output format (explicit per-collection → per-set rule →
+        // library-wide default). The per-set tier lets whole sets diverge — TOSEC
         // kept as zip, TOSEC-PIX left loose for later PDF/collateral extraction —
         // without configuring every collection. Loose copies each ROM into place;
-        // zip/torrentzip packs each game into one archive.
-        let explicit_format = cfg.as_ref().and_then(|c| c.output_format.clone());
-        let set_format = match explicit_format {
-            Some(_) => None,
-            None => {
-                let set = hierarchy.split('/').next().unwrap_or(hierarchy.as_str());
-                // Only consult a per-set rule when there is a set prefix; a flat
-                // collection name is not a set and must not match itself here.
-                if set != hierarchy {
-                    db_config::get_collection_config(conn, set)?.and_then(|c| c.output_format)
-                } else {
-                    None
-                }
-            }
-        };
-        let format = resolve_output_format(
-            explicit_format.as_deref().or(set_format.as_deref()),
-            default_format,
-        );
+        // zip/torrentzip packs each game into one archive. Shared with
+        // `compute_desired_state`.
+        let format = effective_format(conn, opts, cfg.as_ref(), &hierarchy)?;
 
         let mut already_correct = 0;
         let mut to_write = 0;
@@ -1179,6 +1144,223 @@ fn plan_disk_matches(
     );
 
     counts
+}
+
+/// The effective merge mode for a collection, in precedence order: an explicit
+/// per-collection setting, then a per-set rule (a config row keyed on the set —
+/// the top segment of the library path), then the library-wide default. Shared
+/// by the planner and [`compute_desired_state`] so the two never disagree on
+/// which ROMs a game places — a disagreement would let the cleanup mis-identify a
+/// canonical archive.
+fn effective_merge_mode(
+    conn: &Connection,
+    opts: &PlanOptions,
+    cfg: Option<&db_config::CollectionConfig>,
+    hierarchy: &str,
+) -> Result<MergeMode> {
+    let explicit_merge = cfg.and_then(|c| c.merge_mode.clone());
+    let set_merge = match explicit_merge {
+        Some(_) => None,
+        None => {
+            let set = hierarchy.split('/').next().unwrap_or(hierarchy);
+            if set != hierarchy {
+                db_config::get_collection_config(conn, set)?.and_then(|c| c.merge_mode)
+            } else {
+                None
+            }
+        }
+    };
+    Ok(resolve_merge_mode(
+        explicit_merge.as_deref().or(set_merge.as_deref()),
+        opts.default_merge_mode,
+    ))
+}
+
+/// The effective output format for a collection, in the same precedence order as
+/// [`effective_merge_mode`]: explicit per-collection, then per-set rule, then the
+/// library-wide default. Shared by the planner and [`compute_desired_state`].
+fn effective_format(
+    conn: &Connection,
+    opts: &PlanOptions,
+    cfg: Option<&db_config::CollectionConfig>,
+    hierarchy: &str,
+) -> Result<OutputFormat> {
+    let explicit_format = cfg.and_then(|c| c.output_format.clone());
+    let set_format = match explicit_format {
+        Some(_) => None,
+        None => {
+            let set = hierarchy.split('/').next().unwrap_or(hierarchy);
+            if set != hierarchy {
+                db_config::get_collection_config(conn, set)?.and_then(|c| c.output_format)
+            } else {
+                None
+            }
+        }
+    };
+    Ok(resolve_output_format(
+        explicit_format.as_deref().or(set_format.as_deref()),
+        opts.default_format,
+    ))
+}
+
+/// The library's desired state, derived from the active DATs exactly as the
+/// planner derives placement.
+///
+/// Used by `clean-superseded` to decide which loose files under the library are
+/// safe to remove: a loose file may go only when its content is preserved in the
+/// canonical archive the active DAT assigns it to, and the file is not itself a
+/// desired placement of any collection. This captures both facts without running
+/// (and saving) a whole plan.
+pub struct DesiredState {
+    /// Content SHA1 → the canonical archive destination paths the active DATs
+    /// assign that content to (absolute). Populated only for the SHA1s the caller
+    /// passes in `interesting_sha1s`, so the index stays small on a large library.
+    pub archive_homes: HashMap<String, HashSet<String>>,
+    /// Every canonical destination path the active DATs designate — archive,
+    /// loose, or disk (absolute). A file sitting at one of these is itself a
+    /// desired-state member and must never be removed.
+    pub dest_paths: HashSet<String>,
+}
+
+/// Compute the desired state across every active collection in scope.
+///
+/// Mirrors [`generate_plan_filtered`]'s per-collection resolution (active
+/// version, library path, destination root, merge mode, 1G1R filter, output
+/// format, matched ROMs) but records *placements* rather than operations:
+///
+/// - for an archive-format collection, each game's canonical archive
+///   `<dest_root>/<game>.<ext>` and — for the content the caller cares about —
+///   the archive it belongs in;
+/// - for a loose-format collection, each ROM's canonical loose path;
+/// - for any `<disk>`, the loose `<dest_root>/<game>/<name>.chd` path.
+///
+/// Oversized meta-aggregate collections are skipped exactly as the planner skips
+/// them — they place nothing real.
+pub fn compute_desired_state(
+    conn: &Connection,
+    opts: &PlanOptions,
+    interesting_sha1s: &HashSet<String>,
+) -> Result<DesiredState> {
+    let mut state = DesiredState {
+        archive_homes: HashMap::new(),
+        dest_paths: HashSet::new(),
+    };
+
+    for collection in collections::list_collections(conn)? {
+        if let Some(pattern) = opts.dat_filter.as_deref()
+            && !glob_match(pattern, &collection.name)
+        {
+            continue;
+        }
+        let version = match collections::get_active_version(conn, collection.id)? {
+            Some(v) => v,
+            None => continue,
+        };
+        let cfg = db_config::get_collection_config(conn, &collection.name)?;
+        let hierarchy =
+            dats::primary_node_path(conn, version.id)?.unwrap_or_else(|| collection.name.clone());
+
+        if let Some(sets) = opts.set_filter.as_ref() {
+            let set = hierarchy.split('/').next().unwrap_or(hierarchy.as_str());
+            if !sets.iter().any(|s| s == set) {
+                continue;
+            }
+        }
+
+        let explicit = cfg.as_ref().and_then(|c| c.dest_path.as_deref());
+        let dest_root = match resolve_dest_root(explicit, opts.default_dest.as_deref(), &hierarchy)
+        {
+            Some(root) => root,
+            None => continue,
+        };
+
+        // A meta-aggregate places nothing real, so it contributes no desired
+        // state — skip it on the same cap the planner uses.
+        if count_match_rows_capped(conn, version.id, MAX_MATCH_ROWS)? > MAX_MATCH_ROWS {
+            continue;
+        }
+
+        let merge_mode = effective_merge_mode(conn, opts, cfg.as_ref(), &hierarchy)?;
+        let matches = find_matched_roms(
+            conn,
+            version.id,
+            &collection.name,
+            merge_mode == MergeMode::Split,
+        )?;
+        // Mirror the planner's 1G1R filter, so a variant it would not place is
+        // not recorded as a desired placement here either.
+        let matches = match cfg.as_ref().and_then(|c| c.extra_config.as_ref()) {
+            Some(extra) if extra.one_g_one_r => {
+                apply_one_g_one_r_filter(&matches, &extra.to_filter_preferences())
+            }
+            _ => matches,
+        };
+        let format = effective_format(conn, opts, cfg.as_ref(), &hierarchy)?;
+        let root = dest_root.trim_end_matches('/').to_string();
+
+        // CHDs are placed loose as `<game>/<name>.chd`, whatever the format.
+        let (disk_matches, rom_matches): (Vec<MatchedRom>, Vec<MatchedRom>) =
+            matches.into_iter().partition(|m| m.is_disk);
+        for m in &disk_matches {
+            state
+                .dest_paths
+                .insert(format!("{}/{}/{}.chd", root, m.game_name, m.rom_name));
+        }
+
+        match archive_format_tag(format) {
+            Some(tag) => {
+                // One canonical archive per game; record it and, for the content
+                // the caller cares about, which archive it belongs in.
+                let ext = archive_extension(tag);
+                let mut by_game: BTreeMap<&str, Vec<&MatchedRom>> = BTreeMap::new();
+                for m in &rom_matches {
+                    by_game.entry(m.game_name.as_str()).or_default().push(m);
+                }
+                for (game_name, gmatches) in by_game {
+                    let dest = format!("{}/{}.{}", root, game_name, ext);
+                    let mut seen = HashSet::new();
+                    for m in gmatches {
+                        if seen.insert((m.rom_name.as_str(), m.sha1.as_str()))
+                            && interesting_sha1s.contains(&m.sha1)
+                        {
+                            state
+                                .archive_homes
+                                .entry(m.sha1.clone())
+                                .or_default()
+                                .insert(dest.clone());
+                        }
+                    }
+                    state.dest_paths.insert(dest);
+                }
+            }
+            None => {
+                // Loose layout: a single-ROM game is placed flat, a multi-ROM game
+                // in its own folder — so count distinct ROMs per game first.
+                let mut roms_per_game: HashMap<&str, HashSet<&str>> = HashMap::new();
+                for m in &rom_matches {
+                    roms_per_game
+                        .entry(m.game_name.as_str())
+                        .or_default()
+                        .insert(m.rom_name.as_str());
+                }
+                for m in &rom_matches {
+                    let multi = roms_per_game
+                        .get(m.game_name.as_str())
+                        .map(|s| s.len())
+                        .unwrap_or(1)
+                        > 1;
+                    state.dest_paths.insert(build_dest_path(
+                        &root,
+                        &m.game_name,
+                        &m.rom_name,
+                        multi,
+                    ));
+                }
+            }
+        }
+    }
+
+    Ok(state)
 }
 
 /// Compute state hash for plan validation
@@ -2824,5 +3006,161 @@ mod tests {
 
         assert_eq!(filtered.len(), 1);
         assert!(filtered[0].game_name.contains("Japan"));
+    }
+
+    #[test]
+    fn desired_state_assigns_a_split_inherited_rom_to_the_parent_archive() {
+        let db = setup_db();
+        let conn = db.conn();
+        setup_parent_clone_fixture(conn);
+
+        let interesting: HashSet<String> = ["AAA".to_string(), "BBB".to_string()].into();
+        let state = compute_desired_state(
+            conn,
+            &PlanOptions {
+                default_dest: Some("/lib/ROMs".to_string()),
+                default_format: OutputFormat::Zip,
+                default_merge_mode: MergeMode::Split,
+                ..Default::default()
+            },
+            &interesting,
+        )
+        .unwrap();
+
+        // Both games' canonical archives are recorded as desired destinations.
+        assert!(state.dest_paths.contains("/lib/ROMs/ARCADE/puckman.zip"));
+        assert!(state.dest_paths.contains("/lib/ROMs/ARCADE/pacmanm.zip"));
+
+        // The crux: under split, the inherited shared ROM (AAA) belongs in the
+        // PARENT's archive, never the clone's — so a loose copy of AAA sitting in
+        // the clone's folder is preserved by `puckman.zip`, not `pacmanm.zip`.
+        assert_eq!(
+            state.archive_homes.get("AAA"),
+            Some(&["/lib/ROMs/ARCADE/puckman.zip".to_string()].into()),
+            "inherited content's canonical archive is the parent's"
+        );
+        assert_eq!(
+            state.archive_homes.get("BBB"),
+            Some(&["/lib/ROMs/ARCADE/pacmanm.zip".to_string()].into()),
+            "the clone's own ROM belongs in the clone's archive"
+        );
+    }
+
+    #[test]
+    fn desired_state_archive_homes_only_for_interesting_content() {
+        let db = setup_db();
+        let conn = db.conn();
+        setup_parent_clone_fixture(conn);
+
+        // Only BBB is of interest; AAA must not be indexed even though it is a
+        // desired archive member — the index stays scoped to the caller's set.
+        let interesting: HashSet<String> = ["BBB".to_string()].into();
+        let state = compute_desired_state(
+            conn,
+            &PlanOptions {
+                default_dest: Some("/lib/ROMs".to_string()),
+                default_format: OutputFormat::Zip,
+                default_merge_mode: MergeMode::Split,
+                ..Default::default()
+            },
+            &interesting,
+        )
+        .unwrap();
+
+        assert!(state.archive_homes.contains_key("BBB"));
+        assert!(
+            !state.archive_homes.contains_key("AAA"),
+            "uninteresting content is not indexed"
+        );
+        // dest_paths are unconditional, so both archives are still recorded.
+        assert!(state.dest_paths.contains("/lib/ROMs/ARCADE/puckman.zip"));
+    }
+
+    #[test]
+    fn desired_state_records_loose_paths_and_no_archive_homes() {
+        let db = setup_db();
+        let conn = db.conn();
+        // A loose-format collection: a single-ROM game placed flat, a multi-ROM
+        // game placed in its own folder. Loose collections hold no archives, so
+        // they contribute destination paths but never archive homes.
+        let coll = collections::create_collection(conn, "Tapes", "tosec").unwrap();
+        let vid = collections::add_version(conn, coll, "v1", "/dats/tapes.dat", true).unwrap();
+        let node = dats::create_node(conn, vid, None, "Tapes", "dat", "Tapes").unwrap();
+        let solo = dats::create_game(conn, node, "Solo", None, None, false, false, false).unwrap();
+        dats::create_rom(
+            conn,
+            solo,
+            "solo.tap",
+            10,
+            Some("AAA"),
+            None,
+            None,
+            "good",
+            None,
+        )
+        .unwrap();
+        let duo = dats::create_game(conn, node, "Duo", None, None, false, false, false).unwrap();
+        dats::create_rom(
+            conn,
+            duo,
+            "duo-a.tap",
+            10,
+            Some("BBB"),
+            None,
+            None,
+            "good",
+            None,
+        )
+        .unwrap();
+        dats::create_rom(
+            conn,
+            duo,
+            "duo-b.tap",
+            10,
+            Some("CCC"),
+            None,
+            None,
+            "good",
+            None,
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO files (sha1, size) VALUES ('AAA',10),('BBB',10),('CCC',10)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO sources (id, path, case_sensitive) VALUES (500, '/lib/ToSort/Tapes', 0)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO file_locations (sha1, source_id, path, archive_path) VALUES
+                ('AAA',500,'solo.tap',NULL),('BBB',500,'duo-a.tap',NULL),('CCC',500,'duo-b.tap',NULL)",
+            [],
+        )
+        .unwrap();
+
+        let interesting: HashSet<String> =
+            ["AAA".to_string(), "BBB".to_string(), "CCC".to_string()].into();
+        let state = compute_desired_state(
+            conn,
+            &PlanOptions {
+                default_dest: Some("/lib/ROMs".to_string()),
+                default_format: OutputFormat::Loose,
+                ..Default::default()
+            },
+            &interesting,
+        )
+        .unwrap();
+
+        // Single-ROM game flat; multi-ROM game in its own folder.
+        assert!(state.dest_paths.contains("/lib/ROMs/Tapes/solo.tap"));
+        assert!(state.dest_paths.contains("/lib/ROMs/Tapes/Duo/duo-a.tap"));
+        assert!(state.dest_paths.contains("/lib/ROMs/Tapes/Duo/duo-b.tap"));
+        assert!(
+            state.archive_homes.is_empty(),
+            "a loose collection contributes no archive homes"
+        );
     }
 }
