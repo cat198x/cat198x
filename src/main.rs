@@ -178,11 +178,6 @@ enum Commands {
         /// "TOSEC", "TOSEC-PIX"). Repeatable; scopes a phase to chosen sets.
         #[arg(long)]
         set: Option<Vec<String>>,
-
-        /// Move files into place (delete the source) instead of copying — a true
-        /// in-place tidy. Rollback-logged; copy is the default.
-        #[arg(long)]
-        r#move: bool,
     },
 
     /// Apply a previously generated plan
@@ -339,7 +334,7 @@ fn main() -> Result<()> {
         Commands::Reclaim { source, execute } => reclaim_cmd::run(source, execute, cli.data_dir),
         Commands::Stats { group_by } => stats_cmd::run(group_by.as_deref(), cli.data_dir),
         Commands::Config(cmd) => config_cmd::run(cmd, cli.data_dir),
-        Commands::Plan { dat, set, r#move } => plan_cmd::run(dat, set, r#move, cli.data_dir),
+        Commands::Plan { dat, set } => plan_cmd::run(dat, set, cli.data_dir),
         Commands::Apply {
             dry_run,
             skip_space_check,

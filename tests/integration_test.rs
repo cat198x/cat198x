@@ -680,7 +680,7 @@ fn test_plan_generation() {
 
     // Generate plan - note: this will print output but we just verify it doesn't panic
     // A real plan would require destination configuration
-    cli::plan::run(None, None, false, env.data_dir_opt()).unwrap();
+    cli::plan::run(None, None, env.data_dir_opt()).unwrap();
 
     // Check that the plans directory exists
     let plans_dir = env.data_dir.join("objects/plans");
@@ -815,7 +815,7 @@ fn test_plan_apply_rollback_cycle() {
     drop(db);
 
     // Generate plan
-    cli::plan::run(None, None, false, env.data_dir_opt()).expect("Plan generation failed");
+    cli::plan::run(None, None, env.data_dir_opt()).expect("Plan generation failed");
 
     // Verify plan was created with operations
     let plans_dir = env.data_dir.join("objects/plans");
@@ -946,7 +946,7 @@ fn test_apply_from_zip_archive() {
     drop(db);
 
     // Generate and apply plan
-    cli::plan::run(None, None, false, env.data_dir_opt()).expect("Plan generation failed");
+    cli::plan::run(None, None, env.data_dir_opt()).expect("Plan generation failed");
     cli::apply::run(false, true, false, 4, false, env.data_dir_opt()).expect("Apply failed");
 
     // Verify file was extracted to destination
@@ -1019,7 +1019,7 @@ fn test_stale_plan_detection() {
     drop(db);
 
     // Generate plan
-    cli::plan::run(None, None, false, env.data_dir_opt()).unwrap();
+    cli::plan::run(None, None, env.data_dir_opt()).unwrap();
 
     // Now modify the state by adding a new file and rescanning
     create_test_rom(&env.roms_dir, "new_file.rom", b"new content");
@@ -1140,7 +1140,7 @@ fn test_multi_file_plan_apply() {
     drop(db);
 
     // Generate plan
-    cli::plan::run(None, None, false, env.data_dir_opt()).unwrap();
+    cli::plan::run(None, None, env.data_dir_opt()).unwrap();
 
     // Verify plan has 3 operations
     let plans_dir = env.data_dir.join("objects/plans");
@@ -1239,7 +1239,7 @@ fn test_apply_skips_already_correct_files() {
     drop(db);
 
     // Generate plan - should detect file is already correct
-    cli::plan::run(None, None, false, env.data_dir_opt()).unwrap();
+    cli::plan::run(None, None, env.data_dir_opt()).unwrap();
 
     // When no operations are needed, plan file might not be saved.
     // The key verification is that the destination file still has correct content
@@ -2095,7 +2095,7 @@ fn test_recursive_add_plans_into_hierarchical_destination() {
     .unwrap();
 
     // Plan, then read the saved plan and assert the destination is hierarchical.
-    cli::plan::run(None, None, false, env.data_dir_opt()).unwrap();
+    cli::plan::run(None, None, env.data_dir_opt()).unwrap();
 
     let plans_dir = env.data_dir.join("objects/plans");
     let plan_file = fs::read_dir(&plans_dir)
@@ -2249,7 +2249,7 @@ fn test_zip_output_format_plans_applies_and_converges() {
     }
 
     // Plan: one repack to an archive named after the game.
-    cli::plan::run(None, None, false, env.data_dir_opt()).unwrap();
+    cli::plan::run(None, None, env.data_dir_opt()).unwrap();
     let plans_dir = env.data_dir.join("objects/plans");
     let plan_file = fs::read_dir(&plans_dir)
         .unwrap()
@@ -2367,7 +2367,7 @@ fn test_apply_skip_repack_defers_then_resumes() {
     }
 
     // Move mode: the duplicate is deleted (cheap), the kept copy is repacked.
-    cli::plan::run(None, None, true, env.data_dir_opt()).unwrap();
+    cli::plan::run(None, None, env.data_dir_opt()).unwrap();
     let expected_archive = dest_root.join("Skip Repack Test").join("Test Game.zip");
 
     // Pass 1: defer the repack. The duplicate is deleted (one of the two copies
@@ -2462,7 +2462,7 @@ fn test_move_repack_deletes_source_and_rollback_restores_it() {
     }
 
     // Plan in move mode (the third argument), then apply.
-    cli::plan::run(None, None, true, env.data_dir_opt()).unwrap();
+    cli::plan::run(None, None, env.data_dir_opt()).unwrap();
     cli::apply::run(false, true, false, 4, false, env.data_dir_opt()).unwrap();
 
     let archive = dest_root.join("Move Repack Test").join("Test Game.zip");
@@ -2596,7 +2596,7 @@ fn test_move_mode_relocates_and_removes_source() {
     .unwrap();
 
     // Plan with --move, then apply.
-    cli::plan::run(None, None, true, env.data_dir_opt()).unwrap();
+    cli::plan::run(None, None, env.data_dir_opt()).unwrap();
     let plans_dir = env.data_dir.join("objects/plans");
     let plan_json = fs::read_to_string(
         fs::read_dir(&plans_dir)
@@ -2677,7 +2677,7 @@ fn test_apply_prune_empty_removes_emptied_source_subdir() {
     )
     .unwrap();
 
-    cli::plan::run(None, None, true, env.data_dir_opt()).unwrap();
+    cli::plan::run(None, None, env.data_dir_opt()).unwrap();
     // Apply with prune_empty = true.
     cli::apply::run(false, true, false, 4, true, env.data_dir_opt()).unwrap();
 

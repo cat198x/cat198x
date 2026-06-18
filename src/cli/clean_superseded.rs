@@ -180,7 +180,6 @@ pub fn analyze(
         default_dest: Some(library.to_string()),
         default_format,
         default_merge_mode,
-        move_files: false,
     };
     let desired = compute_desired_state(conn, &opts, &interesting)?;
     let removable_sha1 =

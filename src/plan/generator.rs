@@ -7,7 +7,8 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 
 use super::{CollectionPlanStat, Plan, SourceRef};
 use crate::config::{MergeMode, OutputFormat};
-use crate::db::{collections, config as db_config, dats};
+use crate::db::files::Disposition;
+use crate::db::{collections, config as db_config, dats, files};
 use crate::filter::{RomCandidate, parse_game_name, select_preferred};
 
 /// Above this many match-rows, a collection is skipped rather than planned.
@@ -70,9 +71,6 @@ pub struct PlanOptions {
     /// so the clone's archive/folder holds only its own unique ROMs. `NonMerged`
     /// (the default) places every ROM a game's DAT entry lists, parent or clone.
     pub default_merge_mode: MergeMode,
-    /// Move files into place (and delete the source) instead of copying — a true
-    /// in-place tidy rather than a duplicating copy. Off (copy) by default.
-    pub move_files: bool,
 }
 
 /// Generate a plan for all configured collections with default options.
@@ -383,6 +381,10 @@ pub fn generate_plan_filtered(conn: &Connection, opts: &PlanOptions) -> Result<P
         );
     }
 
+    // Each source's disposition decides, per operation, whether content is moved
+    // (and its source freed) or copied. Built once; consulted at every placement.
+    let dispositions = source_dispositions(conn)?;
+
     // Plan every collection, not only those with an explicit dest_path: a
     // library-wide `default_dest_path` should reach collections that were never
     // individually configured. Each collection's destination is resolved below.
@@ -583,7 +585,7 @@ pub fn generate_plan_filtered(conn: &Connection, opts: &PlanOptions) -> Result<P
                                 sha1: m.sha1.clone(),
                                 entry_name: None,
                             };
-                            if opts.move_files && !shared_here {
+                            if may_move(&dispositions, &m.source_root, &dest) && !shared_here {
                                 plan.add_move(source, dest.clone(), m.size as u64);
                             } else {
                                 plan.add_copy(source, dest.clone(), m.size as u64);
@@ -598,9 +600,14 @@ pub fn generate_plan_filtered(conn: &Connection, opts: &PlanOptions) -> Result<P
                     // kept copy preserves the bytes. In copy mode, or for shared
                     // content, leave it be: a copy run must not remove source files,
                     // and a shared copy may be needed by another destination.
-                    if opts.move_files && !shared_here {
+                    // Delete a redundant loose copy only when its source is
+                    // consume — a preserve source never loses content here.
+                    if !shared_here {
                         for (i, m) in copies.iter().enumerate() {
                             if Some(i) == keep || m.archive_path.is_some() {
+                                continue;
+                            }
+                            if !may_delete_source(&dispositions, &m.source_root) {
                                 continue;
                             }
                             let path = format!("{}/{}", m.source_root, m.source_path);
@@ -612,10 +619,9 @@ pub fn generate_plan_filtered(conn: &Connection, opts: &PlanOptions) -> Result<P
                         }
                     }
                 }
-                let verb = if opts.move_files { "move" } else { "copy" };
                 println!(
-                    "  {} already correct, {} to {}, {} duplicate(s) to delete",
-                    already_correct, to_write, verb, deduped
+                    "  {} already correct, {} to place, {} duplicate(s) to delete",
+                    already_correct, to_write, deduped
                 );
             }
             Some(tag) => {
@@ -728,13 +734,16 @@ pub fn generate_plan_filtered(conn: &Connection, opts: &PlanOptions) -> Result<P
                     if complete_at_dest && tag != "torrentzip" {
                         already_correct += expected.len();
                     } else if let Some(ref src) = staged_complete
-                        && opts.move_files
+                        && may_move(&dispositions, &containers[src][0].source_root, &dest)
                         && !game_shared
                         && !shared_containers.contains(src)
                         && tag != "torrentzip"
                         && is_relocatable_archive(&containers[src], src, ext)
                     {
-                        // Relocate the complete staged archive to its destination.
+                        // Relocate the complete staged archive to its destination —
+                        // a whole-file move, so only when its source allows moving
+                        // out (consume, or a preserve source relocating within its
+                        // own tree).
                         let size: u64 = containers[src].iter().map(|m| m.size as u64).sum();
                         bytes += size;
                         plan.add_relocate(src.clone(), dest.clone(), size);
@@ -742,7 +751,7 @@ pub fn generate_plan_filtered(conn: &Connection, opts: &PlanOptions) -> Result<P
                     } else {
                         // Build the canonical archive at dest: from one complete
                         // container if there is one, else from whatever entries we
-                        // hold (scattered across containers). Used in copy mode, for
+                        // hold (scattered across containers). Used for copy-out, for
                         // torrentzip, or when no single container is complete.
                         let sources: Vec<SourceRef> = match &build_from {
                             Some(p) => containers[p].iter().map(source_ref_for).collect(),
@@ -756,15 +765,29 @@ pub fn generate_plan_filtered(conn: &Connection, opts: &PlanOptions) -> Result<P
                             .filter_map(|(name, _)| name_size.get(name.as_str()).copied())
                             .sum();
                         bytes += size;
-                        // Consume loose sources only in move mode and only when the
-                        // content isn't shared — a shared source may feed another
-                        // game's archive too.
+                        // Delete the loose sources the repack consumes only when
+                        // every container feeding it is consume — a preserve source
+                        // is never emptied — and the content isn't shared (a shared
+                        // source may feed another game's archive too).
+                        let feeders: Vec<&str> = match &build_from {
+                            Some(p) => containers[p]
+                                .iter()
+                                .map(|m| m.source_root.as_str())
+                                .collect(),
+                            None => containers
+                                .values()
+                                .flatten()
+                                .map(|m| m.source_root.as_str())
+                                .collect(),
+                        };
+                        let consume_feeders = !feeders.is_empty()
+                            && feeders.iter().all(|r| may_delete_source(&dispositions, r));
                         plan.add_repack(
                             sources,
                             dest.clone(),
                             tag.to_string(),
                             size,
-                            opts.move_files && !game_shared,
+                            consume_feeders && !game_shared,
                         );
                         to_write += 1;
                     }
@@ -776,13 +799,17 @@ pub fn generate_plan_filtered(conn: &Connection, opts: &PlanOptions) -> Result<P
                     // shared with another entry, leave sources untouched. A
                     // container that also sources other games is never deleted —
                     // those games still need to repack from it.
-                    if opts.move_files && !game_shared {
-                        for path in containers.keys() {
+                    if !game_shared {
+                        for (path, entries) in &containers {
                             if *path == dest
                                 || build_from.as_deref() == Some(path.as_str())
                                 || shared_containers.contains(path)
                                 || is_in_library(path, default_dest, &dest_root)
                             {
+                                continue;
+                            }
+                            // Only a consume container is deleted as a duplicate.
+                            if !may_delete_source(&dispositions, &entries[0].source_root) {
                                 continue;
                             }
                             plan.add_delete(path.clone());
@@ -800,7 +827,14 @@ pub fn generate_plan_filtered(conn: &Connection, opts: &PlanOptions) -> Result<P
         // Plan any CHDs loose, regardless of the set's format. (Disk dedups are
         // reported within the helper, like the other branches' own counts.)
         if !disk_matches.is_empty() {
-            let d = plan_disk_matches(disk_matches, &dest_root, opts, &shared, &mut plan);
+            let d = plan_disk_matches(
+                disk_matches,
+                &dest_root,
+                opts,
+                &shared,
+                &dispositions,
+                &mut plan,
+            );
             already_correct += d.already_correct;
             to_write += d.to_write;
             bytes += d.bytes;
@@ -1124,11 +1158,58 @@ fn is_in_library(path: &str, default_dest: Option<&str>, dest_root: &str) -> boo
     under(dest_root) || default_dest.is_some_and(under)
 }
 
+/// Every source's disposition, keyed by its root path (which is what a matched
+/// ROM's `source_root` carries). Drives the move-vs-copy and delete decisions.
+fn source_dispositions(conn: &Connection) -> Result<HashMap<String, Disposition>> {
+    Ok(files::list_sources(conn)?
+        .into_iter()
+        .map(|s| (s.path, s.disposition))
+        .collect())
+}
+
+/// The disposition of the source at `source_root` — unknown roots are treated as
+/// `preserve`, the safe default (never authorise a move-out or delete on a guess).
+fn disposition_of(dispositions: &HashMap<String, Disposition>, source_root: &str) -> Disposition {
+    dispositions
+        .get(source_root)
+        .copied()
+        .unwrap_or(Disposition::Preserve)
+}
+
+/// Whether `dest` sits at or under `root` — the "same tree" test for a preserve
+/// source (a relocation within the tree is allowed; moving out of it is not).
+fn dest_under(root: &str, dest: &str) -> bool {
+    let root = root.trim_end_matches('/');
+    dest == root || dest.starts_with(&format!("{root}/"))
+}
+
+/// May content read from `source_root` be *moved* to `dest` (rather than copied)?
+/// A `consume` source may always be moved out; a `preserve` source may only be
+/// moved when `dest` stays within its tree. See `decisions/source-disposition.md`.
+fn may_move(dispositions: &HashMap<String, Disposition>, source_root: &str, dest: &str) -> bool {
+    match disposition_of(dispositions, source_root) {
+        Disposition::Consume => true,
+        Disposition::Preserve => dest_under(source_root, dest),
+    }
+}
+
+/// May a source file at `source_root` be *deleted* (as a redundant duplicate)?
+/// Only a `consume` source — a `preserve` source never loses content here.
+/// (Intra-tree dedup of a `preserve` tree, where a copy survives in the same
+/// tree, is deliberately deferred to the delete-rule work; see the decision.)
+fn may_delete_source(dispositions: &HashMap<String, Disposition>, source_root: &str) -> bool {
+    matches!(
+        disposition_of(dispositions, source_root),
+        Disposition::Consume
+    )
+}
+
 fn plan_disk_matches(
     matches: Vec<MatchedRom>,
     dest_root: &str,
     opts: &PlanOptions,
     shared: &HashSet<String>,
+    dispositions: &HashMap<String, Disposition>,
     plan: &mut Plan,
 ) -> DiskPlanCounts {
     let mut counts = DiskPlanCounts::default();
@@ -1163,7 +1244,7 @@ fn plan_disk_matches(
                     sha1: m.sha1.clone(),
                     entry_name: None,
                 };
-                if opts.move_files && !shared_here {
+                if may_move(dispositions, &m.source_root, &dest) && !shared_here {
                     plan.add_move(source, dest.clone(), m.size as u64);
                 } else {
                     plan.add_copy(source, dest.clone(), m.size as u64);
@@ -1173,10 +1254,13 @@ fn plan_disk_matches(
             }
         };
 
-        // Every other loose copy is an exact-content duplicate of the kept one.
-        if opts.move_files && !shared_here {
+        // Delete a redundant loose copy only when its source is consume.
+        if !shared_here {
             for (i, m) in copies.iter().enumerate() {
                 if Some(i) == keep || m.archive_path.is_some() {
+                    continue;
+                }
+                if !may_delete_source(dispositions, &m.source_root) {
                     continue;
                 }
                 let path = format!("{}/{}", m.source_root, m.source_path);
@@ -1189,10 +1273,9 @@ fn plan_disk_matches(
         }
     }
 
-    let verb = if opts.move_files { "move" } else { "copy" };
     println!(
-        "  {} CHD(s) already correct, {} to {}, {} duplicate(s) to delete",
-        counts.already_correct, counts.to_write, verb, counts.deduped
+        "  {} CHD(s) already correct, {} to place, {} duplicate(s) to delete",
+        counts.already_correct, counts.to_write, counts.deduped
     );
 
     counts
@@ -1902,10 +1985,10 @@ mod tests {
         conn.execute("INSERT INTO files (sha1, size) VALUES ('SSS', 10)", [])
             .unwrap();
         conn.execute(
-            "INSERT INTO sources (id, path, case_sensitive) VALUES
-                (1, '/lib/ROMs/SET/Sys', 0),
-                (2, '/lib/ROMs/SET/Sys/clone', 0),
-                (3, '/lib/ToSort/SET', 0)",
+            "INSERT INTO sources (id, path, case_sensitive, disposition) VALUES
+                (1, '/lib/ROMs/SET/Sys', 0, 'preserve'),
+                (2, '/lib/ROMs/SET/Sys/clone', 0, 'preserve'),
+                (3, '/lib/ToSort/SET', 0, 'consume')",
             [],
         )
         .unwrap();
@@ -1923,7 +2006,6 @@ mod tests {
             &PlanOptions {
                 default_dest: Some("/lib/ROMs".to_string()),
                 default_format: OutputFormat::Loose,
-                move_files: true,
                 ..Default::default()
             },
         )
@@ -2070,8 +2152,9 @@ mod tests {
 
         // Library copy (already at the canonical destination) and a ToSort dup.
         conn.execute(
-            "INSERT INTO sources (id, path, case_sensitive) VALUES
-                (101, '/lib/ROMs/SET/Sys', 0), (102, '/lib/ToSort/SET', 0)",
+            "INSERT INTO sources (id, path, case_sensitive, disposition) VALUES
+                (101, '/lib/ROMs/SET/Sys', 0, 'preserve'),
+                (102, '/lib/ToSort/SET', 0, 'consume')",
             [],
         )
         .unwrap();
@@ -2107,7 +2190,6 @@ mod tests {
             &PlanOptions {
                 default_dest: Some("/lib/ROMs".to_string()),
                 default_format: OutputFormat::Loose,
-                move_files: true,
                 ..Default::default()
             },
         )
@@ -2138,18 +2220,19 @@ mod tests {
     }
 
     #[test]
-    fn loose_duplicate_left_untouched_in_copy_mode() {
+    fn loose_duplicate_left_untouched_for_a_preserve_source() {
         let db = setup_db();
         let conn = db.conn();
         setup_dup_fixture(conn, false);
+        // A preserve source never loses content, so its exact-content duplicate
+        // is left in place rather than deleted.
+        files::set_source_disposition(conn, "/lib/ToSort/SET", Disposition::Preserve).unwrap();
 
-        // Copy mode must not remove source files: the duplicate is left in place.
         let plan = generate_plan_filtered(
             conn,
             &PlanOptions {
                 default_dest: Some("/lib/ROMs".to_string()),
                 default_format: OutputFormat::Loose,
-                move_files: false,
                 ..Default::default()
             },
         )
@@ -2169,7 +2252,6 @@ mod tests {
             &PlanOptions {
                 default_dest: Some("/lib/ROMs".to_string()),
                 default_format: OutputFormat::Loose, // overridden to zip per-set
-                move_files: true,
                 ..Default::default()
             },
         )
@@ -2209,7 +2291,8 @@ mod tests {
         conn.execute("INSERT INTO files (sha1, size) VALUES ('BBB', 10)", [])
             .unwrap();
         conn.execute(
-            "INSERT INTO sources (id, path, case_sensitive) VALUES (200, '/lib/ToSort/SET', 0)",
+            "INSERT INTO sources (id, path, case_sensitive, disposition)
+             VALUES (200, '/lib/ToSort/SET', 0, 'consume')",
             [],
         )
         .unwrap();
@@ -2225,7 +2308,6 @@ mod tests {
             &PlanOptions {
                 default_dest: Some("/lib/ROMs".to_string()),
                 default_format: OutputFormat::Loose,
-                move_files: true,
                 ..Default::default()
             },
         )
@@ -2279,7 +2361,6 @@ mod tests {
                 default_dest: Some("/lib/ROMs".to_string()),
                 // Zip is the set format — the disk must ignore it and stay loose.
                 default_format: OutputFormat::Zip,
-                move_files: false,
                 ..Default::default()
             },
         )
@@ -2561,7 +2642,8 @@ mod tests {
         conn.execute("INSERT INTO files (sha1, size) VALUES ('CCC', 10)", [])
             .unwrap();
         conn.execute(
-            "INSERT INTO sources (id, path, case_sensitive) VALUES (201, '/lib/ToSort/SET', 0)",
+            "INSERT INTO sources (id, path, case_sensitive, disposition)
+             VALUES (201, '/lib/ToSort/SET', 0, 'consume')",
             [],
         )
         .unwrap();
@@ -2578,7 +2660,6 @@ mod tests {
             &PlanOptions {
                 default_dest: Some("/lib/ROMs".to_string()),
                 default_format: OutputFormat::Loose,
-                move_files: true,
                 ..Default::default()
             },
         )
@@ -2620,7 +2701,8 @@ mod tests {
         )
         .unwrap();
         conn.execute(
-            "INSERT INTO sources (id, path, case_sensitive) VALUES (210, '/lib/ToSort/SET', 0)",
+            "INSERT INTO sources (id, path, case_sensitive, disposition)
+             VALUES (210, '/lib/ToSort/SET', 0, 'consume')",
             [],
         )
         .unwrap();
@@ -2639,7 +2721,6 @@ mod tests {
             &PlanOptions {
                 default_dest: Some("/lib/ROMs".to_string()),
                 default_format: OutputFormat::Loose,
-                move_files: true,
                 ..Default::default()
             },
         )
@@ -2743,7 +2824,6 @@ mod tests {
             &PlanOptions {
                 default_dest: Some("/lib/ROMs".to_string()),
                 default_format: OutputFormat::Loose,
-                move_files: false,
                 ..Default::default()
             },
         )
@@ -2781,7 +2861,6 @@ mod tests {
             set_filter: sets,
             default_dest: Some("/lib/ROMs".to_string()),
             default_format: OutputFormat::Loose,
-            move_files: true,
             ..Default::default()
         };
 
@@ -2821,7 +2900,8 @@ mod tests {
         conn.execute("INSERT INTO files (sha1, size) VALUES ('AAA', 10)", [])
             .unwrap();
         conn.execute(
-            "INSERT INTO sources (id, path, case_sensitive) VALUES (102, '/lib/ToSort/SET', 0)",
+            "INSERT INTO sources (id, path, case_sensitive, disposition)
+             VALUES (102, '/lib/ToSort/SET', 0, 'consume')",
             [],
         )
         .unwrap();
@@ -2838,7 +2918,6 @@ mod tests {
             &PlanOptions {
                 default_dest: Some("/lib/ROMs".to_string()),
                 default_format: OutputFormat::Loose,
-                move_files: true,
                 ..Default::default()
             },
         )
@@ -2893,7 +2972,8 @@ mod tests {
         conn.execute("INSERT INTO files (sha1, size) VALUES ('AAA', 10)", [])
             .unwrap();
         conn.execute(
-            "INSERT INTO sources (id, path, case_sensitive) VALUES (102, '/lib/ToSort/SET', 0)",
+            "INSERT INTO sources (id, path, case_sensitive, disposition)
+             VALUES (102, '/lib/ToSort/SET', 0, 'consume')",
             [],
         )
         .unwrap();
@@ -2911,7 +2991,6 @@ mod tests {
             &PlanOptions {
                 default_dest: Some("/lib/ROMs".to_string()),
                 default_format: OutputFormat::Loose,
-                move_files: true,
                 ..Default::default()
             },
         )
