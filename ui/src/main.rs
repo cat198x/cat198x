@@ -19,6 +19,7 @@ use cat198x::db::Database;
 use cat198x::db::dats::MergeMode;
 use cat198x::ops::{self, ApplyReport, CollectionInfo, CollectionStatus, PendingWork};
 use cat198x::plan::{Operation, PlanSummary};
+use tauri::Emitter;
 
 /// How many of a plan's operations the UI receives. A real plan can hold tens of
 /// thousands; the diff is for review, and the frontend caps what it draws, so we
@@ -128,6 +129,30 @@ async fn apply_preview() -> Result<Option<ApplyReport>, String> {
     .map_err(|e| e.to_string())
 }
 
+/// A dry-run apply that streams per-operation progress to the frontend as it
+/// runs (the `apply-progress` event), then returns the final report. Same as
+/// `apply_preview` but with a live progress bar; the live (real) apply will
+/// reuse this exact stream. Emits are throttled to ~1% steps so a large plan
+/// doesn't flood the webview.
+#[tauri::command]
+async fn apply_stream(app: tauri::AppHandle) -> Result<Option<ApplyReport>, String> {
+    tauri::async_runtime::spawn_blocking(move || -> anyhow::Result<_> {
+        let dir = data_dir()?;
+        let db = Database::open(&dir.join("db.sqlite"))?;
+        let mut last_emit = 0usize;
+        ops::apply_streaming(db.conn(), &dir, true, &mut |p| {
+            let step = (p.total / 100).max(1);
+            if p.done == p.total || p.done - last_emit >= step {
+                last_emit = p.done;
+                let _ = app.emit("apply-progress", &p);
+            }
+        })
+    })
+    .await
+    .map_err(|e| e.to_string())?
+    .map_err(|e| e.to_string())
+}
+
 /// The most recent saved plan — the reorganisation as a diff — or `null`.
 #[tauri::command]
 async fn plan_diff() -> Result<Option<PlanView>, String> {
@@ -158,6 +183,7 @@ fn main() {
             status_one,
             pending_work,
             apply_preview,
+            apply_stream,
             plan_diff
         ])
         .run(tauri::generate_context!())

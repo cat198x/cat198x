@@ -442,13 +442,38 @@ function renderPlan(body, plan) {
 }
 
 // ---- Apply preview (dry run) ----
+let applyUnlisten = null;
+
 async function loadPreview() {
   const body = document.getElementById("preview-body");
-  body.className = "loading";
-  body.textContent = "Running dry-run preview…";
+  body.className = "";
+
+  // Live progress bar, fed by the apply engine's `apply-progress` events.
+  const label = el("div", { class: "muted" }, "Starting dry run…");
+  const fill = el("span", {});
+  const bar = el("div", { class: "progress" }, fill);
+  body.replaceChildren(el("div", { class: "prog-wrap" }, label, bar));
+
+  const stop = () => {
+    if (applyUnlisten) {
+      applyUnlisten();
+      applyUnlisten = null;
+    }
+  };
+
   try {
-    renderPreview(body, await invoke("apply_preview"));
+    stop(); // drop any listener from a previous run
+    applyUnlisten = await window.__TAURI__.event.listen("apply-progress", (e) => {
+      const { done, total, verb } = e.payload;
+      const pct = total ? Math.round((done / total) * 100) : 0;
+      fill.style.width = pct + "%";
+      label.textContent = `${done.toLocaleString()} / ${total.toLocaleString()} (${pct}%) — ${verb}`;
+    });
+    const report = await invoke("apply_stream");
+    stop();
+    renderPreview(body, report);
   } catch (e) {
+    stop();
     showError(body, e);
   }
 }
