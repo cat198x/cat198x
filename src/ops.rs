@@ -281,6 +281,30 @@ pub struct ApplyReport {
 /// stream — the same stream a live apply will drive a progress bar from. Returns
 /// `None` when no plan has been generated.
 pub fn apply(conn: &Connection, data_dir: &Path, dry_run: bool) -> Result<Option<ApplyReport>> {
+    apply_streaming(conn, data_dir, dry_run, &mut |_| {})
+}
+
+/// One operation's worth of progress, reported as a plan is applied.
+#[derive(Debug, Clone, Serialize)]
+pub struct ApplyProgress {
+    /// Operations started so far (monotonic; counts each op as it begins).
+    pub done: usize,
+    /// Total operations in the plan.
+    pub total: usize,
+    /// The verb of the operation just started (COPY/MOVE/RELOCATE/…).
+    pub verb: String,
+}
+
+/// Like [`apply`], but reports each operation's progress through `on_progress`
+/// as the engine runs — the hook a UI drives a live progress bar from. A caller
+/// that wants only the final report uses [`apply`]. Returns `None` without a
+/// plan.
+pub fn apply_streaming(
+    conn: &Connection,
+    data_dir: &Path,
+    dry_run: bool,
+    on_progress: &mut dyn FnMut(ApplyProgress),
+) -> Result<Option<ApplyReport>> {
     let Some(plan_path) = newest_plan_file(data_dir)? else {
         return Ok(None);
     };
@@ -301,6 +325,7 @@ pub fn apply(conn: &Connection, data_dir: &Path, dry_run: bool) -> Result<Option
 
     let sources = files::list_sources(conn)?;
     let mut by_kind: BTreeMap<String, usize> = BTreeMap::new();
+    let mut done = 0usize;
     let outcome = apply_plan(
         conn,
         &mut plan,
@@ -317,6 +342,12 @@ pub fn apply(conn: &Connection, data_dir: &Path, dry_run: bool) -> Result<Option
         &mut |event| {
             if let ApplyEvent::OpStarted { op, .. } = event {
                 *by_kind.entry(op.verb.to_string()).or_default() += 1;
+                done += 1;
+                on_progress(ApplyProgress {
+                    done,
+                    total: total_ops,
+                    verb: op.verb.to_string(),
+                });
             }
         },
     )?;
@@ -525,5 +556,40 @@ mod tests {
         let db = Database::open_in_memory().unwrap();
         let tmp = tempfile::tempdir().unwrap();
         assert!(apply(db.conn(), tmp.path(), true).unwrap().is_none());
+    }
+
+    #[test]
+    fn apply_streaming_reports_progress_per_operation() {
+        let db = Database::open_in_memory().unwrap();
+        let conn = db.conn();
+        let tmp = tempfile::tempdir().unwrap();
+        let plans = tmp.path().join("objects/plans");
+        std::fs::create_dir_all(&plans).unwrap();
+
+        let mut plan = crate::plan::Plan::new(compute_state_hash(conn).unwrap());
+        plan.add_copy(
+            crate::plan::SourceRef {
+                path: "/staging/a.rom".into(),
+                archive_path: None,
+                sha1: "AAA".into(),
+                entry_name: None,
+            },
+            tmp.path().join("a.rom").to_string_lossy().into_owned(),
+            10,
+        );
+        plan.add_delete("/staging/b.rom".into());
+        std::fs::write(plans.join("p.json"), serde_json::to_string(&plan).unwrap()).unwrap();
+
+        let mut progress = Vec::new();
+        apply_streaming(conn, tmp.path(), true, &mut |p| progress.push(p))
+            .unwrap()
+            .expect("a plan");
+
+        // One progress callback per operation, monotonic, total carried through.
+        assert_eq!(progress.len(), 2);
+        assert_eq!((progress[0].done, progress[0].total), (1, 2));
+        assert_eq!((progress[1].done, progress[1].total), (2, 2));
+        assert_eq!(progress[0].verb, "COPY");
+        assert_eq!(progress[1].verb, "DELETE");
     }
 }

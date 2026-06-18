@@ -290,6 +290,32 @@ tr:hover td {
   margin-bottom: 12px;
 }
 
+/* live apply progress */
+.prog-wrap {
+  padding: 24px 4px;
+}
+
+.prog-wrap .muted {
+  margin-bottom: 10px;
+  font-variant-numeric: tabular-nums;
+}
+
+.progress {
+  height: 10px;
+  background: var(--panel-2);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  overflow: hidden;
+}
+
+.progress > span {
+  display: block;
+  height: 100%;
+  width: 0;
+  background: var(--accent);
+  transition: width 0.15s ease;
+}
+
 /* per-node pending detail overlay */
 .detail-overlay {
   position: fixed;
