@@ -268,6 +268,47 @@ pub fn get_roms_for_game(conn: &Connection, game_id: i64) -> Result<Vec<DatRom>>
     Ok(roms)
 }
 
+/// Every ROM for a version in one query, grouped by game id.
+///
+/// Replaces a per-game `get_roms_for_game` loop when the caller needs all games'
+/// ROMs (completeness calculation does) — that loop issued one query per game,
+/// tens of thousands for a full MAME set. Ordering within a game matches
+/// `get_roms_for_game` (by name), so requirement lists are byte-for-byte the
+/// same; a game with no ROMs is simply absent from the map.
+pub fn get_roms_for_version_grouped(
+    conn: &Connection,
+    version_id: i64,
+) -> Result<HashMap<i64, Vec<DatRom>>> {
+    let mut stmt = conn.prepare(
+        "SELECT r.id, r.game_id, r.name, r.size, r.sha1, r.md5, r.crc32, r.status, r.merge_tag, r.is_disk
+           FROM dat_roms r
+           JOIN dat_games g ON g.id = r.game_id
+           JOIN dat_nodes n ON n.id = g.node_id
+          WHERE n.version_id = ?1
+          ORDER BY r.game_id, r.name",
+    )?;
+    let rows = stmt.query_map([version_id], |row| {
+        Ok(DatRom {
+            id: row.get(0)?,
+            game_id: row.get(1)?,
+            name: row.get(2)?,
+            size: row.get(3)?,
+            sha1: row.get(4)?,
+            md5: row.get(5)?,
+            crc32: row.get(6)?,
+            status: row.get(7)?,
+            merge_tag: row.get(8)?,
+            is_disk: row.get(9)?,
+        })
+    })?;
+    let mut map: HashMap<i64, Vec<DatRom>> = HashMap::new();
+    for r in rows {
+        let rom = r?;
+        map.entry(rom.game_id).or_default().push(rom);
+    }
+    Ok(map)
+}
+
 /// Count total games and ROMs for a version
 pub fn count_games_and_roms(conn: &Connection, version_id: i64) -> Result<(i64, i64)> {
     let game_count: i64 = conn.query_row(
@@ -449,6 +490,108 @@ pub fn rom_present(conn: &Connection, key: &RomKey) -> Result<bool> {
     }
 }
 
+/// `?,?,…` — `n` bound-parameter placeholders for an `IN (…)` clause.
+fn placeholders(n: usize) -> String {
+    let mut s = String::with_capacity(n * 2);
+    for i in 0..n {
+        if i > 0 {
+            s.push(',');
+        }
+        s.push('?');
+    }
+    s
+}
+
+/// Which of `keys` the inventory holds — the bulk form of [`rom_present`].
+///
+/// A per-key `rom_present` loop issues one query per ROM (hundreds of thousands
+/// for a full MAME/aggregate set), which dominates completeness calculation.
+/// This batches the lookups into `IN (…)` queries while applying the *same*
+/// matching rules: a SHA1 key matches `files.sha1` or `files.sha1_no_header`; an
+/// MD5 key matches `files.md5`; a CRC+size key matches `files.crc32` at the same
+/// size.
+pub fn present_keys(conn: &Connection, keys: &HashSet<RomKey>) -> Result<HashSet<RomKey>> {
+    // Stay well under SQLite's bound-variable cap. The SHA1 query binds each
+    // value twice (sha1 OR sha1_no_header), so its batch is the smallest.
+    const BATCH: usize = 400;
+    let mut present: HashSet<RomKey> = HashSet::new();
+
+    let mut sha1s: Vec<&str> = Vec::new();
+    let mut md5s: Vec<&str> = Vec::new();
+    let mut crc_size: Vec<(&str, i64)> = Vec::new();
+    for k in keys {
+        match k {
+            RomKey::Sha1(s) => sha1s.push(s),
+            RomKey::Md5(m) => md5s.push(m),
+            RomKey::CrcSize(c, sz) => crc_size.push((c, *sz)),
+        }
+    }
+
+    // SHA1: present if held as either the headered or the headerless hash. Two
+    // single-column `IN` lookups joined by UNION, NOT `sha1 IN (…) OR
+    // sha1_no_header IN (…)` — an OR across two columns uses neither index and
+    // full-scans the (huge) files table per batch, the very cost this function
+    // exists to avoid. Each arm here uses its index (the `sha1` primary key and
+    // `idx_files_sha1_no_header`).
+    for chunk in sha1s.chunks(BATCH) {
+        let ph = placeholders(chunk.len());
+        let mut stmt = conn.prepare(&format!(
+            "SELECT sha1 FROM files WHERE sha1 IN ({ph}) \
+             UNION SELECT sha1_no_header FROM files WHERE sha1_no_header IN ({ph})"
+        ))?;
+        let found: HashSet<String> = stmt
+            .query_map(
+                rusqlite::params_from_iter(chunk.iter().chain(chunk.iter())),
+                |row| row.get::<_, String>(0),
+            )?
+            .collect::<Result<_, _>>()?;
+        for &s in chunk {
+            if found.contains(s) {
+                present.insert(RomKey::Sha1(s.to_string()));
+            }
+        }
+    }
+
+    // MD5.
+    for chunk in md5s.chunks(BATCH) {
+        let ph = placeholders(chunk.len());
+        let mut stmt = conn.prepare(&format!("SELECT md5 FROM files WHERE md5 IN ({ph})"))?;
+        let found: HashSet<String> = stmt
+            .query_map(rusqlite::params_from_iter(chunk.iter()), |row| {
+                row.get::<_, String>(0)
+            })?
+            .collect::<Result<_, _>>()?;
+        for &m in chunk {
+            if found.contains(m) {
+                present.insert(RomKey::Md5(m.to_string()));
+            }
+        }
+    }
+
+    // CRC32 + size: match on CRC in the batch, confirm the size in memory.
+    for chunk in crc_size.chunks(BATCH) {
+        let ph = placeholders(chunk.len());
+        let mut stmt = conn.prepare(&format!(
+            "SELECT crc32, size FROM files WHERE crc32 IN ({ph})"
+        ))?;
+        let mut found: HashSet<(String, i64)> = HashSet::new();
+        let rows = stmt.query_map(
+            rusqlite::params_from_iter(chunk.iter().map(|(c, _)| *c)),
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+        )?;
+        for r in rows {
+            found.insert(r?);
+        }
+        for &(c, sz) in chunk {
+            if found.contains(&(c.to_string(), sz)) {
+                present.insert(RomKey::CrcSize(c.to_string(), sz));
+            }
+        }
+    }
+
+    Ok(present)
+}
+
 /// Map each ROM match key in a version to its size, so byte totals can be
 /// summed over the same unique keys used for completeness counting.
 fn rom_sizes_by_key(conn: &Connection, version_id: i64) -> Result<HashMap<RomKey, i64>> {
@@ -546,12 +689,9 @@ pub fn calculate_rom_requirements_with_options(
     // Get all games for this version
     let games = get_games_for_version(conn, version_id)?;
 
-    // Build a map of game_id -> ROMs
-    let mut game_roms: HashMap<i64, Vec<DatRom>> = HashMap::new();
-    for game in &games {
-        let roms = get_roms_for_game(conn, game.id)?;
-        game_roms.insert(game.id, roms);
-    }
+    // All ROMs for the version in one query, grouped by game — not a query per
+    // game (tens of thousands for a full MAME set).
+    let game_roms = get_roms_for_version_grouped(conn, version_id)?;
 
     let mut requirements = Vec::new();
 
@@ -694,13 +834,8 @@ pub fn calculate_merge_mode_stats(
         }
     }
 
-    // Count how many we have
-    let mut have: HashSet<RomKey> = HashSet::new();
-    for key in &all_required {
-        if rom_present(conn, key)? {
-            have.insert(key.clone());
-        }
-    }
+    // Count how many we have — one batched lookup, not a query per ROM.
+    let have = present_keys(conn, &all_required)?;
 
     // Byte totals over the same unique ROM keys, so size and count stay
     // consistent and `stats` can report GB without a second matching path.
@@ -1934,5 +2069,62 @@ mod tests {
         .unwrap();
         assert_eq!(requirements.len(), 1);
         assert_eq!(requirements[0].game_name, "mslug");
+    }
+
+    #[test]
+    fn present_keys_matches_rom_present_across_kinds() {
+        let db = Database::open_in_memory().unwrap();
+        let conn = db.conn();
+        // A headered file (full + headerless hash), an md5-only file, a crc+size file.
+        crate::db::files::upsert_file(conn, "FULLSHA", Some("HEADERLESS"), None, None, 100)
+            .unwrap();
+        crate::db::files::upsert_file(conn, "MD5FILE", None, Some("ABCMD5"), None, 50).unwrap();
+        crate::db::files::upsert_file(conn, "CRCFILE", None, None, Some("DEAD"), 200).unwrap();
+
+        let keys: HashSet<RomKey> = [
+            RomKey::Sha1("FULLSHA".into()),      // present via full hash
+            RomKey::Sha1("HEADERLESS".into()),   // present via headerless hash
+            RomKey::Sha1("MISSING".into()),      // absent
+            RomKey::Md5("ABCMD5".into()),        // present
+            RomKey::Md5("NOPE".into()),          // absent
+            RomKey::CrcSize("DEAD".into(), 200), // present
+            RomKey::CrcSize("DEAD".into(), 999), // absent — wrong size
+            RomKey::CrcSize("BEEF".into(), 200), // absent — wrong crc
+        ]
+        .into();
+
+        let bulk = present_keys(conn, &keys).unwrap();
+
+        // The batched result equals the per-key oracle, exactly.
+        let oracle: HashSet<RomKey> = keys
+            .iter()
+            .filter(|k| rom_present(conn, k).unwrap())
+            .cloned()
+            .collect();
+        assert_eq!(bulk, oracle);
+        assert_eq!(bulk.len(), 4);
+        assert!(bulk.contains(&RomKey::Sha1("HEADERLESS".into())));
+        assert!(bulk.contains(&RomKey::CrcSize("DEAD".into(), 200)));
+    }
+
+    #[test]
+    fn present_keys_handles_more_than_one_batch() {
+        let db = Database::open_in_memory().unwrap();
+        let conn = db.conn();
+        // More keys than the internal batch size, half of them present, to
+        // exercise the chunking boundary.
+        let mut keys: HashSet<RomKey> = HashSet::new();
+        for i in 0..1000 {
+            let sha1 = format!("SHA{i:04}");
+            if i % 2 == 0 {
+                crate::db::files::upsert_file(conn, &sha1, None, None, None, 1).unwrap();
+            }
+            keys.insert(RomKey::Sha1(sha1));
+        }
+
+        let bulk = present_keys(conn, &keys).unwrap();
+        assert_eq!(bulk.len(), 500);
+        assert!(bulk.contains(&RomKey::Sha1("SHA0000".into())));
+        assert!(!bulk.contains(&RomKey::Sha1("SHA0001".into())));
     }
 }
