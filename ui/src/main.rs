@@ -90,7 +90,9 @@ async fn status_one(
 ) -> Result<Option<CollectionStatus>, String> {
     tauri::async_runtime::spawn_blocking(move || -> anyhow::Result<_> {
         let mode = parse_merge_mode(merge_mode.as_deref());
-        Ok(compute_status(&data_dir()?, Some(&name), mode)?.into_iter().next())
+        Ok(compute_status(&data_dir()?, Some(&name), mode)?
+            .into_iter()
+            .next())
     })
     .await
     .map_err(|e| e.to_string())?
