@@ -106,6 +106,40 @@ pub fn primary_node_path(conn: &Connection, version_id: i64) -> Result<Option<St
     Ok(path)
 }
 
+/// Nest a version's primary node under its own name: `path` becomes `path/name`
+/// (e.g. `MAME/Software List` → `MAME/Software List/32x`).
+///
+/// Recursive `dat add` records the *directory* a DAT was found in as the node
+/// path, so sibling DATs in one directory share a path and collide on their
+/// destination root. Appending the node's own name gives each a distinct
+/// destination — and a distinct library-tree node. Returns the new path, or
+/// `None` if the version has no node. Idempotent only by inspection: calling it
+/// twice nests twice, so callers gate on a real collision.
+pub fn nest_primary_node_under_name(conn: &Connection, version_id: i64) -> Result<Option<String>> {
+    let node = conn
+        .query_row(
+            "SELECT id, path, name FROM dat_nodes WHERE version_id = ? ORDER BY id LIMIT 1",
+            [version_id],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((id, path, name)) = node else {
+        return Ok(None);
+    };
+    let new_path = format!("{path}/{name}");
+    conn.execute(
+        "UPDATE dat_nodes SET path = ?1 WHERE id = ?2",
+        params![new_path, id],
+    )?;
+    Ok(Some(new_path))
+}
+
 /// Create a game entry
 #[allow(clippy::too_many_arguments)]
 pub fn create_game(
@@ -1140,6 +1174,34 @@ mod tests {
         .unwrap();
 
         assert!(clone_id > 0);
+    }
+
+    #[test]
+    fn nest_primary_node_under_name_appends_the_node_name() {
+        let db = setup_db();
+        let conn = db.conn();
+        let (_, version_id) = create_test_collection_version(conn);
+        create_node(conn, version_id, None, "32x", "root", "MAME/Software List").unwrap();
+
+        let new_path = nest_primary_node_under_name(conn, version_id).unwrap();
+        assert_eq!(new_path.as_deref(), Some("MAME/Software List/32x"));
+        // Reflected in the primary path used for destination resolution.
+        assert_eq!(
+            primary_node_path(conn, version_id).unwrap().as_deref(),
+            Some("MAME/Software List/32x")
+        );
+    }
+
+    #[test]
+    fn nest_primary_node_under_name_is_none_without_a_node() {
+        let db = setup_db();
+        let conn = db.conn();
+        let (_, version_id) = create_test_collection_version(conn);
+        assert!(
+            nest_primary_node_under_name(conn, version_id)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
