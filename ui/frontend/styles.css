@@ -246,6 +246,106 @@ tr:hover td {
   display: none;
 }
 
+/* pending-work badge on a node */
+.pending-badge {
+  flex: none;
+  font-size: 11px;
+  color: var(--warn);
+  border: 1px solid rgba(224, 196, 106, 0.4);
+  background: rgba(224, 196, 106, 0.08);
+  border-radius: 999px;
+  padding: 1px 8px;
+  margin-left: 8px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.pending-badge:hover {
+  background: rgba(224, 196, 106, 0.18);
+}
+
+.pending-badge.hidden {
+  display: none;
+}
+
+.stale-banner {
+  background: rgba(224, 196, 106, 0.1);
+  border: 1px solid rgba(224, 196, 106, 0.35);
+  color: var(--warn);
+  border-radius: 8px;
+  padding: 10px 14px;
+  margin-bottom: 12px;
+}
+
+.stale-banner.hidden {
+  display: none;
+}
+
+/* per-node pending detail overlay */
+.detail-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.5);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 10;
+}
+
+.detail-panel {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  width: min(640px, 90vw);
+  max-height: 80vh;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.detail-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--line);
+}
+
+.detail-close {
+  margin-left: auto;
+  background: var(--panel-2);
+  color: var(--ink);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 4px 10px;
+  cursor: pointer;
+}
+
+.detail-list {
+  overflow: auto;
+  padding: 6px 0;
+}
+
+.detail-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 120px 100px;
+  gap: 10px;
+  align-items: center;
+  padding: 6px 16px;
+  border-bottom: 1px solid var(--line);
+}
+
+.detail-row .num {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+.detail-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 /* ---- plan diff ---- */
 .summary {
   display: flex;

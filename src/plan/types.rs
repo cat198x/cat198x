@@ -22,13 +22,16 @@ pub struct Plan {
     /// of files. Each entry is `"<name> (<rows> match-rows)"`. Transient.
     #[serde(skip)]
     pub skipped_oversized: Vec<String>,
-    /// Per-collection operation tallies, for a reviewable breakdown. Transient.
-    #[serde(skip)]
+    /// Per-collection operation tallies, for a reviewable breakdown. Persisted
+    /// so a reader (the UI's pending-work overlay) can roll the to-write counts
+    /// up the library tree without re-running the planner; `default` keeps plans
+    /// written before it was saved loadable.
+    #[serde(default)]
     pub per_collection: Vec<CollectionPlanStat>,
 }
 
 /// A single collection's contribution to a plan, for the by-group breakdown.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CollectionPlanStat {
     pub name: String,
     /// The collection's library path (carries the set as its top segment).

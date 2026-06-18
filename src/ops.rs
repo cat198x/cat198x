@@ -24,7 +24,7 @@ use serde::Serialize;
 
 use crate::db::dats::{self, MergeMode};
 use crate::db::{collections, files};
-use crate::plan::Plan;
+use crate::plan::{Plan, compute_state_hash};
 
 /// Completeness of one collection against its active DAT.
 #[derive(Debug, Clone, Serialize)]
@@ -187,6 +187,62 @@ pub fn latest_plan(data_dir: &Path) -> Result<Option<Plan>> {
     }
 }
 
+/// One collection's pending reorganise work, from the saved plan.
+#[derive(Debug, Clone, Serialize)]
+pub struct PendingItem {
+    pub collection: String,
+    /// The collection's library path, for rolling up the tree.
+    pub node_path: String,
+    /// Operations the plan would perform here (copy/move/repack/relocate).
+    pub to_write: usize,
+    /// Bytes the plan would transfer here.
+    pub bytes: u64,
+}
+
+/// The reorganise work the saved plan implies, per collection, plus whether the
+/// plan has gone stale against the current catalogue.
+#[derive(Debug, Clone, Serialize)]
+pub struct PendingWork {
+    /// `true` when the catalogue has changed since the plan was generated, so the
+    /// numbers may be out of date and the plan should be re-run.
+    pub stale: bool,
+    /// When the underlying plan was generated.
+    pub plan_created_at: String,
+    /// Collections with at least one pending operation.
+    pub items: Vec<PendingItem>,
+}
+
+/// The pending reorganise work from the most recent saved plan, or `None` when
+/// no plan has been generated.
+///
+/// This is a *read* of the saved plan's per-collection breakdown — it does not
+/// run the planner. The `stale` flag (the saved plan's state hash vs the current
+/// catalogue's) tells a caller when those numbers predate the catalogue and the
+/// plan should be regenerated. Clean-up work (removals, husks) is not included
+/// here; only the additive/reorganise operations the plan carries.
+pub fn pending_work(conn: &Connection, data_dir: &Path) -> Result<Option<PendingWork>> {
+    let Some(plan) = latest_plan(data_dir)? else {
+        return Ok(None);
+    };
+    let stale = compute_state_hash(conn)? != plan.state_hash;
+    let items = plan
+        .per_collection
+        .iter()
+        .filter(|c| c.to_write > 0)
+        .map(|c| PendingItem {
+            collection: c.name.clone(),
+            node_path: c.node_path.clone(),
+            to_write: c.to_write,
+            bytes: c.bytes,
+        })
+        .collect();
+    Ok(Some(PendingWork {
+        stale,
+        plan_created_at: plan.created_at,
+        items,
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -289,5 +345,52 @@ mod tests {
 
         let loaded = latest_plan(tmp.path()).unwrap().expect("a plan");
         assert_eq!(loaded.state_hash, "deadbeefdeadbeef");
+    }
+
+    #[test]
+    fn pending_work_rolls_up_the_saved_plans_per_collection() {
+        let db = Database::open_in_memory().unwrap();
+        let conn = db.conn();
+        let tmp = tempfile::tempdir().unwrap();
+        let plans = tmp.path().join("objects/plans");
+        std::fs::create_dir_all(&plans).unwrap();
+
+        // A plan whose hash matches the (empty) catalogue → not stale.
+        let current = compute_state_hash(conn).unwrap();
+        let mut plan = Plan::new(current);
+        plan.per_collection = vec![
+            crate::plan::CollectionPlanStat {
+                name: "A".into(),
+                node_path: "TOSEC/A".into(),
+                to_write: 3,
+                already_correct: 0,
+                bytes: 30,
+            },
+            crate::plan::CollectionPlanStat {
+                name: "B".into(),
+                node_path: "TOSEC/B".into(),
+                to_write: 0, // fully placed — excluded
+                already_correct: 5,
+                bytes: 0,
+            },
+        ];
+        std::fs::write(plans.join("p.json"), serde_json::to_string(&plan).unwrap()).unwrap();
+
+        let pw = pending_work(conn, tmp.path())
+            .unwrap()
+            .expect("pending work");
+        assert!(!pw.stale, "plan hash matches the catalogue");
+        assert_eq!(pw.items.len(), 1, "only collections with pending work");
+        assert_eq!(pw.items[0].collection, "A");
+        assert_eq!(pw.items[0].node_path, "TOSEC/A");
+        assert_eq!(pw.items[0].to_write, 3);
+        assert_eq!(pw.items[0].bytes, 30);
+    }
+
+    #[test]
+    fn pending_work_is_none_without_a_plan() {
+        let db = Database::open_in_memory().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(pending_work(db.conn(), tmp.path()).unwrap().is_none());
     }
 }

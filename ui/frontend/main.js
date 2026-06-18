@@ -80,7 +80,8 @@ function makeNode(name, parent) {
     collection: null, // set on a leaf
     activeLeaves: 0, // active collections in this subtree (for the progress hint)
     agg: { games: 0, have: 0, total: 0, resolved: 0 },
-    dom: null, // { row, cells, childrenEl, expanded, rendered } once drawn
+    pending: { to_write: 0, bytes: 0 }, // reorganise work from the saved plan
+    dom: null, // { row, cells, badge, childrenEl, expanded, rendered } once drawn
   };
 }
 
@@ -124,12 +125,18 @@ function renderChildren(node, container, depth) {
     const count = hasChildren
       ? el("span", { class: "pill" }, `${child.activeLeaves || child.children.size}`)
       : null;
+    const badge = el("span", { class: "pending-badge hidden" });
+    badge.addEventListener("click", (ev) => {
+      ev.stopPropagation(); // don't toggle the row
+      showPendingDetail(child);
+    });
     const name = el(
       "div",
       { class: "name", style: `padding-left:${depth * 18}px`, title: child.name },
       toggle,
       el("span", { class: hasChildren ? "node-name group" : "node-name" }, child.name),
-      count
+      count,
+      badge
     );
     const row = el(
       "div",
@@ -141,8 +148,9 @@ function renderChildren(node, container, depth) {
       cells.complete
     );
     const childrenEl = el("div", { class: "tree-children hidden" });
-    child.dom = { row, cells, childrenEl, expanded: false, rendered: false };
+    child.dom = { row, cells, badge, childrenEl, expanded: false, rendered: false };
     drawNodeStats(child);
+    drawBadge(child);
     container.append(row, childrenEl);
 
     if (hasChildren) {
@@ -200,6 +208,75 @@ function rollUpToRoot(leafNode, s) {
   }
 }
 
+// Draw (or clear) a node's pending-work badge — the reorganise work the saved
+// plan would do within it. Clicking the badge opens the per-node detail.
+function drawBadge(node) {
+  if (!node.dom) return;
+  const b = node.dom.badge;
+  const p = node.pending;
+  if (p.to_write > 0) {
+    b.textContent = `⊕ ${p.to_write.toLocaleString()} to file · ${fmtBytes(p.bytes)}`;
+    b.classList.remove("hidden");
+    b.title = "Pending reorganise work — click for detail";
+  } else {
+    b.classList.add("hidden");
+  }
+}
+
+// Add one collection's pending work to its leaf and every ancestor, redrawing
+// any badges currently on screen.
+function applyPending(leafNode, toWrite, bytes) {
+  for (let n = leafNode; n; n = n.parent) {
+    n.pending.to_write += toWrite;
+    n.pending.bytes += bytes;
+    if (n.dom) drawBadge(n);
+  }
+}
+
+// Collect the leaf collections beneath `node` that have pending work.
+function pendingLeaves(node, out = []) {
+  if (node.collection && node.pending.to_write > 0 && node.children.size === 0) {
+    out.push(node);
+  }
+  for (const ch of node.children.values()) pendingLeaves(ch, out);
+  return out;
+}
+
+// Show a node's pending reorganise work, broken down by collection.
+function showPendingDetail(node) {
+  const leaves = pendingLeaves(node).sort((a, b) => b.pending.to_write - a.pending.to_write);
+  const rows = leaves.map((l) =>
+    el(
+      "div",
+      { class: "detail-row" },
+      el("div", { class: "detail-name", title: l.collection.node_path }, l.collection.name),
+      el("div", { class: "num" }, `${l.pending.to_write.toLocaleString()} to file`),
+      el("div", { class: "num muted" }, fmtBytes(l.pending.bytes))
+    )
+  );
+  const panel = el(
+    "div",
+    { class: "detail-panel" },
+    el(
+      "div",
+      { class: "detail-head" },
+      el("strong", {}, node.name || "Library"),
+      el(
+        "span",
+        { class: "muted" },
+        ` · ${node.pending.to_write.toLocaleString()} to file · ${fmtBytes(node.pending.bytes)}`
+      ),
+      el("button", { class: "detail-close", onclick: () => overlay.remove() }, "✕")
+    ),
+    el("div", { class: "detail-list" }, ...(rows.length ? rows : [el("div", { class: "muted" }, "No pending work.")]))
+  );
+  const overlay = el("div", { class: "detail-overlay" }, panel);
+  overlay.addEventListener("click", (ev) => {
+    if (ev.target === overlay) overlay.remove();
+  });
+  document.body.append(overlay);
+}
+
 async function loadStatus() {
   const body = document.getElementById("status-body");
   body.className = "loading";
@@ -237,8 +314,28 @@ async function loadStatus() {
   const treeBody = el("div", { class: "tree-body" });
   renderChildren(root, treeBody, 0); // top-level sets, collapsed
 
+  const banner = el("div", { class: "stale-banner hidden" });
   body.className = "";
-  body.replaceChildren(el("div", { class: "tree" }, header, treeBody));
+  body.replaceChildren(el("div", { class: "tree" }, banner, header, treeBody));
+
+  // Overlay the saved plan's pending reorganise work as per-node badges. This is
+  // a cheap read of the saved plan — independent of the completeness fill below.
+  invoke("pending_work")
+    .then((pw) => {
+      if (!pw) return;
+      if (pw.stale) {
+        banner.textContent =
+          "⚠ The pending counts are from an earlier plan and may be out of date — run `cat198x plan` to refresh.";
+        banner.classList.remove("hidden");
+      }
+      for (const item of pw.items) {
+        const leaf = leafByName.get(item.collection);
+        if (leaf) applyPending(leaf, item.to_write, item.bytes);
+      }
+    })
+    .catch(() => {
+      /* pending overlay is best-effort; the tree still works without it */
+    });
 
   // Fill each active collection concurrently, rolling each result up the tree.
   const active = cols.filter((c) => c.has_active_version);
