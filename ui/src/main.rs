@@ -17,7 +17,7 @@ use std::path::Path;
 
 use cat198x::db::Database;
 use cat198x::db::dats::MergeMode;
-use cat198x::ops::{self, CollectionInfo, CollectionStatus};
+use cat198x::ops::{self, CollectionInfo, CollectionStatus, PendingWork};
 use cat198x::plan::{Operation, PlanSummary};
 
 /// How many of a plan's operations the UI receives. A real plan can hold tens of
@@ -99,6 +99,21 @@ async fn status_one(
     .map_err(|e| e.to_string())
 }
 
+/// The pending reorganise work from the saved plan, per collection, with a
+/// staleness flag. The UI rolls it up the tree as per-node badges. Reads the
+/// saved plan; does not run the planner.
+#[tauri::command]
+async fn pending_work() -> Result<Option<PendingWork>, String> {
+    tauri::async_runtime::spawn_blocking(|| -> anyhow::Result<_> {
+        let dir = data_dir()?;
+        let db = Database::open(&dir.join("db.sqlite"))?;
+        ops::pending_work(db.conn(), &dir)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+    .map_err(|e| e.to_string())
+}
+
 /// The most recent saved plan — the reorganisation as a diff — or `null`.
 #[tauri::command]
 async fn plan_diff() -> Result<Option<PlanView>, String> {
@@ -124,7 +139,12 @@ async fn plan_diff() -> Result<Option<PlanView>, String> {
 
 fn main() {
     tauri::Builder::default()
-        .invoke_handler(tauri::generate_handler![collections, status_one, plan_diff])
+        .invoke_handler(tauri::generate_handler![
+            collections,
+            status_one,
+            pending_work,
+            plan_diff
+        ])
         .run(tauri::generate_context!())
         .expect("error while running the Cat198x UI");
 }
