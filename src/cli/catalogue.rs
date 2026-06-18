@@ -80,6 +80,8 @@ pub fn run(dry_run: bool, plan_filter: Option<String>, data_dir: Option<PathBuf>
             case_sensitive: false,
             added_at: String::new(),
             last_scanned: None,
+            // The library root is a destination — content is preserved there.
+            disposition: files::Disposition::Preserve,
         });
     }
 
@@ -210,6 +212,7 @@ mod tests {
             case_sensitive: false,
             added_at: String::new(),
             last_scanned: None,
+            disposition: files::Disposition::Preserve,
         }];
 
         // Loose copy dest.

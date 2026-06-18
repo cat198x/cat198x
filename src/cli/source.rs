@@ -1,23 +1,37 @@
 //! Source directory management commands
 
 use anyhow::{Context, Result};
+use rusqlite::Connection;
 use std::path::{Path, PathBuf};
 
 use crate::SourceCommands;
-use crate::db::files;
+use crate::config::Config;
+use crate::db::files::{self, Disposition};
 
-use super::open_database;
+use super::{get_data_dir, open_database};
 
 /// Run a source subcommand
 pub fn run(cmd: SourceCommands, data_dir: Option<PathBuf>) -> Result<()> {
     match cmd {
-        SourceCommands::Add { path } => add_source(&path, data_dir),
+        SourceCommands::Add {
+            path,
+            preserve,
+            consume,
+        } => add_source(&path, preserve, consume, data_dir),
         SourceCommands::Remove { path } => remove_source(&path, data_dir),
         SourceCommands::List => list_sources(data_dir),
+        SourceCommands::SetDisposition { path, disposition } => {
+            set_disposition(&path, &disposition, data_dir)
+        }
     }
 }
 
-fn add_source(path: &PathBuf, data_dir: Option<PathBuf>) -> Result<()> {
+fn add_source(
+    path: &PathBuf,
+    preserve: bool,
+    consume: bool,
+    data_dir: Option<PathBuf>,
+) -> Result<()> {
     let abs_path =
         std::fs::canonicalize(path).with_context(|| format!("Cannot resolve path: {:?}", path))?;
 
@@ -26,14 +40,15 @@ fn add_source(path: &PathBuf, data_dir: Option<PathBuf>) -> Result<()> {
         anyhow::bail!("Path is not a directory: {}", abs_path.display());
     }
 
-    let db = open_database(data_dir)?;
+    let db = open_database(data_dir.clone())?;
     let conn = db.conn();
 
     // Check if already registered
-    let path_str = abs_path.to_string_lossy();
+    let path_str = abs_path.to_string_lossy().into_owned();
     if let Some(existing) = files::get_source_by_path(conn, &path_str)? {
         println!("Source already registered:");
         println!("  Path: {}", existing.path);
+        println!("  Disposition: {}", existing.disposition.as_str());
         println!("  Case sensitive: {}", existing.case_sensitive);
         println!("  Added: {}", existing.added_at);
         if let Some(scanned) = existing.last_scanned {
@@ -42,18 +57,116 @@ fn add_source(path: &PathBuf, data_dir: Option<PathBuf>) -> Result<()> {
         return Ok(());
     }
 
+    // Disposition follows the directory's role unless overridden. A destination
+    // is always preserved — refuse an explicit --consume there.
+    let roots = destination_roots(conn, &data_dir)?;
+    let is_dest = is_destination(&path_str, &roots);
+    let disposition = if preserve {
+        Disposition::Preserve
+    } else if consume {
+        if is_dest {
+            anyhow::bail!(
+                "{} sits under a destination root — a destination is always preserved \
+                 and cannot be consumed.",
+                abs_path.display()
+            );
+        }
+        Disposition::Consume
+    } else if is_dest {
+        Disposition::Preserve
+    } else {
+        Disposition::Consume
+    };
+
     // Detect case sensitivity
     let case_sensitive = detect_case_sensitivity(&abs_path);
 
-    // Add to database
+    // Add to database, then set the resolved disposition (add defaults preserve).
     let id = files::add_source(conn, &path_str, case_sensitive)?;
+    files::set_source_disposition(conn, &path_str, disposition)?;
 
     println!("Added source #{}: {}", id, abs_path.display());
+    println!("  Disposition: {}", disposition.as_str());
     println!("  Case sensitive: {}", case_sensitive);
     println!();
     println!("Run 'cat198x scan' to index files in this source.");
 
     Ok(())
+}
+
+fn set_disposition(path: &PathBuf, disposition: &str, data_dir: Option<PathBuf>) -> Result<()> {
+    let target = match disposition {
+        "consume" => Disposition::Consume,
+        "preserve" => Disposition::Preserve,
+        other => anyhow::bail!("Unknown disposition '{other}' — use 'consume' or 'preserve'."),
+    };
+
+    let abs_path =
+        std::fs::canonicalize(path).with_context(|| format!("Cannot resolve path: {:?}", path))?;
+
+    let db = open_database(data_dir.clone())?;
+    let conn = db.conn();
+    let path_str = abs_path.to_string_lossy().into_owned();
+
+    if files::get_source_by_path(conn, &path_str)?.is_none() {
+        anyhow::bail!(
+            "Not a registered source: {}\nUse 'cat198x source list' to see registered sources.",
+            abs_path.display()
+        );
+    }
+
+    // A destination is always preserved; consuming it would move content out of
+    // the library.
+    if target == Disposition::Consume {
+        let roots = destination_roots(conn, &data_dir)?;
+        if is_destination(&path_str, &roots) {
+            anyhow::bail!(
+                "{} sits under a destination root — a destination is always preserved \
+                 and cannot be consumed.",
+                abs_path.display()
+            );
+        }
+    }
+
+    files::set_source_disposition(conn, &path_str, target)?;
+    println!(
+        "Set {} disposition: {}",
+        abs_path.display(),
+        target.as_str()
+    );
+    Ok(())
+}
+
+/// The configured destination roots: the library-wide `default_dest_path` plus
+/// every per-collection `dest_path`. A source at or under any of these is a
+/// destination and is always preserved.
+fn destination_roots(conn: &Connection, data_dir: &Option<PathBuf>) -> Result<Vec<String>> {
+    let mut roots = Vec::new();
+    if let Ok(dir) = get_data_dir(data_dir.clone()) {
+        let config_path = dir.join("config.toml");
+        if config_path.exists()
+            && let Ok(config) = Config::load(&config_path)
+            && let Some(default_dest) = config.default_dest_path
+        {
+            roots.push(default_dest);
+        }
+    }
+    let mut stmt =
+        conn.prepare("SELECT DISTINCT dest_path FROM dat_config WHERE dest_path IS NOT NULL")?;
+    let dest_paths = stmt
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+    roots.extend(dest_paths);
+    Ok(roots)
+}
+
+/// Whether `path` is at or under any destination root.
+fn is_destination(path: &str, roots: &[String]) -> bool {
+    let path = path.trim_end_matches('/');
+    roots.iter().any(|root| {
+        let root = root.trim_end_matches('/');
+        path == root || path.starts_with(&format!("{root}/"))
+    })
 }
 
 fn remove_source(path: &PathBuf, data_dir: Option<PathBuf>) -> Result<()> {
@@ -99,6 +212,7 @@ fn list_sources(data_dir: Option<PathBuf>) -> Result<()> {
         let file_count = files::count_files_in_source(conn, source.id)?;
 
         println!("  {} [#{}]", source.path, source.id);
+        println!("    Disposition: {}", source.disposition.as_str());
         println!("    Case sensitive: {}", source.case_sensitive);
         println!("    Files indexed: {}", file_count);
         if let Some(ref scanned) = source.last_scanned {
@@ -144,6 +258,24 @@ fn detect_case_sensitivity(path: &Path) -> bool {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn is_destination_matches_at_or_under_a_root() {
+        let roots = vec![
+            "/Volumes/Data/Library/ROMs".to_string(),
+            "/Volumes/Data/Library/ROMs/MAME/".to_string(), // trailing slash tolerated
+        ];
+        // At a root, and under one → destination (preserve).
+        assert!(is_destination("/Volumes/Data/Library/ROMs", &roots));
+        assert!(is_destination("/Volumes/Data/Library/ROMs/TOSEC", &roots));
+        assert!(is_destination(
+            "/Volumes/Data/Library/ROMs/MAME/Software List/32x",
+            &roots
+        ));
+        // Staging, and a sibling that merely shares a prefix string → not.
+        assert!(!is_destination("/Volumes/Data/ToSort/MAME", &roots));
+        assert!(!is_destination("/Volumes/Data/Library/ROMs-backup", &roots));
+    }
 
     #[test]
     fn test_detect_case_sensitivity() {

@@ -91,7 +91,11 @@ CREATE TABLE sources (
     path TEXT NOT NULL UNIQUE,
     case_sensitive BOOLEAN NOT NULL,
     added_at TEXT NOT NULL DEFAULT (datetime('now')),
-    last_scanned TEXT
+    last_scanned TEXT,
+    -- 'consume' (staging: may be emptied) or 'preserve' (content never lost).
+    -- Defaults preserve: safe — never authorises removal without an explicit
+    -- choice. See decisions/source-disposition.md.
+    disposition TEXT NOT NULL DEFAULT 'preserve'
 );
 
 -- Where files physically exist

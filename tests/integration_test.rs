@@ -127,6 +127,8 @@ fn test_full_workflow_init_to_status() {
     use cat198x::SourceCommands;
     cli::source::run(
         SourceCommands::Add {
+            preserve: false,
+            consume: false,
             path: env.roms_dir.clone(),
         },
         env.data_dir_opt(),
@@ -199,6 +201,8 @@ fn test_source_add_detects_case_sensitivity() {
     use cat198x::SourceCommands;
     cli::source::run(
         SourceCommands::Add {
+            preserve: false,
+            consume: false,
             path: env.roms_dir.clone(),
         },
         env.data_dir_opt(),
@@ -226,6 +230,8 @@ fn test_source_add_prevents_duplicates() {
     // Add source first time
     cli::source::run(
         SourceCommands::Add {
+            preserve: false,
+            consume: false,
             path: env.roms_dir.clone(),
         },
         env.data_dir_opt(),
@@ -235,6 +241,8 @@ fn test_source_add_prevents_duplicates() {
     // Add same source again - should succeed but not create duplicate
     cli::source::run(
         SourceCommands::Add {
+            preserve: false,
+            consume: false,
             path: env.roms_dir.clone(),
         },
         env.data_dir_opt(),
@@ -258,6 +266,8 @@ fn test_source_remove() {
     // Add source
     cli::source::run(
         SourceCommands::Add {
+            preserve: false,
+            consume: false,
             path: env.roms_dir.clone(),
         },
         env.data_dir_opt(),
@@ -297,6 +307,8 @@ fn test_scan_indexes_loose_files() {
     use cat198x::SourceCommands;
     cli::source::run(
         SourceCommands::Add {
+            preserve: false,
+            consume: false,
             path: env.roms_dir.clone(),
         },
         env.data_dir_opt(),
@@ -325,6 +337,8 @@ fn test_scan_updates_last_scanned() {
     use cat198x::SourceCommands;
     cli::source::run(
         SourceCommands::Add {
+            preserve: false,
+            consume: false,
             path: env.roms_dir.clone(),
         },
         env.data_dir_opt(),
@@ -525,6 +539,8 @@ fn test_file_hashing_correctness() {
     use cat198x::SourceCommands;
     cli::source::run(
         SourceCommands::Add {
+            preserve: false,
+            consume: false,
             path: env.roms_dir.clone(),
         },
         env.data_dir_opt(),
@@ -648,6 +664,8 @@ fn test_plan_generation() {
     use cat198x::SourceCommands;
     cli::source::run(
         SourceCommands::Add {
+            preserve: false,
+            consume: false,
             path: env.roms_dir.clone(),
         },
         env.data_dir_opt(),
@@ -683,6 +701,8 @@ fn test_incremental_scan_skips_unchanged() {
     use cat198x::SourceCommands;
     cli::source::run(
         SourceCommands::Add {
+            preserve: false,
+            consume: false,
             path: env.roms_dir.clone(),
         },
         env.data_dir_opt(),
@@ -773,6 +793,8 @@ fn test_plan_apply_rollback_cycle() {
     use cat198x::SourceCommands;
     cli::source::run(
         SourceCommands::Add {
+            preserve: false,
+            consume: false,
             path: env.roms_dir.clone(),
         },
         env.data_dir_opt(),
@@ -898,6 +920,8 @@ fn test_apply_from_zip_archive() {
     use cat198x::SourceCommands;
     cli::source::run(
         SourceCommands::Add {
+            preserve: false,
+            consume: false,
             path: env.roms_dir.clone(),
         },
         env.data_dir_opt(),
@@ -976,6 +1000,8 @@ fn test_stale_plan_detection() {
     use cat198x::SourceCommands;
     cli::source::run(
         SourceCommands::Add {
+            preserve: false,
+            consume: false,
             path: env.roms_dir.clone(),
         },
         env.data_dir_opt(),
@@ -1094,6 +1120,8 @@ fn test_multi_file_plan_apply() {
     use cat198x::SourceCommands;
     cli::source::run(
         SourceCommands::Add {
+            preserve: false,
+            consume: false,
             path: env.roms_dir.clone(),
         },
         env.data_dir_opt(),
@@ -1197,6 +1225,8 @@ fn test_apply_skips_already_correct_files() {
     use cat198x::SourceCommands;
     cli::source::run(
         SourceCommands::Add {
+            preserve: false,
+            consume: false,
             path: dest_dir.clone(),
         },
         env.data_dir_opt(),
@@ -1605,6 +1635,8 @@ fn test_doctor_healthy_database() {
     use cat198x::SourceCommands;
     cli::source::run(
         SourceCommands::Add {
+            preserve: false,
+            consume: false,
             path: env.roms_dir.clone(),
         },
         env.data_dir_opt(),
@@ -1815,6 +1847,8 @@ fn test_export_filters() {
     use cat198x::SourceCommands;
     cli::source::run(
         SourceCommands::Add {
+            preserve: false,
+            consume: false,
             path: env.roms_dir.clone(),
         },
         env.data_dir_opt(),
@@ -1990,6 +2024,8 @@ fn test_stats_command() {
     use cat198x::SourceCommands;
     cli::source::run(
         SourceCommands::Add {
+            preserve: false,
+            consume: false,
             path: env.roms_dir.clone(),
         },
         env.data_dir_opt(),
@@ -2038,6 +2074,8 @@ fn test_recursive_add_plans_into_hierarchical_destination() {
     fs::write(env.roms_dir.join("test.rom"), content).unwrap();
     cli::source::run(
         SourceCommands::Add {
+            preserve: false,
+            consume: false,
             path: env.roms_dir.clone(),
         },
         env.data_dir_opt(),
@@ -2170,6 +2208,8 @@ fn test_zip_output_format_plans_applies_and_converges() {
     fs::write(env.roms_dir.join("test.rom"), content).unwrap();
     cli::source::run(
         SourceCommands::Add {
+            preserve: false,
+            consume: false,
             path: env.roms_dir.clone(),
         },
         env.data_dir_opt(),
@@ -2187,6 +2227,8 @@ fn test_zip_output_format_plans_applies_and_converges() {
     // and a re-plan converges without a re-scan.
     cli::source::run(
         SourceCommands::Add {
+            preserve: false,
+            consume: false,
             path: dest_root.clone(),
         },
         env.data_dir_opt(),
@@ -2286,7 +2328,15 @@ fn test_apply_skip_repack_defers_then_resumes() {
     fs::write(env.roms_dir.join("test.rom"), content).unwrap();
     fs::write(roms2.join("test.rom"), content).unwrap();
     for dir in [env.roms_dir.clone(), roms2.clone()] {
-        cli::source::run(SourceCommands::Add { path: dir }, env.data_dir_opt()).unwrap();
+        cli::source::run(
+            SourceCommands::Add {
+                path: dir,
+                preserve: false,
+                consume: false,
+            },
+            env.data_dir_opt(),
+        )
+        .unwrap();
     }
     cli::scan::run(None, false, None, env.data_dir_opt()).unwrap();
 
@@ -2295,6 +2345,8 @@ fn test_apply_skip_repack_defers_then_resumes() {
     let dest_root = std::fs::canonicalize(&dest_root).unwrap();
     cli::source::run(
         SourceCommands::Add {
+            preserve: false,
+            consume: false,
             path: dest_root.clone(),
         },
         env.data_dir_opt(),
@@ -2374,6 +2426,8 @@ fn test_move_repack_deletes_source_and_rollback_restores_it() {
     fs::write(&source_file, content).unwrap();
     cli::source::run(
         SourceCommands::Add {
+            preserve: false,
+            consume: false,
             path: env.roms_dir.clone(),
         },
         env.data_dir_opt(),
@@ -2386,6 +2440,8 @@ fn test_move_repack_deletes_source_and_rollback_restores_it() {
     let dest_root = std::fs::canonicalize(&dest_root).unwrap();
     cli::source::run(
         SourceCommands::Add {
+            preserve: false,
+            consume: false,
             path: dest_root.clone(),
         },
         env.data_dir_opt(),
@@ -2460,6 +2516,8 @@ fn test_plan_records_per_collection_breakdown() {
     fs::write(env.roms_dir.join("test.rom"), content).unwrap();
     cli::source::run(
         SourceCommands::Add {
+            preserve: false,
+            consume: false,
             path: env.roms_dir.clone(),
         },
         env.data_dir_opt(),
@@ -2518,6 +2576,8 @@ fn test_move_mode_relocates_and_removes_source() {
     fs::write(&misnamed, content).unwrap();
     cli::source::run(
         SourceCommands::Add {
+            preserve: false,
+            consume: false,
             path: env.roms_dir.clone(),
         },
         env.data_dir_opt(),
@@ -2598,6 +2658,8 @@ fn test_apply_prune_empty_removes_emptied_source_subdir() {
     fs::write(&misnamed, content).unwrap();
     cli::source::run(
         SourceCommands::Add {
+            preserve: false,
+            consume: false,
             path: env.roms_dir.clone(),
         },
         env.data_dir_opt(),
