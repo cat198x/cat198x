@@ -15,7 +15,12 @@ use std::path::Path;
 use cat198x::db::Database;
 use cat198x::db::dats::MergeMode;
 use cat198x::ops::{self, CollectionStatus};
-use cat198x::plan::Plan;
+use cat198x::plan::{Operation, PlanSummary};
+
+/// How many of a plan's operations the UI receives. A real plan can hold tens of
+/// thousands; the diff is for review, and the frontend caps what it draws, so we
+/// send a bounded prefix plus the true total rather than a multi-megabyte payload.
+const MAX_PLAN_OPS: usize = 2000;
 
 /// Map a merge-mode string from the UI to the enum, defaulting to non-merged —
 /// the same mapping the other adapters use.
@@ -39,19 +44,53 @@ fn data_dir() -> anyhow::Result<std::path::PathBuf> {
     cat198x::cli::get_data_dir(None)
 }
 
+/// The saved plan trimmed for the UI: the summary and counts in full, the
+/// operation list bounded to a reviewable prefix.
+#[derive(serde::Serialize)]
+struct PlanView {
+    state_hash: String,
+    created_at: String,
+    total_operations: usize,
+    summary: PlanSummary,
+    operations: Vec<Operation>,
+}
+
 /// Collection completeness against the active DATs.
+///
+/// `async` so Tauri runs it off the main thread; the blocking database work is
+/// then handed to `spawn_blocking`, so a slow catalogue can never freeze the UI.
 #[tauri::command]
-fn status(merge_mode: Option<String>) -> Result<Vec<CollectionStatus>, String> {
-    let mode = parse_merge_mode(merge_mode.as_deref());
-    let dir = data_dir().map_err(|e| e.to_string())?;
-    compute_status(&dir, mode).map_err(|e| e.to_string())
+async fn status(merge_mode: Option<String>) -> Result<Vec<CollectionStatus>, String> {
+    tauri::async_runtime::spawn_blocking(move || -> anyhow::Result<_> {
+        let mode = parse_merge_mode(merge_mode.as_deref());
+        compute_status(&data_dir()?, mode)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+    .map_err(|e| e.to_string())
 }
 
 /// The most recent saved plan — the reorganisation as a diff — or `null`.
 #[tauri::command]
-fn plan_diff() -> Result<Option<Plan>, String> {
-    let dir = data_dir().map_err(|e| e.to_string())?;
-    ops::latest_plan(&dir).map_err(|e| e.to_string())
+async fn plan_diff() -> Result<Option<PlanView>, String> {
+    tauri::async_runtime::spawn_blocking(|| -> anyhow::Result<Option<PlanView>> {
+        let Some(plan) = ops::latest_plan(&data_dir()?)? else {
+            return Ok(None);
+        };
+        let total_operations = plan.operations.len();
+        let mut operations = plan.operations;
+        operations.truncate(MAX_PLAN_OPS);
+        Ok(Some(PlanView {
+            state_hash: plan.state_hash,
+            created_at: plan.created_at,
+            total_operations,
+            summary: plan.summary,
+            operations,
+        }))
+    })
+    .await
+    .map_err(|e| e.to_string())?
+    .map_err(|e| e.to_string())
 }
 
 fn main() {

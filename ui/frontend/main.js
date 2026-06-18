@@ -169,10 +169,11 @@ function renderPlan(body, plan) {
     el("div", { class: "chip" }, el("div", { class: "n" }, fmtBytes(s.total_bytes)), el("div", { class: "k" }, "to transfer"))
   );
 
+  const total = plan.total_operations;
   const meta = el(
     "div",
     { class: "muted", style: "margin-bottom:12px" },
-    `${plan.operations.length.toLocaleString()} operation(s) · generated ${plan.created_at} · state ${plan.state_hash.slice(0, 12)}`
+    `${total.toLocaleString()} operation(s) · generated ${plan.created_at} · state ${plan.state_hash.slice(0, 12)}`
   );
 
   const list = el("div", {});
@@ -187,9 +188,9 @@ function renderPlan(body, plan) {
       )
     );
   }
-  if (plan.operations.length > MAX_OPS) {
+  if (total > shown.length) {
     list.append(
-      el("div", { class: "muted", style: "padding:10px" }, `… and ${(plan.operations.length - MAX_OPS).toLocaleString()} more (showing first ${MAX_OPS})`)
+      el("div", { class: "muted", style: "padding:10px" }, `… and ${(total - shown.length).toLocaleString()} more (showing first ${shown.length.toLocaleString()})`)
     );
   }
 
@@ -197,17 +198,33 @@ function renderPlan(body, plan) {
 }
 
 // ---- Tabs + refresh ----
+let currentView = "plan";
+let statusLoaded = false;
+
 function switchView(view) {
+  currentView = view;
   for (const t of document.querySelectorAll(".tab")) {
     t.classList.toggle("active", t.dataset.view === view);
   }
   document.getElementById("status-view").classList.toggle("active", view === "status");
   document.getElementById("plan-view").classList.toggle("active", view === "plan");
+
+  // Status completeness can be expensive over a large catalogue, so it loads
+  // lazily — only the first time its tab is opened. The plan loads up front
+  // because it is the central view and only reads the saved plan file.
+  if (view === "status" && !statusLoaded) {
+    statusLoaded = true;
+    loadStatus();
+  }
 }
 
 function refresh() {
-  loadStatus();
-  loadPlan();
+  if (currentView === "status") {
+    statusLoaded = true;
+    loadStatus();
+  } else {
+    loadPlan();
+  }
 }
 
 window.addEventListener("DOMContentLoaded", () => {
@@ -215,5 +232,7 @@ window.addEventListener("DOMContentLoaded", () => {
     t.addEventListener("click", () => switchView(t.dataset.view));
   }
   document.getElementById("refresh").addEventListener("click", refresh);
-  refresh();
+  // Default to the plan (diff) view; it is fast and is the central view.
+  switchView("plan");
+  loadPlan();
 });
