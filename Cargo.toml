@@ -97,7 +97,13 @@ tempfile = "3"
 # Single-package workspace root: the skeleton's quality gates, profiles, and
 # release config live in workspace tables so this crate matches the rest of the
 # 198x family and can grow into a multi-crate workspace later.
+#
+# `ui/` is a standalone Tauri app that path-depends on this crate's library. It
+# is excluded so its heavyweight desktop/webview dependency tree, lints, and
+# bundle config stay out of the lean CLI crate — a thin, swappable adapter, per
+# decisions/agent-native-surface-and-ui.md.
 [workspace]
+exclude = ["ui"]
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
