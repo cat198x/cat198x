@@ -638,6 +638,7 @@ mod tests {
             case_sensitive: false,
             added_at: String::new(),
             last_scanned: None,
+            disposition: files::Disposition::Preserve,
         }
     }
 

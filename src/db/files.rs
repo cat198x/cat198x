@@ -3,6 +3,36 @@
 use anyhow::Result;
 use rusqlite::{Connection, params};
 
+/// Whether a source's content may leave it. See
+/// `decisions/source-disposition.md`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Disposition {
+    /// Staging: content may leave the tree and the source be freed (moved out).
+    Consume,
+    /// Content is never lost from the tree — reorganised within it, copied out,
+    /// but never removed. The library and reference masters are `preserve`.
+    Preserve,
+}
+
+impl Disposition {
+    /// The canonical lowercase string stored in the database.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Disposition::Consume => "consume",
+            Disposition::Preserve => "preserve",
+        }
+    }
+
+    /// Parse the stored string; unknown values fall back to the safe
+    /// `Preserve` (a malformed disposition must never authorise removal).
+    pub fn parse(s: &str) -> Disposition {
+        match s {
+            "consume" => Disposition::Consume,
+            _ => Disposition::Preserve,
+        }
+    }
+}
+
 /// A source directory
 #[derive(Debug, Clone)]
 pub struct Source {
@@ -11,6 +41,8 @@ pub struct Source {
     pub case_sensitive: bool,
     pub added_at: String,
     pub last_scanned: Option<String>,
+    /// Whether this source may be consumed (emptied) or its content preserved.
+    pub disposition: Disposition,
 }
 
 /// A content-addressed file
@@ -51,21 +83,27 @@ pub fn remove_source(conn: &Connection, path: &str) -> Result<bool> {
     Ok(deleted > 0)
 }
 
+/// Set a source's disposition by path. Returns whether a source matched.
+pub fn set_source_disposition(
+    conn: &Connection,
+    path: &str,
+    disposition: Disposition,
+) -> Result<bool> {
+    let updated = conn.execute(
+        "UPDATE sources SET disposition = ?1 WHERE path = ?2",
+        params![disposition.as_str(), path],
+    )?;
+    Ok(updated > 0)
+}
+
 /// Get a source by path
 pub fn get_source_by_path(conn: &Connection, path: &str) -> Result<Option<Source>> {
     let mut stmt = conn.prepare(
-        "SELECT id, path, case_sensitive, added_at, last_scanned FROM sources WHERE path = ?",
+        "SELECT id, path, case_sensitive, added_at, last_scanned, disposition \
+         FROM sources WHERE path = ?",
     )?;
 
-    let result = stmt.query_row([path], |row| {
-        Ok(Source {
-            id: row.get(0)?,
-            path: row.get(1)?,
-            case_sensitive: row.get(2)?,
-            added_at: row.get(3)?,
-            last_scanned: row.get(4)?,
-        })
-    });
+    let result = stmt.query_row([path], row_to_source);
 
     match result {
         Ok(s) => Ok(Some(s)),
@@ -77,22 +115,28 @@ pub fn get_source_by_path(conn: &Connection, path: &str) -> Result<Option<Source
 /// List all sources
 pub fn list_sources(conn: &Connection) -> Result<Vec<Source>> {
     let mut stmt = conn.prepare(
-        "SELECT id, path, case_sensitive, added_at, last_scanned FROM sources ORDER BY path",
+        "SELECT id, path, case_sensitive, added_at, last_scanned, disposition \
+         FROM sources ORDER BY path",
     )?;
 
     let sources = stmt
-        .query_map([], |row| {
-            Ok(Source {
-                id: row.get(0)?,
-                path: row.get(1)?,
-                case_sensitive: row.get(2)?,
-                added_at: row.get(3)?,
-                last_scanned: row.get(4)?,
-            })
-        })?
+        .query_map([], row_to_source)?
         .collect::<Result<Vec<_>, _>>()?;
 
     Ok(sources)
+}
+
+/// Build a `Source` from a row selecting
+/// `id, path, case_sensitive, added_at, last_scanned, disposition`.
+fn row_to_source(row: &rusqlite::Row) -> rusqlite::Result<Source> {
+    Ok(Source {
+        id: row.get(0)?,
+        path: row.get(1)?,
+        case_sensitive: row.get(2)?,
+        added_at: row.get(3)?,
+        last_scanned: row.get(4)?,
+        disposition: Disposition::parse(&row.get::<_, String>(5)?),
+    })
 }
 
 /// Update last scanned time for a source
@@ -375,7 +419,36 @@ mod tests {
             case_sensitive: false,
             added_at: String::new(),
             last_scanned: None,
+            disposition: Disposition::Preserve,
         }
+    }
+
+    #[test]
+    fn source_disposition_defaults_preserve_and_is_settable() {
+        let db = setup_db();
+        let conn = db.conn();
+        add_source(conn, "/ToSort/X", false).unwrap();
+
+        // A freshly added source defaults to the safe preserve.
+        let s = get_source_by_path(conn, "/ToSort/X").unwrap().unwrap();
+        assert_eq!(s.disposition, Disposition::Preserve);
+
+        // Settable to consume, and read back by both accessors.
+        assert!(set_source_disposition(conn, "/ToSort/X", Disposition::Consume).unwrap());
+        assert_eq!(
+            get_source_by_path(conn, "/ToSort/X")
+                .unwrap()
+                .unwrap()
+                .disposition,
+            Disposition::Consume
+        );
+        assert_eq!(
+            list_sources(conn).unwrap()[0].disposition,
+            Disposition::Consume
+        );
+
+        // No matching source → no update.
+        assert!(!set_source_disposition(conn, "/nope", Disposition::Consume).unwrap());
     }
 
     #[test]

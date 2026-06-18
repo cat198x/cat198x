@@ -144,6 +144,14 @@ pub enum SourceCommands {
     Add {
         /// Path to directory
         path: std::path::PathBuf,
+        /// Preserve this source — its content is never removed (reference
+        /// master). Overrides the role-based default.
+        #[arg(long, conflicts_with = "consume")]
+        preserve: bool,
+        /// Consume this source — staging that may be emptied as content is
+        /// placed. Overrides the role-based default.
+        #[arg(long)]
+        consume: bool,
     },
 
     /// Remove a source directory (does not delete files)
@@ -154,6 +162,14 @@ pub enum SourceCommands {
 
     /// List registered source directories
     List,
+
+    /// Set whether a source is consumed (emptied) or preserved
+    SetDisposition {
+        /// Path to a registered source directory
+        path: std::path::PathBuf,
+        /// `consume` (staging, may be emptied) or `preserve` (content kept)
+        disposition: String,
+    },
 }
 
 /// Configuration management commands
