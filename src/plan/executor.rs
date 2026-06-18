@@ -89,6 +89,70 @@ fn verify_written_sha1(path: &Path, expected: &str) -> Result<bool> {
     }
 }
 
+/// Move a file into the content-addressed quarantine store and record it.
+///
+/// The quarantine filename is `<full-sha1>_<original-name>` — the full hash (not
+/// a prefix) means two distinct files can never collide onto one path, and an
+/// existing target is refused rather than overwritten. The move is rename-first,
+/// copy+delete on a cross-device failure, and the catalogue entry is added on the
+/// caller's connection. Returns the quarantine path so the caller can journal the
+/// move and reverse it (restore to the original) on rollback.
+///
+/// This is the file-operation half of quarantining; resolving *where* the store
+/// lives (config vs default) stays with the caller, which passes `quarantine_dir`.
+pub fn execute_quarantine(
+    conn: &rusqlite::Connection,
+    file_path: &str,
+    sha1: &str,
+    size: i64,
+    reason: crate::db::quarantine::QuarantineReason,
+    collection_name: Option<&str>,
+    quarantine_dir: &Path,
+) -> Result<String> {
+    fs::create_dir_all(quarantine_dir).context("Failed to create quarantine directory")?;
+
+    let original_filename = Path::new(file_path)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("unknown");
+    let quarantine_filename = format!("{sha1}_{original_filename}");
+    let quarantine_path = quarantine_dir.join(&quarantine_filename);
+
+    // Never overwrite an existing quarantine file — a collision under the full
+    // SHA1 means identical content under the same name, so refuse rather than
+    // clobber whatever is already there.
+    if quarantine_path.exists() {
+        anyhow::bail!(
+            "Quarantine target already exists, refusing to overwrite: {}",
+            quarantine_path.display()
+        );
+    }
+
+    let source = Path::new(file_path);
+    if source.exists() {
+        fs::rename(source, &quarantine_path).or_else(|_| {
+            // Cross-device rename fails; fall back to copy + delete.
+            fs::copy(source, &quarantine_path)?;
+            fs::remove_file(source)?;
+            Ok::<_, anyhow::Error>(())
+        })?;
+    } else {
+        anyhow::bail!("File not found: {}", file_path);
+    }
+
+    crate::db::quarantine::add_entry(
+        conn,
+        sha1,
+        file_path,
+        &quarantine_filename,
+        size,
+        reason,
+        collection_name,
+    )?;
+
+    Ok(quarantine_path.to_string_lossy().into_owned())
+}
+
 /// Execute a rollback move operation
 pub fn execute_rollback_move(source: &str, dest: &str, expected_sha1: &str) -> Result<()> {
     let source_path = Path::new(source);

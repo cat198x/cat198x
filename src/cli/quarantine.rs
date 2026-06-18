@@ -3,7 +3,7 @@
 //! The quarantine is a holding area for files that are no longer needed
 //! at their current location but shouldn't be immediately deleted.
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use std::fs;
 use std::io::{self, Write};
 use std::path::PathBuf;
@@ -369,61 +369,19 @@ pub fn move_to_quarantine(
     collection_name: Option<&str>,
     data_dir: Option<PathBuf>,
 ) -> Result<String> {
+    // Resolve the store location here (config vs default) and open the
+    // connection; the file move + catalogue entry are the library primitive.
     let quarantine_dir = super::config::resolve_quarantine_dir(data_dir.clone())?;
-
-    // Create quarantine directory if it doesn't exist
-    fs::create_dir_all(&quarantine_dir).context("Failed to create quarantine directory")?;
-
-    // Quarantine filename: <full-sha1>_originalname. The full SHA1 (not an
-    // 8-char prefix) means two distinct files can never collide onto the same
-    // path — an 8-char prefix could, losing a ROM, and slicing it also panicked
-    // on a short or empty hash.
-    let original_filename = std::path::Path::new(file_path)
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("unknown");
-
-    let quarantine_filename = format!("{}_{}", sha1, original_filename);
-    let quarantine_path = quarantine_dir.join(&quarantine_filename);
-
-    // Never overwrite an existing quarantine file — that would destroy whatever
-    // is already there. A collision under the full SHA1 means identical content
-    // under the same name, so refuse rather than clobber.
-    if quarantine_path.exists() {
-        anyhow::bail!(
-            "Quarantine target already exists, refusing to overwrite: {}",
-            quarantine_path.display()
-        );
-    }
-
-    // Move the file
-    let source = std::path::Path::new(file_path);
-    if source.exists() {
-        fs::rename(source, &quarantine_path).or_else(|_| {
-            // If rename fails (cross-device), copy + delete
-            fs::copy(source, &quarantine_path)?;
-            fs::remove_file(source)?;
-            Ok::<_, anyhow::Error>(())
-        })?;
-    } else {
-        anyhow::bail!("File not found: {}", file_path);
-    }
-
-    // Record in database
     let db = open_database(data_dir)?;
-    db_quarantine::add_entry(
+    crate::plan::executor::execute_quarantine(
         db.conn(),
-        sha1,
         file_path,
-        &quarantine_filename,
+        sha1,
         size,
         reason,
         collection_name,
-    )?;
-
-    // Return the quarantine file path so the caller can journal the move and
-    // reverse it (restore to the original path) on rollback.
-    Ok(quarantine_path.to_string_lossy().into_owned())
+        &quarantine_dir,
+    )
 }
 
 /// Format bytes as human-readable string
