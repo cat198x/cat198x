@@ -2,6 +2,7 @@
 
 pub mod apply;
 pub mod catalogue;
+pub mod clean_superseded;
 pub mod config;
 pub mod dat;
 pub mod doctor;
