@@ -17,7 +17,7 @@ use std::path::Path;
 
 use cat198x::db::Database;
 use cat198x::db::dats::MergeMode;
-use cat198x::ops::{self, CollectionInfo, CollectionStatus, PendingWork};
+use cat198x::ops::{self, ApplyReport, CollectionInfo, CollectionStatus, PendingWork};
 use cat198x::plan::{Operation, PlanSummary};
 
 /// How many of a plan's operations the UI receives. A real plan can hold tens of
@@ -114,6 +114,20 @@ async fn pending_work() -> Result<Option<PendingWork>, String> {
     .map_err(|e| e.to_string())
 }
 
+/// A dry-run apply of the latest plan: readiness (stale, disk) plus the work it
+/// would do, tallied from the apply engine's progress events. Mutates nothing.
+#[tauri::command]
+async fn apply_preview() -> Result<Option<ApplyReport>, String> {
+    tauri::async_runtime::spawn_blocking(|| -> anyhow::Result<_> {
+        let dir = data_dir()?;
+        let db = Database::open(&dir.join("db.sqlite"))?;
+        ops::apply(db.conn(), &dir, true)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+    .map_err(|e| e.to_string())
+}
+
 /// The most recent saved plan — the reorganisation as a diff — or `null`.
 #[tauri::command]
 async fn plan_diff() -> Result<Option<PlanView>, String> {
@@ -143,6 +157,7 @@ fn main() {
             collections,
             status_one,
             pending_work,
+            apply_preview,
             plan_diff
         ])
         .run(tauri::generate_context!())

@@ -441,6 +441,68 @@ function renderPlan(body, plan) {
   body.replaceChildren(summary, meta, list);
 }
 
+// ---- Apply preview (dry run) ----
+async function loadPreview() {
+  const body = document.getElementById("preview-body");
+  body.className = "loading";
+  body.textContent = "Running dry-run preview…";
+  try {
+    renderPreview(body, await invoke("apply_preview"));
+  } catch (e) {
+    showError(body, e);
+  }
+}
+
+function renderPreview(body, r) {
+  body.className = "";
+  if (!r) {
+    body.replaceChildren(
+      el("div", { class: "empty" }, "No plan saved yet. Generate one with: cat198x plan")
+    );
+    return;
+  }
+  const parts = [];
+  if (r.stale) {
+    parts.push(
+      el(
+        "div",
+        { class: "stale-banner" },
+        "⚠ The plan predates the current catalogue — regenerate with `cat198x plan` before applying."
+      )
+    );
+  }
+  parts.push(
+    r.disk_ok
+      ? el("div", { class: "disk-ok" }, "✓ Fits on the destination volume.")
+      : el(
+          "div",
+          { class: "error" },
+          "Insufficient disk space — " + (r.disk_detail || "the destination volume is too full.")
+        )
+  );
+
+  // Op tally, from the apply engine's own progress events.
+  const order = ["COPY", "MOVE", "RELOCATE", "REPACK", "DELETE", "QUARANTINE"];
+  const summary = el("div", { class: "summary" });
+  for (const k of order) {
+    const n = r.by_kind[k];
+    if (n) summary.append(chip(n, k.toLowerCase()));
+  }
+  if (!summary.children.length) {
+    summary.append(el("div", { class: "muted" }, "Nothing to do — the library is already in place."));
+  }
+  parts.push(summary);
+
+  parts.push(
+    el(
+      "div",
+      { class: "muted", style: "margin-top:6px" },
+      `${r.total_ops.toLocaleString()} operation(s), ${r.pending.toLocaleString()} pending · dry run — nothing was changed`
+    )
+  );
+  body.replaceChildren(...parts);
+}
+
 // ---- Tabs + refresh ----
 let currentView = "plan";
 let statusLoaded = false;
@@ -452,13 +514,17 @@ function switchView(view) {
   }
   document.getElementById("status-view").classList.toggle("active", view === "status");
   document.getElementById("plan-view").classList.toggle("active", view === "plan");
+  document.getElementById("preview-view").classList.toggle("active", view === "preview");
 
   // Status completeness can be expensive over a large catalogue, so it loads
   // lazily — only the first time its tab is opened. The plan loads up front
-  // because it is the central view and only reads the saved plan file.
+  // because it is the central view and only reads the saved plan file. The
+  // preview runs a dry-run apply, so it too loads on first open.
   if (view === "status" && !statusLoaded) {
     statusLoaded = true;
     loadStatus();
+  } else if (view === "preview") {
+    loadPreview();
   }
 }
 
@@ -466,6 +532,8 @@ function refresh() {
   if (currentView === "status") {
     statusLoaded = true;
     loadStatus();
+  } else if (currentView === "preview") {
+    loadPreview();
   } else {
     loadPlan();
   }

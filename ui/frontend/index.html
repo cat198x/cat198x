@@ -12,6 +12,7 @@
       <div class="tabs">
         <button class="tab" data-view="status">Status</button>
         <button class="tab active" data-view="plan">Plan</button>
+        <button class="tab" data-view="preview">Preview apply</button>
       </div>
       <button id="refresh" title="Reload from the catalogue">↻ Refresh</button>
     </header>
@@ -23,6 +24,10 @@
 
       <section id="plan-view" class="view active">
         <div id="plan-body" class="loading">Loading plan…</div>
+      </section>
+
+      <section id="preview-view" class="view">
+        <div id="preview-body" class="loading">Open this tab to dry-run the latest plan…</div>
       </section>
     </main>
 
