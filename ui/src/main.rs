@@ -5,8 +5,11 @@
 //! formats and the `cat198x mcp` server exposes. See
 //! `decisions/agent-native-surface-and-ui.md` — one surface, three adapters.
 //!
-//! This first slice is read-only: collection completeness (`status`) and the
-//! saved plan-as-diff (`plan_diff`). Mutating actions (apply, reclaim,
+//! This first slice is read-only: collection completeness and the saved
+//! plan-as-diff. Completeness is fetched per collection (`collections` lists the
+//! names instantly; `status_one` computes one collection's numbers), so the UI
+//! shows the list immediately and fills each row's stats concurrently rather
+//! than blocking on the whole catalogue. Mutating actions (apply, reclaim,
 //! clean-superseded) land once the operation surface grows progress events.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
@@ -14,7 +17,7 @@ use std::path::Path;
 
 use cat198x::db::Database;
 use cat198x::db::dats::MergeMode;
-use cat198x::ops::{self, CollectionStatus};
+use cat198x::ops::{self, CollectionInfo, CollectionStatus};
 use cat198x::plan::{Operation, PlanSummary};
 
 /// How many of a plan's operations the UI receives. A real plan can hold tens of
@@ -32,11 +35,16 @@ fn parse_merge_mode(s: Option<&str>) -> MergeMode {
     }
 }
 
-/// Collection completeness under `data_dir`, factored out of the Tauri command
-/// so it can be tested against a temporary catalogue.
-fn compute_status(data_dir: &Path, mode: MergeMode) -> anyhow::Result<Vec<CollectionStatus>> {
+/// Collection completeness under `data_dir`, optionally for a single collection.
+/// Factored out of the Tauri commands so it can be tested against a temporary
+/// catalogue.
+fn compute_status(
+    data_dir: &Path,
+    collection: Option<&str>,
+    mode: MergeMode,
+) -> anyhow::Result<Vec<CollectionStatus>> {
     let db = Database::open(&data_dir.join("db.sqlite"))?;
-    ops::collection_status(db.conn(), None, mode)
+    ops::collection_status(db.conn(), collection, mode)
 }
 
 /// The catalogue's default data directory (`~/.cat198x`), shared with the CLI.
@@ -55,15 +63,34 @@ struct PlanView {
     operations: Vec<Operation>,
 }
 
-/// Collection completeness against the active DATs.
+/// Every registered collection (name + whether it has an active version). Cheap
+/// — the UI renders the list immediately, then fills each row's stats with
+/// `status_one`, so it never blocks on the whole catalogue.
+#[tauri::command]
+async fn collections() -> Result<Vec<CollectionInfo>, String> {
+    tauri::async_runtime::spawn_blocking(|| -> anyhow::Result<_> {
+        let db = Database::open(&data_dir()?.join("db.sqlite"))?;
+        ops::list_collections(db.conn())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+    .map_err(|e| e.to_string())
+}
+
+/// Completeness for a single collection by name. The UI calls this per row,
+/// concurrently, so the heavy collections (e.g. MAME) fill in without holding up
+/// the rest. Returns `null` if the collection isn't found.
 ///
 /// `async` so Tauri runs it off the main thread; the blocking database work is
-/// then handed to `spawn_blocking`, so a slow catalogue can never freeze the UI.
+/// handed to `spawn_blocking`, so a slow collection can never freeze the UI.
 #[tauri::command]
-async fn status(merge_mode: Option<String>) -> Result<Vec<CollectionStatus>, String> {
+async fn status_one(
+    name: String,
+    merge_mode: Option<String>,
+) -> Result<Option<CollectionStatus>, String> {
     tauri::async_runtime::spawn_blocking(move || -> anyhow::Result<_> {
         let mode = parse_merge_mode(merge_mode.as_deref());
-        compute_status(&data_dir()?, mode)
+        Ok(compute_status(&data_dir()?, Some(&name), mode)?.into_iter().next())
     })
     .await
     .map_err(|e| e.to_string())?
@@ -95,7 +122,7 @@ async fn plan_diff() -> Result<Option<PlanView>, String> {
 
 fn main() {
     tauri::Builder::default()
-        .invoke_handler(tauri::generate_handler![status, plan_diff])
+        .invoke_handler(tauri::generate_handler![collections, status_one, plan_diff])
         .run(tauri::generate_context!())
         .expect("error while running the Cat198x UI");
 }
@@ -129,10 +156,23 @@ mod tests {
                 .unwrap();
         }
 
-        let statuses = compute_status(tmp.path(), MergeMode::NonMerged).unwrap();
-        assert_eq!(statuses.len(), 1);
-        assert_eq!(statuses[0].name, "NES");
-        assert_eq!(statuses[0].have_roms, 1);
-        assert_eq!(statuses[0].missing_roms, 1);
+        // All collections, and the per-collection path the UI uses, agree.
+        let all = compute_status(tmp.path(), None, MergeMode::NonMerged).unwrap();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].name, "NES");
+        assert_eq!(all[0].have_roms, 1);
+        assert_eq!(all[0].missing_roms, 1);
+
+        let one = compute_status(tmp.path(), Some("NES"), MergeMode::NonMerged).unwrap();
+        assert_eq!(one.len(), 1);
+        assert_eq!(one[0].name, "NES");
+        assert_eq!(one[0].have_roms, 1);
+
+        // An unknown collection yields nothing (the command maps this to null).
+        assert!(
+            compute_status(tmp.path(), Some("nope"), MergeMode::NonMerged)
+                .unwrap()
+                .is_empty()
+        );
     }
 }

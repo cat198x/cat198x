@@ -40,24 +40,42 @@ function showError(container, e) {
 }
 
 // ---- Status view ----
+// Concurrency for the per-collection stat fill — enough to overlap the slow
+// collections (e.g. MAME) with the fast ones, without flooding the backend.
+const STATUS_POOL = 8;
+
+// Run `worker` over `items` with at most `size` in flight at once.
+async function runPool(items, size, worker) {
+  let i = 0;
+  const next = async () => {
+    while (i < items.length) {
+      const idx = i++;
+      await worker(items[idx], idx);
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(size, items.length) }, next));
+}
+
 async function loadStatus() {
   const body = document.getElementById("status-body");
   body.className = "loading";
-  body.textContent = "Loading collection status…";
+  body.textContent = "Loading collections…";
+  let cols;
   try {
-    const rows = await invoke("status", {});
-    renderStatus(body, rows);
+    cols = await invoke("collections");
   } catch (e) {
     showError(body, e);
+    return;
   }
-}
-
-function renderStatus(body, rows) {
-  body.className = "";
-  if (!rows || rows.length === 0) {
+  if (!cols || cols.length === 0) {
+    body.className = "";
     body.replaceChildren(el("div", { class: "empty" }, "No collections imported yet."));
     return;
   }
+
+  // Render the list immediately: a row per collection with placeholder cells.
+  // The numbers fill in as each per-collection query resolves, so a slow
+  // collection holds up only its own row, never the list.
   const head = el(
     "tr",
     {},
@@ -69,43 +87,64 @@ function renderStatus(body, rows) {
     el("th", {}, "Complete")
   );
   const tbody = el("tbody");
-  for (const r of rows) {
-    if (!r.version) {
-      tbody.append(
-        el(
-          "tr",
-          {},
-          el("td", {}, r.name),
-          el("td", { class: "muted", colSpan: "5" }, "no active version")
-        )
-      );
-      continue;
-    }
-    const pct = (r.completion_pct || 0).toFixed(1);
-    const complete = r.missing_roms === 0 && r.total_roms > 0;
-    const bar = el(
-      "div",
-      { class: complete ? "bar complete" : "bar", style: `--pct:${Math.min(100, r.completion_pct || 0)}%` },
-      el("span", {})
-    );
-    const extras = [];
-    if (r.bios_sets) extras.push(`${r.bios_sets} BIOS`);
-    if (r.device_sets) extras.push(`${r.device_sets} device`);
-    if (r.nodump_roms) extras.push(`${r.nodump_roms} nodump`);
+  const rowFor = new Map();
+  for (const c of cols) {
+    const cells = {
+      version: el("td", { class: "muted" }, c.has_active_version ? "…" : "no active version"),
+      games: el("td", { class: "num muted" }, c.has_active_version ? "…" : ""),
+      have: el("td", { class: "num muted" }, ""),
+      missing: el("td", { class: "num muted" }, ""),
+      complete: el("td", { class: "muted" }, ""),
+    };
+    rowFor.set(c.name, cells);
     tbody.append(
-      el(
-        "tr",
-        {},
-        el("td", {}, r.name, ...extras.map((x) => el("span", { class: "pill" }, x))),
-        el("td", { class: "muted" }, `v${r.version}`),
-        el("td", { class: "num" }, r.total_games.toLocaleString()),
-        el("td", { class: "num" }, r.have_roms.toLocaleString()),
-        el("td", { class: "num" }, r.missing_roms.toLocaleString()),
-        el("td", {}, el("div", { style: "display:flex;align-items:center;gap:8px" }, bar, `${pct}%`))
-      )
+      el("tr", {}, el("td", {}, c.name), cells.version, cells.games, cells.have, cells.missing, cells.complete)
     );
   }
+  body.className = "";
   body.replaceChildren(el("table", {}, el("thead", {}, head), tbody));
+
+  // Fill stats for collections with an active version, concurrently.
+  const active = cols.filter((c) => c.has_active_version);
+  await runPool(active, STATUS_POOL, async (c) => {
+    const cells = rowFor.get(c.name);
+    try {
+      const s = await invoke("status_one", { name: c.name });
+      if (!s || !s.version) {
+        cells.version.textContent = "no active version";
+        cells.games.textContent = "";
+        return;
+      }
+      fillStatusRow(cells, s);
+    } catch (e) {
+      cells.version.textContent = "error";
+      cells.version.title = String(e);
+    }
+  });
+}
+
+// Fill one collection's row from its computed status.
+function fillStatusRow(cells, s) {
+  cells.version.className = "muted";
+  cells.version.textContent = `v${s.version}`;
+  cells.games.className = "num";
+  cells.games.textContent = s.total_games.toLocaleString();
+  cells.have.className = "num";
+  cells.have.textContent = s.have_roms.toLocaleString();
+  cells.missing.className = "num";
+  cells.missing.textContent = s.missing_roms.toLocaleString();
+
+  const pct = (s.completion_pct || 0).toFixed(1);
+  const complete = s.missing_roms === 0 && s.total_roms > 0;
+  const bar = el(
+    "div",
+    { class: complete ? "bar complete" : "bar", style: `--pct:${Math.min(100, s.completion_pct || 0)}%` },
+    el("span", {})
+  );
+  cells.complete.className = "";
+  cells.complete.replaceChildren(
+    el("div", { style: "display:flex;align-items:center;gap:8px" }, bar, `${pct}%`)
+  );
 }
 
 // ---- Plan (diff) view ----
