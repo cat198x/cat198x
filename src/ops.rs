@@ -252,8 +252,31 @@ pub fn pending_work(conn: &Connection, data_dir: &Path) -> Result<Option<Pending
     }))
 }
 
+/// How to run an apply through the ops surface: the dry-run switch plus the one
+/// gate override a real apply needs. The staleness gate has no override (a stale
+/// plan must be regenerated, never forced).
+#[derive(Debug, Clone, Copy)]
+pub struct ApplyRunOptions {
+    /// Report what would happen without touching any file.
+    pub dry_run: bool,
+    /// Apply even when the destination volume looks too small. Ignored on a dry
+    /// run, which never mutates and so never blocks on a gate.
+    pub skip_space_check: bool,
+}
+
+impl ApplyRunOptions {
+    /// The dry-run preview: mutates nothing and never blocks on a gate (it only
+    /// *reports* staleness and disk readiness for the adapter to show).
+    pub fn preview() -> Self {
+        Self {
+            dry_run: true,
+            skip_space_check: false,
+        }
+    }
+}
+
 /// Readiness to apply the latest plan, plus the work it would do — what the UI's
-/// dry-run preview shows.
+/// dry-run preview shows, and what a real apply returns once it has run.
 #[derive(Debug, Clone, Serialize)]
 pub struct ApplyReport {
     /// The plan predates the current catalogue, so it should be regenerated.
@@ -267,21 +290,33 @@ pub struct ApplyReport {
     /// Operation count by kind (copy/move/relocate/repack/delete/quarantine),
     /// tallied from the apply engine's own progress events.
     pub by_kind: BTreeMap<String, usize>,
-    /// Whether this was a dry run (the only mode wired today).
+    /// Whether this was a dry run.
     pub dry_run: bool,
+    /// When a real apply was refused by a gate (a stale plan, or insufficient
+    /// disk without an override), the human-readable reason — and nothing was
+    /// touched. `None` when the apply ran, and always `None` for a dry run
+    /// (which only reports the gate flags above, never blocks on them).
+    pub refused: Option<String>,
     pub succeeded: usize,
     pub failed: usize,
 }
 
-/// Drive the apply engine over the latest plan and report what it would do.
+/// Drive the apply engine over the latest plan and report what it did (or, on a
+/// dry run, would do).
 ///
-/// Today only `dry_run` is exposed (the UI's preview): it performs nothing,
-/// reports the apply-time gates (staleness, disk space) the static plan view
-/// can't show, and tallies the operations from the engine's [`ApplyEvent`]
-/// stream — the same stream a live apply will drive a progress bar from. Returns
-/// `None` when no plan has been generated.
-pub fn apply(conn: &Connection, data_dir: &Path, dry_run: bool) -> Result<Option<ApplyReport>> {
-    apply_streaming(conn, data_dir, dry_run, &mut |_| {})
+/// A dry run (`ApplyRunOptions::preview`) performs nothing, reports the
+/// apply-time gates (staleness, disk space) the static plan view can't show, and
+/// tallies the operations from the engine's [`ApplyEvent`] stream. A real apply
+/// (`dry_run: false`) enforces those gates — refusing to mutate a stale or
+/// won't-fit plan (see [`ApplyReport::refused`]) — and otherwise carries the plan
+/// out. Returns `None` when no plan has been generated. For a live progress bar,
+/// use [`apply_streaming`].
+pub fn apply(
+    conn: &Connection,
+    data_dir: &Path,
+    opts: ApplyRunOptions,
+) -> Result<Option<ApplyReport>> {
+    apply_streaming(conn, data_dir, opts, &mut |_| {})
 }
 
 /// One operation's worth of progress, reported as a plan is applied.
@@ -302,7 +337,7 @@ pub struct ApplyProgress {
 pub fn apply_streaming(
     conn: &Connection,
     data_dir: &Path,
-    dry_run: bool,
+    opts: ApplyRunOptions,
     on_progress: &mut dyn FnMut(ApplyProgress),
 ) -> Result<Option<ApplyReport>> {
     let Some(plan_path) = newest_plan_file(data_dir)? else {
@@ -323,6 +358,54 @@ pub fn apply_streaming(
         .filter(|op| op.status == crate::plan::OperationStatus::Pending)
         .count();
 
+    // A real apply enforces the gates the dry-run preview only reports: it refuses
+    // to mutate when the plan is stale or won't fit, returning a refusal the
+    // adapter surfaces without touching a single file. (A dry run never blocks —
+    // it reports the same flags so the UI can show them, then runs the engine in
+    // its no-op mode to tally the work.)
+    if !opts.dry_run {
+        // A *started* plan is mid-flight: its own completed operations moved the
+        // catalogue (and so the state hash) by design, so that drift is expected
+        // and it resumes. The staleness gate only rejects a fresh plan — one whose
+        // every operation is still pending — that the catalogue moved underneath.
+        // This mirrors the `apply` CLI exactly.
+        let plan_started = plan
+            .operations
+            .iter()
+            .any(|op| op.status != crate::plan::OperationStatus::Pending);
+        if stale && !plan_started {
+            return Ok(Some(refused_report(
+                "Plan is stale: the catalogue changed since it was generated. \
+                 Run `cat198x plan` to regenerate it."
+                    .to_string(),
+                stale,
+                disk_ok,
+                disk_detail,
+                total_ops,
+                pending,
+            )));
+        }
+        if !disk_ok && !opts.skip_space_check {
+            let reason = match &disk_detail {
+                Some(detail) => format!("Not enough disk space: {detail}"),
+                None => "Not enough disk space for the plan's transfers.".to_string(),
+            };
+            return Ok(Some(refused_report(
+                reason,
+                stale,
+                disk_ok,
+                disk_detail,
+                total_ops,
+                pending,
+            )));
+        }
+    }
+
+    // Resolve the real quarantine store (configured path, or <data_dir>/quarantine).
+    // On a dry run quarantine never executes, but resolving it costs nothing and
+    // keeps the dry-run and real paths identical.
+    let quarantine_dir = crate::config::resolve_quarantine_dir(data_dir)?;
+
     let sources = files::list_sources(conn)?;
     let mut by_kind: BTreeMap<String, usize> = BTreeMap::new();
     let mut done = 0usize;
@@ -332,12 +415,10 @@ pub fn apply_streaming(
         &plan_path,
         &sources,
         &ApplyOptions {
-            dry_run,
+            dry_run: opts.dry_run,
             skip_repack: false,
             jobs: 1,
-            // Unused on a dry run (quarantine never executes); a real apply
-            // would resolve the configured store. Kept simple here.
-            quarantine_dir: data_dir.join("quarantine"),
+            quarantine_dir,
         },
         &mut |event| {
             if let ApplyEvent::OpStarted { op, .. } = event {
@@ -359,10 +440,36 @@ pub fn apply_streaming(
         total_ops,
         pending,
         by_kind,
-        dry_run,
+        dry_run: opts.dry_run,
+        refused: None,
         succeeded: outcome.success_count,
         failed: outcome.error_count,
     }))
+}
+
+/// Build the report for a real apply a gate refused: nothing ran, so the work
+/// tallies are zero, but the gate flags and plan size are carried through so the
+/// adapter can explain the refusal.
+fn refused_report(
+    reason: String,
+    stale: bool,
+    disk_ok: bool,
+    disk_detail: Option<String>,
+    total_ops: usize,
+    pending: usize,
+) -> ApplyReport {
+    ApplyReport {
+        stale,
+        disk_ok,
+        disk_detail,
+        total_ops,
+        pending,
+        by_kind: BTreeMap::new(),
+        dry_run: false,
+        refused: Some(reason),
+        succeeded: 0,
+        failed: 0,
+    }
 }
 
 #[cfg(test)]
@@ -539,8 +646,11 @@ mod tests {
         plan.add_delete("/staging/b.rom".into());
         std::fs::write(plans.join("p.json"), serde_json::to_string(&plan).unwrap()).unwrap();
 
-        let report = apply(conn, tmp.path(), true).unwrap().expect("a plan");
+        let report = apply(conn, tmp.path(), ApplyRunOptions::preview())
+            .unwrap()
+            .expect("a plan");
         assert!(report.dry_run);
+        assert!(report.refused.is_none(), "a dry run never refuses");
         assert!(!report.stale, "plan hash matches the (empty) catalogue");
         assert_eq!(report.total_ops, 2);
         assert_eq!(report.pending, 2);
@@ -555,7 +665,120 @@ mod tests {
     fn apply_is_none_without_a_plan() {
         let db = Database::open_in_memory().unwrap();
         let tmp = tempfile::tempdir().unwrap();
-        assert!(apply(db.conn(), tmp.path(), true).unwrap().is_none());
+        assert!(
+            apply(db.conn(), tmp.path(), ApplyRunOptions::preview())
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn real_apply_moves_the_file_and_writes_a_journal() {
+        let db = Database::open_in_memory().unwrap();
+        let conn = db.conn();
+        let tmp = tempfile::tempdir().unwrap();
+        let plans = tmp.path().join("objects/plans");
+        std::fs::create_dir_all(&plans).unwrap();
+
+        // A real source file whose content hashes to the plan's recorded sha1
+        // (sha1("hello")), so verify-before-delete passes on the move.
+        let src = tmp.path().join("staging/a.rom");
+        std::fs::create_dir_all(src.parent().unwrap()).unwrap();
+        std::fs::write(&src, b"hello").unwrap();
+        let dest = tmp.path().join("lib/a.rom");
+
+        let mut plan = crate::plan::Plan::new(compute_state_hash(conn).unwrap());
+        plan.add_move(
+            crate::plan::SourceRef {
+                path: src.to_string_lossy().into_owned(),
+                archive_path: None,
+                sha1: "aaf4c61ddcc5e8a2dabede0f3b482cd9aea9434d".into(),
+                entry_name: None,
+            },
+            dest.to_string_lossy().into_owned(),
+            5,
+        );
+        std::fs::write(plans.join("p.json"), serde_json::to_string(&plan).unwrap()).unwrap();
+
+        let report = apply(
+            conn,
+            tmp.path(),
+            ApplyRunOptions {
+                dry_run: false,
+                skip_space_check: false,
+            },
+        )
+        .unwrap()
+        .expect("a plan");
+
+        assert!(
+            report.refused.is_none(),
+            "a fresh in-fit plan is not refused"
+        );
+        assert_eq!(report.succeeded, 1);
+        assert_eq!(report.failed, 0);
+        assert_eq!(std::fs::read(&dest).unwrap(), b"hello", "moved into place");
+        assert!(!src.exists(), "a move frees the source");
+        // The rollback journal lands under objects/logs alongside objects/plans.
+        let logs = tmp.path().join("objects/logs");
+        let journal_written = logs.is_dir()
+            && std::fs::read_dir(&logs)
+                .unwrap()
+                .any(|e| e.unwrap().path().extension().is_some_and(|x| x == "json"));
+        assert!(journal_written, "a real apply writes a rollback journal");
+    }
+
+    #[test]
+    fn real_apply_refuses_a_stale_plan_without_touching_anything() {
+        let db = Database::open_in_memory().unwrap();
+        let conn = db.conn();
+        let tmp = tempfile::tempdir().unwrap();
+        let plans = tmp.path().join("objects/plans");
+        std::fs::create_dir_all(&plans).unwrap();
+
+        let src = tmp.path().join("staging/a.rom");
+        std::fs::create_dir_all(src.parent().unwrap()).unwrap();
+        std::fs::write(&src, b"hello").unwrap();
+        let dest = tmp.path().join("lib/a.rom");
+
+        // A plan whose state hash does NOT match the current catalogue, with every
+        // operation still pending → stale and not started → must be refused.
+        let mut plan = crate::plan::Plan::new("stale-hash-that-will-not-match".into());
+        plan.add_move(
+            crate::plan::SourceRef {
+                path: src.to_string_lossy().into_owned(),
+                archive_path: None,
+                sha1: "aaf4c61ddcc5e8a2dabede0f3b482cd9aea9434d".into(),
+                entry_name: None,
+            },
+            dest.to_string_lossy().into_owned(),
+            5,
+        );
+        std::fs::write(plans.join("p.json"), serde_json::to_string(&plan).unwrap()).unwrap();
+
+        let report = apply(
+            conn,
+            tmp.path(),
+            ApplyRunOptions {
+                dry_run: false,
+                skip_space_check: false,
+            },
+        )
+        .unwrap()
+        .expect("a plan");
+
+        assert!(report.stale, "the plan hash does not match the catalogue");
+        assert!(report.refused.is_some(), "a stale fresh plan is refused");
+        assert_eq!(report.succeeded, 0);
+        assert_eq!(report.failed, 0);
+        // Nothing moved: the source is untouched, the destination never created,
+        // and no rollback journal was written.
+        assert!(src.exists(), "the source is untouched");
+        assert!(!dest.exists(), "the destination is never created");
+        assert!(
+            !tmp.path().join("objects/logs").exists(),
+            "no journal — nothing ran"
+        );
     }
 
     #[test]
@@ -581,9 +804,11 @@ mod tests {
         std::fs::write(plans.join("p.json"), serde_json::to_string(&plan).unwrap()).unwrap();
 
         let mut progress = Vec::new();
-        apply_streaming(conn, tmp.path(), true, &mut |p| progress.push(p))
-            .unwrap()
-            .expect("a plan");
+        apply_streaming(conn, tmp.path(), ApplyRunOptions::preview(), &mut |p| {
+            progress.push(p)
+        })
+        .unwrap()
+        .expect("a plan");
 
         // One progress callback per operation, monotonic, total carried through.
         assert_eq!(progress.len(), 2);

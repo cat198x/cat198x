@@ -1,7 +1,7 @@
 //! Configuration types
 
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Main configuration for Cat198x
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -76,11 +76,61 @@ impl Config {
     }
 }
 
+/// Resolve the quarantine store for a library at `data_dir`: the `quarantine_dir`
+/// configured in `<data_dir>/config.toml`, or `<data_dir>/quarantine` when it is
+/// unset or no config file exists.
+///
+/// This is the library-level resolver, so the apply engine can find the real
+/// store without reaching into the CLI layer. The CLI's `resolve_quarantine_dir`
+/// delegates here, so both agree on the location every quarantine operation uses.
+pub fn resolve_quarantine_dir(data_dir: &Path) -> anyhow::Result<PathBuf> {
+    let config_path = data_dir.join("config.toml");
+    let configured = if config_path.exists() {
+        Config::load(&config_path)?.quarantine_dir
+    } else {
+        None
+    };
+    Ok(configured
+        .map(PathBuf::from)
+        .unwrap_or_else(|| data_dir.join("quarantine")))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::io::Write;
     use tempfile::NamedTempFile;
+
+    #[test]
+    fn resolve_quarantine_dir_defaults_when_no_config_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        // No config.toml at all → falls back to <data_dir>/quarantine.
+        let dir = resolve_quarantine_dir(tmp.path()).unwrap();
+        assert_eq!(dir, tmp.path().join("quarantine"));
+    }
+
+    #[test]
+    fn resolve_quarantine_dir_defaults_when_unset_in_config() {
+        let tmp = tempfile::tempdir().unwrap();
+        // A config file with no quarantine_dir set → still the default store.
+        Config::default()
+            .save(&tmp.path().join("config.toml"))
+            .unwrap();
+        let dir = resolve_quarantine_dir(tmp.path()).unwrap();
+        assert_eq!(dir, tmp.path().join("quarantine"));
+    }
+
+    #[test]
+    fn resolve_quarantine_dir_uses_configured_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = Config {
+            quarantine_dir: Some("/Volumes/Data/Library/Quarantine".to_string()),
+            ..Config::default()
+        };
+        config.save(&tmp.path().join("config.toml")).unwrap();
+        let dir = resolve_quarantine_dir(tmp.path()).unwrap();
+        assert_eq!(dir, PathBuf::from("/Volumes/Data/Library/Quarantine"));
+    }
 
     #[test]
     fn test_config_default() {

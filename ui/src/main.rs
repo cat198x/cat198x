@@ -122,7 +122,7 @@ async fn apply_preview() -> Result<Option<ApplyReport>, String> {
     tauri::async_runtime::spawn_blocking(|| -> anyhow::Result<_> {
         let dir = data_dir()?;
         let db = Database::open(&dir.join("db.sqlite"))?;
-        ops::apply(db.conn(), &dir, true)
+        ops::apply(db.conn(), &dir, ops::ApplyRunOptions::preview())
     })
     .await
     .map_err(|e| e.to_string())?
@@ -140,7 +140,7 @@ async fn apply_stream(app: tauri::AppHandle) -> Result<Option<ApplyReport>, Stri
         let dir = data_dir()?;
         let db = Database::open(&dir.join("db.sqlite"))?;
         let mut last_emit = 0usize;
-        ops::apply_streaming(db.conn(), &dir, true, &mut |p| {
+        ops::apply_streaming(db.conn(), &dir, ops::ApplyRunOptions::preview(), &mut |p| {
             let step = (p.total / 100).max(1);
             if p.done == p.total || p.done - last_emit >= step {
                 last_emit = p.done;
