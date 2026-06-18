@@ -173,6 +173,79 @@ tr:hover td {
   color: var(--muted);
 }
 
+/* ---- status tree ---- */
+.tree {
+  font-variant-numeric: tabular-nums;
+}
+
+.tree-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 90px 90px 90px 150px;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px;
+  border-bottom: 1px solid var(--line);
+}
+
+.tree-row.clickable {
+  cursor: pointer;
+}
+
+.tree-row.clickable:hover {
+  background: var(--panel);
+}
+
+.tree-head {
+  color: var(--muted);
+  font-weight: 600;
+  position: sticky;
+  top: -18px;
+  background: var(--bg);
+  border-bottom: 1px solid var(--line);
+}
+
+.tree-row .num {
+  text-align: right;
+}
+
+.tree-row .name {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.tree-row .node-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.tree-row .node-name.group {
+  color: var(--ink);
+  font-weight: 600;
+}
+
+.tree-toggle {
+  flex: none;
+  width: 1em;
+  color: var(--muted);
+}
+
+.tree-row.inactive .node-name {
+  color: var(--muted);
+}
+
+.complete-cell {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.tree-children.hidden {
+  display: none;
+}
+
 /* ---- plan diff ---- */
 .summary {
   display: flex;

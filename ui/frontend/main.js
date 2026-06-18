@@ -56,6 +56,150 @@ async function runPool(items, size, worker) {
   await Promise.all(Array.from({ length: Math.min(size, items.length) }, next));
 }
 
+// A completion bar + percentage.
+function completeCell(have, total) {
+  const pct = total > 0 ? (have / total) * 100 : 0;
+  const done = total > 0 && have >= total;
+  const bar = el(
+    "div",
+    { class: done ? "bar complete" : "bar", style: `--pct:${Math.min(100, pct)}%` },
+    el("span", {})
+  );
+  return el("div", { class: "complete-cell" }, bar, `${pct.toFixed(1)}%`);
+}
+
+// --- Tree model ---
+// The catalogue's collections form a tree by their library path
+// (TOSEC/Acorn/Archimedes/Games/[ADF]). Each node rolls up the completeness of
+// every collection beneath it; leaves are collections.
+function makeNode(name, parent) {
+  return {
+    name,
+    parent: parent || null,
+    children: new Map(),
+    collection: null, // set on a leaf
+    activeLeaves: 0, // active collections in this subtree (for the progress hint)
+    agg: { games: 0, have: 0, total: 0, resolved: 0 },
+    dom: null, // { row, cells, childrenEl, expanded, rendered } once drawn
+  };
+}
+
+function buildTree(cols) {
+  const root = makeNode("", null);
+  for (const c of cols) {
+    const segs = (c.node_path || c.name).split("/").filter((s) => s.length);
+    let node = root;
+    for (const seg of segs) {
+      if (!node.children.has(seg)) node.children.set(seg, makeNode(seg, node));
+      node = node.children.get(seg);
+    }
+    node.collection = c; // this path is a collection's leaf
+  }
+  // Count active leaves per subtree, so a node knows when its rollup is complete.
+  const countActive = (node) => {
+    let n = node.collection && node.collection.has_active_version ? 1 : 0;
+    for (const ch of node.children.values()) n += countActive(ch);
+    node.activeLeaves = n;
+    return n;
+  };
+  countActive(root);
+  return root;
+}
+
+const sortedChildren = (node) =>
+  [...node.children.values()].sort((a, b) => a.name.localeCompare(b.name));
+
+// Render a node's children as rows into `container`, recursing lazily: a node's
+// own children are only drawn the first time it is expanded.
+function renderChildren(node, container, depth) {
+  for (const child of sortedChildren(node)) {
+    const hasChildren = child.children.size > 0;
+    const cells = {
+      games: el("div", { class: "num muted" }, ""),
+      have: el("div", { class: "num muted" }, ""),
+      missing: el("div", { class: "num muted" }, ""),
+      complete: el("div", {}, ""),
+    };
+    const toggle = el("span", { class: "tree-toggle" }, hasChildren ? "▸" : "");
+    const count = hasChildren
+      ? el("span", { class: "pill" }, `${child.activeLeaves || child.children.size}`)
+      : null;
+    const name = el(
+      "div",
+      { class: "name", style: `padding-left:${depth * 18}px`, title: child.name },
+      toggle,
+      el("span", { class: hasChildren ? "node-name group" : "node-name" }, child.name),
+      count
+    );
+    const row = el(
+      "div",
+      { class: "tree-row" + (hasChildren ? " clickable" : "") },
+      name,
+      cells.games,
+      cells.have,
+      cells.missing,
+      cells.complete
+    );
+    const childrenEl = el("div", { class: "tree-children hidden" });
+    child.dom = { row, cells, childrenEl, expanded: false, rendered: false };
+    drawNodeStats(child);
+    container.append(row, childrenEl);
+
+    if (hasChildren) {
+      row.addEventListener("click", () => {
+        child.dom.expanded = !child.dom.expanded;
+        toggle.textContent = child.dom.expanded ? "▾" : "▸";
+        childrenEl.classList.toggle("hidden", !child.dom.expanded);
+        if (child.dom.expanded && !child.dom.rendered) {
+          child.dom.rendered = true;
+          renderChildren(child, childrenEl, depth + 1);
+        }
+      });
+    }
+  }
+}
+
+// Draw a node's current rolled-up numbers into its (already-rendered) row.
+function drawNodeStats(node) {
+  if (!node.dom) return;
+  const { cells, row } = node.dom;
+  const a = node.agg;
+  const leaf = node.collection && node.children.size === 0;
+
+  // Numbers: only meaningful once something has resolved.
+  if (a.resolved > 0 || leaf) {
+    cells.games.className = "num";
+    cells.games.textContent = a.games.toLocaleString();
+    cells.have.className = "num";
+    cells.have.textContent = a.have.toLocaleString();
+    cells.missing.className = "num";
+    cells.missing.textContent = (a.total - a.have).toLocaleString();
+  }
+
+  if (node.activeLeaves === 0) {
+    row.classList.add("inactive");
+    cells.complete.replaceChildren(el("span", { class: "muted" }, "—"));
+  } else if (a.resolved >= node.activeLeaves) {
+    cells.complete.replaceChildren(completeCell(a.have, a.total));
+  } else {
+    cells.complete.replaceChildren(
+      el("span", { class: "muted" }, `${a.resolved}/${node.activeLeaves} computed…`)
+    );
+  }
+}
+
+// Add a resolved collection's numbers to its leaf node and every ancestor,
+// redrawing whichever of those rows are currently on screen.
+function rollUpToRoot(leafNode, s) {
+  for (let n = leafNode; n; n = n.parent) {
+    n.agg.games += s.total_games;
+    n.agg.have += s.have_roms;
+    n.agg.total += s.total_roms;
+    n.agg.resolved += 1;
+    if (n.dom) drawNodeStats(n);
+  }
+}
+
 async function loadStatus() {
   const body = document.getElementById("status-body");
   body.className = "loading";
@@ -73,78 +217,42 @@ async function loadStatus() {
     return;
   }
 
-  // Render the list immediately: a row per collection with placeholder cells.
-  // The numbers fill in as each per-collection query resolves, so a slow
-  // collection holds up only its own row, never the list.
-  const head = el(
-    "tr",
-    {},
-    el("th", {}, "Collection"),
-    el("th", {}, "Version"),
-    el("th", { class: "num" }, "Games"),
-    el("th", { class: "num" }, "Have"),
-    el("th", { class: "num" }, "Missing"),
-    el("th", {}, "Complete")
-  );
-  const tbody = el("tbody");
-  const rowFor = new Map();
-  for (const c of cols) {
-    const cells = {
-      version: el("td", { class: "muted" }, c.has_active_version ? "…" : "no active version"),
-      games: el("td", { class: "num muted" }, c.has_active_version ? "…" : ""),
-      have: el("td", { class: "num muted" }, ""),
-      missing: el("td", { class: "num muted" }, ""),
-      complete: el("td", { class: "muted" }, ""),
-    };
-    rowFor.set(c.name, cells);
-    tbody.append(
-      el("tr", {}, el("td", {}, c.name), cells.version, cells.games, cells.have, cells.missing, cells.complete)
-    );
-  }
-  body.className = "";
-  body.replaceChildren(el("table", {}, el("thead", {}, head), tbody));
+  const root = buildTree(cols);
+  const leafByName = new Map();
+  const collectLeaves = (node) => {
+    if (node.collection) leafByName.set(node.collection.name, node);
+    for (const ch of node.children.values()) collectLeaves(ch);
+  };
+  collectLeaves(root);
 
-  // Fill stats for collections with an active version, concurrently.
+  const header = el(
+    "div",
+    { class: "tree-row tree-head" },
+    el("div", { class: "name" }, "Set / Manufacturer / System / …"),
+    el("div", { class: "num" }, "Games"),
+    el("div", { class: "num" }, "Have"),
+    el("div", { class: "num" }, "Missing"),
+    el("div", {}, "Complete")
+  );
+  const treeBody = el("div", { class: "tree-body" });
+  renderChildren(root, treeBody, 0); // top-level sets, collapsed
+
+  body.className = "";
+  body.replaceChildren(el("div", { class: "tree" }, header, treeBody));
+
+  // Fill each active collection concurrently, rolling each result up the tree.
   const active = cols.filter((c) => c.has_active_version);
   await runPool(active, STATUS_POOL, async (c) => {
-    const cells = rowFor.get(c.name);
     try {
       const s = await invoke("status_one", { name: c.name });
-      if (!s || !s.version) {
-        cells.version.textContent = "no active version";
-        cells.games.textContent = "";
-        return;
-      }
-      fillStatusRow(cells, s);
+      const leaf = leafByName.get(c.name);
+      if (s && s.version && leaf) rollUpToRoot(leaf, s);
     } catch (e) {
-      cells.version.textContent = "error";
-      cells.version.title = String(e);
+      // Leave the node showing its pending hint; surface the error on hover.
+      const leaf = leafByName.get(c.name);
+      if (leaf && leaf.dom) leaf.dom.row.title = String(e);
     }
   });
-}
-
-// Fill one collection's row from its computed status.
-function fillStatusRow(cells, s) {
-  cells.version.className = "muted";
-  cells.version.textContent = `v${s.version}`;
-  cells.games.className = "num";
-  cells.games.textContent = s.total_games.toLocaleString();
-  cells.have.className = "num";
-  cells.have.textContent = s.have_roms.toLocaleString();
-  cells.missing.className = "num";
-  cells.missing.textContent = s.missing_roms.toLocaleString();
-
-  const pct = (s.completion_pct || 0).toFixed(1);
-  const complete = s.missing_roms === 0 && s.total_roms > 0;
-  const bar = el(
-    "div",
-    { class: complete ? "bar complete" : "bar", style: `--pct:${Math.min(100, s.completion_pct || 0)}%` },
-    el("span", {})
-  );
-  cells.complete.className = "";
-  cells.complete.replaceChildren(
-    el("div", { style: "display:flex;align-items:center;gap:8px" }, bar, `${pct}%`)
-  );
 }
 
 // ---- Plan (diff) view ----

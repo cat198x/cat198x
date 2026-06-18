@@ -48,6 +48,13 @@ pub struct CollectionInfo {
     pub name: String,
     pub source_type: String,
     pub has_active_version: bool,
+    /// The collection's full library path — the whole tree it sits in, e.g.
+    /// `TOSEC/Acorn/Archimedes/Games/[ADF]` — set by recursive `dat add`. Falls
+    /// back to the collection name when it has no active version or no recorded
+    /// path. A caller groups the catalogue's thousands of collections by walking
+    /// this path: the first segment is the set, the rest the manufacturer /
+    /// system / category tree beneath it.
+    pub node_path: String,
 }
 
 /// A registered source directory.
@@ -112,15 +119,23 @@ pub fn collection_status(
     Ok(out)
 }
 
-/// Every registered collection, with whether it has an active version.
+/// Every registered collection, with whether it has an active version and the
+/// set it rolls up under.
 pub fn list_collections(conn: &Connection) -> Result<Vec<CollectionInfo>> {
     let mut out = Vec::new();
     for coll in collections::list_collections(conn)? {
-        let has_active_version = collections::get_active_version(conn, coll.id)?.is_some();
+        let version = collections::get_active_version(conn, coll.id)?;
+        // Full library path (the tree set by recursive `dat add`); fall back to
+        // the collection name when there's no active version or recorded path.
+        let node_path = match &version {
+            Some(v) => dats::primary_node_path(conn, v.id)?.unwrap_or_else(|| coll.name.clone()),
+            None => coll.name.clone(),
+        };
         out.push(CollectionInfo {
             name: coll.name,
             source_type: coll.source_type,
-            has_active_version,
+            has_active_version: version.is_some(),
+            node_path,
         });
     }
     Ok(out)
@@ -213,6 +228,46 @@ mod tests {
         let just_nes = collection_status(conn, Some("NES"), MergeMode::NonMerged).unwrap();
         assert_eq!(just_nes.len(), 1);
         assert_eq!(just_nes[0].name, "NES");
+    }
+
+    #[test]
+    fn list_collections_reports_the_full_library_path() {
+        let db = Database::open_in_memory().unwrap();
+        let conn = db.conn();
+
+        // A collection whose library path nests under a set ("TOSEC-PIX/…").
+        let c = collections::create_collection(conn, "Acorn BBC - Magazines", "tosec").unwrap();
+        let v = collections::add_version(conn, c, "v1", "/d/bbc.dat", true).unwrap();
+        dats::create_node(
+            conn,
+            v,
+            None,
+            "Magazines",
+            "dat",
+            "TOSEC-PIX/Acorn/BBC/Magazines",
+        )
+        .unwrap();
+
+        // A collection with no active version falls back to its own name.
+        collections::create_collection(conn, "Loose Coll", "tosec").unwrap();
+
+        let cols = list_collections(conn).unwrap();
+        let bbc = cols
+            .iter()
+            .find(|c| c.name == "Acorn BBC - Magazines")
+            .unwrap();
+        assert_eq!(
+            bbc.node_path, "TOSEC-PIX/Acorn/BBC/Magazines",
+            "the full library path is reported, not just the set"
+        );
+        assert!(bbc.has_active_version);
+
+        let loose = cols.iter().find(|c| c.name == "Loose Coll").unwrap();
+        assert_eq!(
+            loose.node_path, "Loose Coll",
+            "no active version → path is the name"
+        );
+        assert!(!loose.has_active_version);
     }
 
     #[test]
