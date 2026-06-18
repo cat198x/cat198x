@@ -13,7 +13,6 @@ use super::{get_data_dir, open_database};
 pub fn run(
     dat_filter: Option<String>,
     set_filter: Option<Vec<String>>,
-    move_files: bool,
     data_dir: Option<PathBuf>,
 ) -> Result<()> {
     let db = open_database(data_dir.clone())?;
@@ -45,7 +44,6 @@ pub fn run(
             default_dest: file_config.default_dest_path,
             default_format: file_config.default_output_format,
             default_merge_mode: file_config.default_merge_mode,
-            move_files,
         },
     )?;
 
