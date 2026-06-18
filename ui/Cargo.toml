@@ -1,0 +1,29 @@
+[package]
+name = "cat198x-ui"
+version = "0.1.0"
+edition = "2024"
+description = "Cat198x desktop UI (Tauri) — a thin client over the cat198x operation surface."
+license = "MIT"
+repository = "https://github.com/cat198x/cat198x"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+# The desktop shell. Default features only; this slice uses no plugins.
+tauri = { version = "2", features = [] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+# The shared operation surface and database layer live in the sibling crate; the
+# UI is a thin adapter over them, never a parallel implementation.
+cat198x = { path = ".." }
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints.rust]
+# `unsafe_code` is forbidden in our code as elsewhere in the family. (The Tauri
+# macros and webview crates carry their own audited unsafe; this binds only this
+# crate's source.)
+unsafe_code = "forbid"
