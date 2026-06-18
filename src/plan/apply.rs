@@ -1,0 +1,748 @@
+//! Plan application: the orchestration that carries out a plan's operations.
+//!
+//! This is the loop that walks a plan's operations — copy / move / relocate /
+//! repack / delete / quarantine — driving the verified file primitives in
+//! [`crate::plan::executor`], journaling each to the rollback log, and keeping
+//! the catalogue in step so a re-plan converges without a re-scan. Repacks are
+//! batched and run concurrently (they're latency-bound over a network mount).
+//!
+//! It holds no output concerns: progress is reported through an [`ApplyEvent`]
+//! callback, so the `apply` CLI prints, the UI streams a progress bar, and the
+//! MCP surface stays silent — each adapter decides how to render the same run.
+//! That keeps this engine drivable from every 198x surface, exactly as the
+//! safety model requires ("the execution engine lives in the library").
+
+use std::fs;
+use std::path::{Path, PathBuf};
+
+use anyhow::{Context, Result};
+use rusqlite::Connection;
+
+use crate::db::files::{self, Source};
+use crate::db::quarantine::QuarantineReason;
+use crate::plan::executor::{
+    RepackJob, RepackOutcome, delete_has_surviving_copy, execute_copy, execute_move,
+    execute_quarantine, execute_relocate, execute_repacks_concurrent,
+};
+use crate::plan::{OperationKind, OperationLog, OperationStatus, Plan};
+
+/// How to apply a plan. Staleness and disk-space pre-checks stay with the
+/// caller (they're user-facing gates); this is the execution itself.
+pub struct ApplyOptions {
+    /// Report what would happen without touching any file.
+    pub dry_run: bool,
+    /// Leave repack operations pending for a later pass (cheap ops land first).
+    pub skip_repack: bool,
+    /// Concurrent repack workers.
+    pub jobs: usize,
+    /// The resolved quarantine store location (the caller resolves config vs
+    /// default and passes it in, so this engine needs no config layer).
+    pub quarantine_dir: PathBuf,
+}
+
+/// A display-agnostic view of an operation about to run — full paths and counts,
+/// no truncation or formatting (that's the adapter's job).
+#[derive(Debug, Clone)]
+pub struct OpView {
+    pub verb: &'static str,
+    /// The primary path: the source for copy/move/relocate, the path for
+    /// delete/quarantine, the destination archive for a repack.
+    pub from: String,
+    /// The destination, for the operations that have a distinct one.
+    pub to: Option<String>,
+    /// The number of files folded into a repack.
+    pub file_count: Option<usize>,
+}
+
+/// A progress event emitted as a plan is applied. The library never prints;
+/// adapters turn these into console lines, UI updates, or summaries.
+#[derive(Debug, Clone)]
+pub enum ApplyEvent {
+    /// An operation is starting (or, on a dry run, would run).
+    OpStarted {
+        index: usize,
+        total: usize,
+        op: OpView,
+    },
+    /// A delete or copy/repack reverse whose target was already gone — an
+    /// idempotent success, not a failure.
+    AlreadyGone { index: usize },
+    /// A delete refused because no surviving copy of its content exists on disk.
+    DeleteRefused { index: usize, path: String },
+    /// A delete refused because its surviving-copy check itself errored.
+    DeleteVerifyError { index: usize, message: String },
+    /// An operation failed.
+    OpFailed { index: usize, message: String },
+    /// The catalogue couldn't be updated after a completed op (non-fatal).
+    CatalogueWarning { op_id: u64, message: String },
+    /// A concurrent repack batch is starting.
+    RepackBatchStarted { count: usize, in_flight: usize },
+}
+
+/// The result of applying a plan.
+pub struct ApplyOutcome {
+    pub success_count: usize,
+    pub error_count: usize,
+    /// Where the rollback journal was written (absent on a dry run).
+    pub log_path: Option<PathBuf>,
+}
+
+impl OpView {
+    fn of(kind: &OperationKind) -> Self {
+        match kind {
+            OperationKind::Copy { source, dest, .. } => OpView {
+                verb: "COPY",
+                from: source.path.clone(),
+                to: Some(dest.clone()),
+                file_count: None,
+            },
+            OperationKind::Move { source, dest, .. } => OpView {
+                verb: "MOVE",
+                from: source.path.clone(),
+                to: Some(dest.clone()),
+                file_count: None,
+            },
+            OperationKind::Relocate { source, dest, .. } => OpView {
+                verb: "RELOCATE",
+                from: source.clone(),
+                to: Some(dest.clone()),
+                file_count: None,
+            },
+            OperationKind::Repack { sources, dest, .. } => OpView {
+                verb: "REPACK",
+                from: dest.clone(),
+                to: None,
+                file_count: Some(sources.len()),
+            },
+            OperationKind::Delete { path } => OpView {
+                verb: "DELETE",
+                from: path.clone(),
+                to: None,
+                file_count: None,
+            },
+            OperationKind::Quarantine { path, .. } => OpView {
+                verb: "QUARANTINE",
+                from: path.clone(),
+                to: None,
+                file_count: None,
+            },
+        }
+    }
+}
+
+/// Apply a plan's pending operations, reporting progress through `on_event`.
+///
+/// The plan's per-operation status is updated in place and (on a real run) the
+/// plan file and rollback journal are written, so a re-run resumes rather than
+/// repeats. `sources` is the registered source list, used to keep the catalogue
+/// in step with each file operation.
+pub fn apply_plan(
+    conn: &Connection,
+    plan: &mut Plan,
+    plan_path: &Path,
+    sources: &[Source],
+    opts: &ApplyOptions,
+    on_event: &mut dyn FnMut(ApplyEvent),
+) -> Result<ApplyOutcome> {
+    let total_ops = plan.operations.len();
+
+    // Create operation log (only if not dry run)
+    let mut op_log = if !opts.dry_run {
+        Some(OperationLog::new(plan.state_hash.clone()))
+    } else {
+        None
+    };
+
+    let mut success_count = 0;
+    let mut error_count = 0;
+
+    // Consecutive pending repacks accumulate here and run concurrently — they're
+    // latency-bound over a network mount, so overlapping them is the wall-clock
+    // win. Any other pending operation flushes the batch first, so ordering
+    // between repacks and everything else is exactly serial apply's.
+    let mut repack_batch: Vec<RepackJob> = Vec::new();
+
+    for i in 0..plan.operations.len() {
+        {
+            let op = &plan.operations[i];
+            if op.status != OperationStatus::Pending {
+                continue; // Skip already completed or failed operations
+            }
+
+            if let OperationKind::Repack {
+                sources: repack_sources,
+                dest,
+                format,
+                move_sources,
+                ..
+            } = &op.kind
+            {
+                // Leave repacks pending for a later pass when deferred, so the
+                // cheap operations land first and the recompression can run
+                // separately.
+                if opts.skip_repack {
+                    continue;
+                }
+                if !opts.dry_run {
+                    repack_batch.push(RepackJob {
+                        plan_index: i,
+                        operation_id: op.id,
+                        sources: repack_sources.clone(),
+                        dest: dest.clone(),
+                        format: format.clone(),
+                        move_sources: *move_sources,
+                    });
+                    continue;
+                }
+            }
+        }
+
+        // A non-repack operation: complete the batched repacks before it runs,
+        // preserving the plan's ordering between repacks and other operations.
+        flush_repack_batch(
+            &mut repack_batch,
+            opts.jobs,
+            plan,
+            &mut op_log,
+            conn,
+            sources,
+            total_ops,
+            &mut success_count,
+            &mut error_count,
+            on_event,
+        );
+
+        let op = &mut plan.operations[i];
+        on_event(ApplyEvent::OpStarted {
+            index: i,
+            total: total_ops,
+            op: OpView::of(&op.kind),
+        });
+
+        match &op.kind {
+            OperationKind::Copy { source, dest, .. } => {
+                if opts.dry_run {
+                    success_count += 1;
+                    continue;
+                }
+
+                let result = execute_copy(
+                    &source.path,
+                    source.archive_path.as_deref(),
+                    dest,
+                    &source.sha1,
+                );
+                let success = result.is_ok();
+
+                if let Some(ref mut log) = op_log {
+                    log.log_copy(op.id, &source.path, dest, &source.sha1, success);
+                }
+
+                match result {
+                    Ok(()) => {
+                        op.status = OperationStatus::Completed;
+                        success_count += 1;
+                    }
+                    Err(e) => {
+                        on_event(ApplyEvent::OpFailed {
+                            index: i,
+                            message: format!("{e:#}"),
+                        });
+                        op.status = OperationStatus::Failed;
+                        error_count += 1;
+                    }
+                }
+            }
+            OperationKind::Move { source, dest, .. } => {
+                if opts.dry_run {
+                    success_count += 1;
+                    continue;
+                }
+
+                let result = execute_move(
+                    &source.path,
+                    source.archive_path.as_deref(),
+                    dest,
+                    &source.sha1,
+                );
+                let success = result.is_ok();
+
+                if let Some(ref mut log) = op_log {
+                    log.log_move(op.id, &source.path, dest, &source.sha1, success);
+                }
+
+                match result {
+                    Ok(()) => {
+                        op.status = OperationStatus::Completed;
+                        success_count += 1;
+                    }
+                    Err(e) => {
+                        on_event(ApplyEvent::OpFailed {
+                            index: i,
+                            message: format!("{e:#}"),
+                        });
+                        op.status = OperationStatus::Failed;
+                        error_count += 1;
+                    }
+                }
+            }
+            OperationKind::Relocate { source, dest, .. } => {
+                if opts.dry_run {
+                    success_count += 1;
+                    continue;
+                }
+
+                let result = execute_relocate(source, dest);
+                let success = result.is_ok();
+
+                if let Some(ref mut log) = op_log {
+                    log.log_relocate(op.id, source, dest, success);
+                }
+
+                match result {
+                    Ok(()) => {
+                        op.status = OperationStatus::Completed;
+                        success_count += 1;
+                    }
+                    Err(e) => {
+                        on_event(ApplyEvent::OpFailed {
+                            index: i,
+                            message: format!("{e:#}"),
+                        });
+                        op.status = OperationStatus::Failed;
+                        error_count += 1;
+                    }
+                }
+            }
+            OperationKind::Repack { .. } => {
+                // Reachable only on a dry run: live repacks were batched above
+                // for concurrent execution and never fall through to here.
+                success_count += 1;
+                continue;
+            }
+            OperationKind::Delete { path } => {
+                if opts.dry_run {
+                    success_count += 1;
+                    continue;
+                }
+
+                // Verify-before-delete: a plan deletes a file only because its
+                // content is held elsewhere, but never destroy the last copy on
+                // a stale record. Refuse if no surviving copy physically exists.
+                match delete_has_surviving_copy(conn, sources, path) {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        on_event(ApplyEvent::DeleteRefused {
+                            index: i,
+                            path: path.clone(),
+                        });
+                        op.status = OperationStatus::Failed;
+                        error_count += 1;
+                        continue;
+                    }
+                    Err(e) => {
+                        on_event(ApplyEvent::DeleteVerifyError {
+                            index: i,
+                            message: format!("{e:#}"),
+                        });
+                        op.status = OperationStatus::Failed;
+                        error_count += 1;
+                        continue;
+                    }
+                }
+
+                match fs::remove_file(path) {
+                    Ok(()) => {
+                        op.status = OperationStatus::Completed;
+                        success_count += 1;
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                        // File already gone, consider success
+                        op.status = OperationStatus::Completed;
+                        success_count += 1;
+                        on_event(ApplyEvent::AlreadyGone { index: i });
+                    }
+                    Err(e) => {
+                        on_event(ApplyEvent::OpFailed {
+                            index: i,
+                            message: format!("{e:#}"),
+                        });
+                        op.status = OperationStatus::Failed;
+                        error_count += 1;
+                    }
+                }
+            }
+            OperationKind::Quarantine {
+                path,
+                sha1,
+                size,
+                reason,
+                collection,
+            } => {
+                if opts.dry_run {
+                    success_count += 1;
+                    continue;
+                }
+
+                let reason_enum =
+                    QuarantineReason::parse(reason).unwrap_or(QuarantineReason::PathChanged);
+
+                let result = execute_quarantine(
+                    conn,
+                    path,
+                    sha1,
+                    *size as i64,
+                    reason_enum,
+                    collection.as_deref(),
+                    &opts.quarantine_dir,
+                );
+
+                // Journal the quarantine so it can be rolled back: its reverse
+                // is a Move restoring the original from the quarantine store.
+                if let Some(ref mut log) = op_log {
+                    let quarantine_path = result.as_deref().unwrap_or("");
+                    log.log_quarantine(op.id, path, quarantine_path, sha1, result.is_ok());
+                }
+
+                match result {
+                    Ok(_) => {
+                        op.status = OperationStatus::Completed;
+                        success_count += 1;
+                    }
+                    Err(e) => {
+                        on_event(ApplyEvent::OpFailed {
+                            index: i,
+                            message: format!("{e:#}"),
+                        });
+                        op.status = OperationStatus::Failed;
+                        error_count += 1;
+                    }
+                }
+            }
+        }
+
+        // Keep the catalogue in step with what just happened on disk, so a
+        // re-plan converges without a re-scan. Catalogue-local and cheap; a
+        // failure here doesn't undo the file operation that already succeeded.
+        if !opts.dry_run
+            && op.status == OperationStatus::Completed
+            && let Err(e) = sync_catalogue_after(conn, sources, &op.kind)
+        {
+            on_event(ApplyEvent::CatalogueWarning {
+                op_id: op.id,
+                message: e.to_string(),
+            });
+        }
+    }
+
+    // Repacks at the tail of the plan (the common case) are still batched.
+    flush_repack_batch(
+        &mut repack_batch,
+        opts.jobs,
+        plan,
+        &mut op_log,
+        conn,
+        sources,
+        total_ops,
+        &mut success_count,
+        &mut error_count,
+        on_event,
+    );
+
+    // Save updated plan and operation log
+    let mut log_path = None;
+    if !opts.dry_run {
+        let plan_json = serde_json::to_string_pretty(&plan).context("Failed to serialize plan")?;
+        fs::write(plan_path, &plan_json).context("Failed to update plan file")?;
+
+        if let Some(mut log) = op_log {
+            log.complete();
+            let logs_dir = plan_path
+                .parent()
+                .and_then(|p| p.parent())
+                .map(|p| p.join("logs"))
+                .unwrap_or_else(|| PathBuf::from("objects/logs"));
+            log_path = Some(log.save(&logs_dir)?);
+        }
+    }
+
+    Ok(ApplyOutcome {
+        success_count,
+        error_count,
+        log_path,
+    })
+}
+
+/// Execute the accumulated repack batch concurrently, then drain it.
+///
+/// Workers do the file operations; everything stateful happens here on the
+/// calling thread as each outcome streams in — journal entry, plan status,
+/// catalogue sync — in completion order. That keeps the rollback log append
+/// order consistent with what actually happened on disk and never shares the
+/// (non-`Sync`) database connection across threads.
+#[allow(clippy::too_many_arguments)]
+fn flush_repack_batch(
+    batch: &mut Vec<RepackJob>,
+    workers: usize,
+    plan: &mut Plan,
+    op_log: &mut Option<OperationLog>,
+    conn: &Connection,
+    sources: &[Source],
+    total_ops: usize,
+    success_count: &mut usize,
+    error_count: &mut usize,
+    on_event: &mut dyn FnMut(ApplyEvent),
+) {
+    if batch.is_empty() {
+        return;
+    }
+    let jobs = std::mem::take(batch);
+    if jobs.len() > 1 && workers > 1 {
+        on_event(ApplyEvent::RepackBatchStarted {
+            count: jobs.len(),
+            in_flight: workers.min(jobs.len()),
+        });
+    }
+
+    execute_repacks_concurrent(jobs, workers, |outcome: RepackOutcome| {
+        let RepackOutcome { job, result } = outcome;
+        on_event(ApplyEvent::OpStarted {
+            index: job.plan_index,
+            total: total_ops,
+            op: OpView {
+                verb: "REPACK",
+                from: job.dest.clone(),
+                to: None,
+                file_count: Some(job.sources.len()),
+            },
+        });
+
+        // Log the operation. A move-mode repack reports the loose sources it
+        // consumed so the reverse can extract them back out.
+        if let Some(log) = op_log {
+            let source_paths: Vec<String> = job.sources.iter().map(|s| s.path.clone()).collect();
+            let consumed = result.as_deref().unwrap_or(&[]);
+            log.log_repack(
+                job.operation_id,
+                &source_paths,
+                &job.dest,
+                consumed,
+                result.is_ok(),
+            );
+        }
+
+        let op = &mut plan.operations[job.plan_index];
+        match result {
+            Ok(_) => {
+                op.status = OperationStatus::Completed;
+                *success_count += 1;
+
+                // Keep the catalogue in step, as the serial path does per-op.
+                if let Err(e) = sync_catalogue_after(conn, sources, &op.kind) {
+                    on_event(ApplyEvent::CatalogueWarning {
+                        op_id: op.id,
+                        message: e.to_string(),
+                    });
+                }
+            }
+            Err(e) => {
+                on_event(ApplyEvent::OpFailed {
+                    index: job.plan_index,
+                    message: format!("{e:#}"),
+                });
+                op.status = OperationStatus::Failed;
+                *error_count += 1;
+            }
+        }
+    });
+}
+
+/// Update the file catalogue to match a completed operation, so a re-plan
+/// converges without a re-scan: a move/relocate updates the file's recorded
+/// location, a quarantine/delete removes it, a copy/repack records the new copy.
+/// Paths outside any registered source can't be recorded (the file simply leaves
+/// the catalogue's view); the library destination is a source, so the common
+/// cases resolve.
+fn sync_catalogue_after(conn: &Connection, sources: &[Source], kind: &OperationKind) -> Result<()> {
+    match kind {
+        OperationKind::Move { source, dest, .. } => {
+            if source.archive_path.is_some() {
+                // A copy extracted from an archive to a loose dest; source kept.
+                if let Some((nsrc, nrel)) = files::resolve_in_sources(sources, dest) {
+                    files::upsert_file_location(conn, &source.sha1, nsrc, &nrel, None)?;
+                }
+            } else {
+                relocate_or_drop(conn, sources, &source.path, dest)?;
+            }
+        }
+        OperationKind::Relocate { source, dest, .. } => {
+            relocate_or_drop(conn, sources, source, dest)?;
+        }
+        OperationKind::Copy { source, dest, .. } => {
+            if let Some((nsrc, nrel)) = files::resolve_in_sources(sources, dest) {
+                files::upsert_file_location(conn, &source.sha1, nsrc, &nrel, None)?;
+            }
+        }
+        OperationKind::Repack {
+            sources: entries,
+            dest,
+            move_sources,
+            ..
+        } => {
+            if let Some((nsrc, nrel)) = files::resolve_in_sources(sources, dest) {
+                for e in entries {
+                    files::upsert_file_location(
+                        conn,
+                        &e.sha1,
+                        nsrc,
+                        &nrel,
+                        e.entry_name.as_deref(),
+                    )?;
+                }
+            }
+            // Move mode deleted the loose sources on disk; drop their catalogued
+            // locations too (archive-member sources are left in place).
+            if *move_sources {
+                for e in entries {
+                    if e.archive_path.is_none()
+                        && let Some((src, rel)) = files::resolve_in_sources(sources, &e.path)
+                    {
+                        files::remove_locations_at(conn, src, &rel)?;
+                    }
+                }
+            }
+        }
+        OperationKind::Quarantine { path, .. } | OperationKind::Delete { path } => {
+            if let Some((src, rel)) = files::resolve_in_sources(sources, path) {
+                files::remove_locations_at(conn, src, &rel)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Move a file's catalogued location(s) from `old_abs` to `new_abs`, or drop them
+/// if the destination is outside every registered source.
+fn relocate_or_drop(
+    conn: &Connection,
+    sources: &[Source],
+    old_abs: &str,
+    new_abs: &str,
+) -> Result<()> {
+    match (
+        files::resolve_in_sources(sources, old_abs),
+        files::resolve_in_sources(sources, new_abs),
+    ) {
+        (Some((osrc, orel)), Some((nsrc, nrel))) => {
+            files::relocate_locations(conn, osrc, &orel, nsrc, &nrel)?;
+        }
+        (Some((osrc, orel)), None) => {
+            files::remove_locations_at(conn, osrc, &orel)?;
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::Database;
+    use crate::plan::{Plan, SourceRef};
+
+    fn loose(path: &str, sha1: &str) -> SourceRef {
+        SourceRef {
+            path: path.to_string(),
+            archive_path: None,
+            sha1: sha1.to_string(),
+            entry_name: None,
+        }
+    }
+
+    fn opts(dry_run: bool, quarantine_dir: PathBuf) -> ApplyOptions {
+        ApplyOptions {
+            dry_run,
+            skip_repack: false,
+            jobs: 1,
+            quarantine_dir,
+        }
+    }
+
+    #[test]
+    fn dry_run_touches_nothing_and_leaves_the_op_pending() {
+        let db = Database::open_in_memory().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("out.bin");
+
+        let mut plan = Plan::new("statehash".to_string());
+        plan.add_copy(
+            loose(
+                "/does/not/exist.bin",
+                "aaf4c61ddcc5e8a2dabede0f3b482cd9aea9434d",
+            ),
+            dest.to_string_lossy().into_owned(),
+            5,
+        );
+
+        let mut events = Vec::new();
+        let outcome = apply_plan(
+            db.conn(),
+            &mut plan,
+            &tmp.path().join("plan.json"),
+            &[],
+            &opts(true, tmp.path().join("q")),
+            &mut |e| events.push(e),
+        )
+        .unwrap();
+
+        assert_eq!(outcome.success_count, 1);
+        assert_eq!(outcome.error_count, 0);
+        assert!(outcome.log_path.is_none(), "a dry run writes no journal");
+        assert!(!dest.exists(), "a dry run copies nothing");
+        assert!(matches!(events[0], ApplyEvent::OpStarted { .. }));
+        // Left pending, so a real apply still runs it.
+        assert_eq!(plan.operations[0].status, OperationStatus::Pending);
+    }
+
+    #[test]
+    fn real_run_copies_the_file_and_writes_a_journal() {
+        let db = Database::open_in_memory().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let in_path = tmp.path().join("in.bin");
+        std::fs::write(&in_path, b"hello").unwrap();
+        let dest = tmp.path().join("lib/out.bin");
+
+        let mut plan = Plan::new("statehash".to_string());
+        plan.add_copy(
+            // sha1("hello")
+            loose(
+                in_path.to_str().unwrap(),
+                "aaf4c61ddcc5e8a2dabede0f3b482cd9aea9434d",
+            ),
+            dest.to_string_lossy().into_owned(),
+            5,
+        );
+
+        // Plan under objects/plans so the journal lands in objects/logs.
+        let plans_dir = tmp.path().join("objects/plans");
+        std::fs::create_dir_all(&plans_dir).unwrap();
+        let plan_path = plans_dir.join("plan.json");
+
+        let outcome = apply_plan(
+            db.conn(),
+            &mut plan,
+            &plan_path,
+            &[],
+            &opts(false, tmp.path().join("q")),
+            &mut |_| {},
+        )
+        .unwrap();
+
+        assert_eq!(outcome.success_count, 1);
+        assert_eq!(outcome.error_count, 0);
+        assert_eq!(std::fs::read(&dest).unwrap(), b"hello", "file copied");
+        assert_eq!(plan.operations[0].status, OperationStatus::Completed);
+        assert!(outcome.log_path.unwrap().exists(), "journal written");
+        assert!(plan_path.exists(), "updated plan written");
+    }
+}
