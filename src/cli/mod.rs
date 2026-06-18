@@ -9,6 +9,7 @@ pub mod doctor;
 pub mod export;
 pub mod fetch;
 pub mod init;
+pub mod mcp;
 pub mod plan;
 pub mod prune;
 pub mod quarantine;

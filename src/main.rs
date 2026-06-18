@@ -6,9 +6,9 @@ use std::io;
 use cat198x::cli::{
     apply as apply_cmd, catalogue as catalogue_cmd, clean_superseded as clean_superseded_cmd,
     config as config_cmd, dat as dat_cmd, doctor as doctor_cmd, export as export_cmd, init,
-    plan as plan_cmd, prune as prune_cmd, quarantine as quarantine_cmd, reclaim as reclaim_cmd,
-    scan, source, stats as stats_cmd, status, torrent as torrent_cmd, unknowns as unknowns_cmd,
-    update as update_cmd,
+    mcp as mcp_cmd, plan as plan_cmd, prune as prune_cmd, quarantine as quarantine_cmd,
+    reclaim as reclaim_cmd, scan, source, stats as stats_cmd, status, torrent as torrent_cmd,
+    unknowns as unknowns_cmd, update as update_cmd,
 };
 use cat198x::{ConfigCommands, DatCommands, QuarantineCommands, SourceCommands, TorrentCommands};
 
@@ -268,6 +268,12 @@ enum Commands {
         shell: Shell,
     },
 
+    /// Run a Model Context Protocol server over stdio, exposing the read-only
+    /// operations (status, plan-as-diff, collection/source lists) as MCP tools
+    /// so an agent can drive Cat198x headlessly. stdout carries JSON-RPC; logs
+    /// go to stderr.
+    Mcp,
+
     /// Update Cat198x to the latest version
     Update {
         /// Only check for updates, don't install
@@ -292,10 +298,20 @@ fn main() -> Result<()> {
         tracing::Level::INFO
     };
 
-    tracing_subscriber::fmt()
-        .with_max_level(log_level)
-        .with_target(false)
-        .init();
+    // The MCP server uses stdout for the JSON-RPC transport, so its logs must go
+    // to stderr; every other command logs to stdout as before.
+    if matches!(cli.command, Commands::Mcp) {
+        tracing_subscriber::fmt()
+            .with_max_level(log_level)
+            .with_target(false)
+            .with_writer(std::io::stderr)
+            .init();
+    } else {
+        tracing_subscriber::fmt()
+            .with_max_level(log_level)
+            .with_target(false)
+            .init();
+    }
 
     // Handle commands
     match cli.command {
@@ -346,6 +362,7 @@ fn main() -> Result<()> {
                 )
             }
         }
+        Commands::Mcp => mcp_cmd::run(cli.data_dir),
         Commands::Quarantine(cmd) => quarantine_cmd::run(cmd, cli.data_dir),
         Commands::Torrent(cmd) => torrent_cmd::run(cmd),
         Commands::Doctor { fix } => doctor_cmd::run(fix, cli.data_dir),

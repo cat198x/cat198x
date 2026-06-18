@@ -21,96 +21,76 @@ pub fn run(
     // Parse merge mode (default to non-merged for simple collections)
     let mode = parse_merge_mode(merge_mode.as_deref())?;
 
-    let colls = collections::list_collections(conn)?;
+    // The data comes from the shared operation surface; this command only
+    // formats it. Any other adapter (MCP, UI) gets the same numbers.
+    let statuses = crate::ops::collection_status(conn, collection.as_deref(), mode)?;
 
-    if colls.is_empty() {
-        println!("No collections imported yet.");
-        println!();
-        println!("Import a DAT file with:");
-        println!("  cat198x dat add <path>");
-        return Ok(());
-    }
-
-    // Filter to specific collection if requested
-    let colls_to_show: Vec<_> = if let Some(ref name) = collection {
-        colls.into_iter().filter(|c| c.name == *name).collect()
-    } else {
-        colls
-    };
-
-    if colls_to_show.is_empty() {
+    if statuses.is_empty() {
         if let Some(name) = collection {
             println!("Collection not found: {}", name);
-            println!();
-            println!("Available collections:");
-            for c in collections::list_collections(conn)? {
-                println!("  {}", c.name);
+            let all = collections::list_collections(conn)?;
+            if !all.is_empty() {
+                println!();
+                println!("Available collections:");
+                for c in all {
+                    println!("  {}", c.name);
+                }
             }
+        } else {
+            println!("No collections imported yet.");
+            println!();
+            println!("Import a DAT file with:");
+            println!("  cat198x dat add <path>");
         }
         return Ok(());
     }
+
+    let mode_str = match mode {
+        MergeMode::NonMerged => "",
+        MergeMode::Split => " (split)",
+        MergeMode::Merged => " (merged)",
+    };
 
     println!("Collection Status:");
     println!();
 
-    for coll in &colls_to_show {
-        // Get active version
-        let version = match collections::get_active_version(conn, coll.id)? {
-            Some(v) => v,
-            None => {
-                println!("{}  [no active version]", coll.name);
-                continue;
-            }
+    for s in &statuses {
+        let Some(version) = &s.version else {
+            println!("{}  [no active version]", s.name);
+            continue;
         };
 
-        // Use merge-mode aware stats calculation
-        let stats = dats::calculate_merge_mode_stats(
-            conn, version.id, mode, true, // exclude_mechanical by default
-        )?;
-
-        // Calculate completion percentage
-        let completion = if stats.total_roms > 0 {
-            (stats.have_roms as f64 / stats.total_roms as f64) * 100.0
-        } else {
-            0.0
-        };
-
-        let missing = stats.total_roms - stats.have_roms;
-
-        // Display summary with merge mode indicator
-        let mode_str = match mode {
-            MergeMode::NonMerged => "",
-            MergeMode::Split => " (split)",
-            MergeMode::Merged => " (merged)",
-        };
         println!(
             "{}  v{}  [{:.1}% complete]{}",
-            coll.name, version.version, completion, mode_str
+            s.name, version, s.completion_pct, mode_str
         );
-        println!(
-            "  {} games, {} ROMs required",
-            stats.total_games, stats.total_roms
-        );
-        println!("  {} have, {} missing", stats.have_roms, missing);
+        println!("  {} games, {} ROMs required", s.total_games, s.total_roms);
+        println!("  {} have, {} missing", s.have_roms, s.missing_roms);
 
         // Show additional info for MAME-style collections
         let mut extras = Vec::new();
-        if stats.nodump_roms > 0 {
-            extras.push(format!("{} nodump", stats.nodump_roms));
+        if s.nodump_roms > 0 {
+            extras.push(format!("{} nodump", s.nodump_roms));
         }
-        if stats.bios_sets > 0 {
-            extras.push(format!("{} BIOS", stats.bios_sets));
+        if s.bios_sets > 0 {
+            extras.push(format!("{} BIOS", s.bios_sets));
         }
-        if stats.device_sets > 0 {
-            extras.push(format!("{} device", stats.device_sets));
+        if s.device_sets > 0 {
+            extras.push(format!("{} device", s.device_sets));
         }
         if !extras.is_empty() {
             println!("  ({})", extras.join(", "));
         }
 
         if detailed {
-            println!();
-            show_detailed_status(conn, version.id, mode)?;
+            // The detailed per-game view needs the active version id; re-resolve
+            // it from the name (cheap) rather than thread it through the ops type.
+            if let Some(coll) = collections::get_collection_by_name(conn, &s.name)?
+                && let Some(v) = collections::get_active_version(conn, coll.id)?
+            {
+                println!();
+                show_detailed_status(conn, v.id, mode)?;
+            }
         }
 
         println!();
