@@ -281,6 +281,15 @@ tr:hover td {
   display: none;
 }
 
+.disk-ok {
+  color: var(--good);
+  background: rgba(90, 209, 155, 0.08);
+  border: 1px solid rgba(90, 209, 155, 0.3);
+  border-radius: 8px;
+  padding: 10px 14px;
+  margin-bottom: 12px;
+}
+
 /* per-node pending detail overlay */
 .detail-overlay {
   position: fixed;

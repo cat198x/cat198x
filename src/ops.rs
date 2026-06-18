@@ -16,6 +16,7 @@
 //! Mutating operations (apply, reclaim, clean-superseded) join it behind a
 //! structured-progress-event design in a follow-up.
 
+use std::collections::BTreeMap;
 use std::path::Path;
 
 use anyhow::Result;
@@ -24,7 +25,8 @@ use serde::Serialize;
 
 use crate::db::dats::{self, MergeMode};
 use crate::db::{collections, files};
-use crate::plan::{Plan, compute_state_hash};
+use crate::plan::executor::check_disk_space;
+use crate::plan::{ApplyEvent, ApplyOptions, Plan, apply_plan, compute_state_hash};
 
 /// Completeness of one collection against its active DAT.
 #[derive(Debug, Clone, Serialize)]
@@ -158,6 +160,19 @@ pub fn list_sources(conn: &Connection) -> Result<Vec<SourceInfo>> {
 /// `<data_dir>/objects/plans`; the plan already *is* the diff, so no reconcile
 /// model is needed (see the decision record).
 pub fn latest_plan(data_dir: &Path) -> Result<Option<Plan>> {
+    match newest_plan_file(data_dir)? {
+        Some(path) => {
+            let contents = std::fs::read_to_string(&path)?;
+            Ok(Some(serde_json::from_str(&contents)?))
+        }
+        None => Ok(None),
+    }
+}
+
+/// The path of the most recently written plan under `<data_dir>/objects/plans`,
+/// or `None` when none exists. Shared by [`latest_plan`] and [`apply`] — the
+/// latter needs the path to drive the apply engine.
+fn newest_plan_file(data_dir: &Path) -> Result<Option<std::path::PathBuf>> {
     let plans_dir = data_dir.join("objects/plans");
     if !plans_dir.is_dir() {
         return Ok(None);
@@ -178,13 +193,7 @@ pub fn latest_plan(data_dir: &Path) -> Result<Option<Plan>> {
             }
         }
     }
-    match latest {
-        Some((path, _)) => {
-            let contents = std::fs::read_to_string(&path)?;
-            Ok(Some(serde_json::from_str(&contents)?))
-        }
-        None => Ok(None),
-    }
+    Ok(latest.map(|(path, _)| path))
 }
 
 /// One collection's pending reorganise work, from the saved plan.
@@ -240,6 +249,88 @@ pub fn pending_work(conn: &Connection, data_dir: &Path) -> Result<Option<Pending
         stale,
         plan_created_at: plan.created_at,
         items,
+    }))
+}
+
+/// Readiness to apply the latest plan, plus the work it would do — what the UI's
+/// dry-run preview shows.
+#[derive(Debug, Clone, Serialize)]
+pub struct ApplyReport {
+    /// The plan predates the current catalogue, so it should be regenerated.
+    pub stale: bool,
+    /// The destination volumes have room for the plan's transfers.
+    pub disk_ok: bool,
+    /// When `disk_ok` is false, the "need X, have Y" detail from the check.
+    pub disk_detail: Option<String>,
+    pub total_ops: usize,
+    pub pending: usize,
+    /// Operation count by kind (copy/move/relocate/repack/delete/quarantine),
+    /// tallied from the apply engine's own progress events.
+    pub by_kind: BTreeMap<String, usize>,
+    /// Whether this was a dry run (the only mode wired today).
+    pub dry_run: bool,
+    pub succeeded: usize,
+    pub failed: usize,
+}
+
+/// Drive the apply engine over the latest plan and report what it would do.
+///
+/// Today only `dry_run` is exposed (the UI's preview): it performs nothing,
+/// reports the apply-time gates (staleness, disk space) the static plan view
+/// can't show, and tallies the operations from the engine's [`ApplyEvent`]
+/// stream — the same stream a live apply will drive a progress bar from. Returns
+/// `None` when no plan has been generated.
+pub fn apply(conn: &Connection, data_dir: &Path, dry_run: bool) -> Result<Option<ApplyReport>> {
+    let Some(plan_path) = newest_plan_file(data_dir)? else {
+        return Ok(None);
+    };
+    let contents = std::fs::read_to_string(&plan_path)?;
+    let mut plan: Plan = serde_json::from_str(&contents)?;
+
+    let stale = compute_state_hash(conn)? != plan.state_hash;
+    let (disk_ok, disk_detail) = match check_disk_space(&plan) {
+        Ok(()) => (true, None),
+        Err(e) => (false, Some(e.to_string())),
+    };
+    let total_ops = plan.operations.len();
+    let pending = plan
+        .operations
+        .iter()
+        .filter(|op| op.status == crate::plan::OperationStatus::Pending)
+        .count();
+
+    let sources = files::list_sources(conn)?;
+    let mut by_kind: BTreeMap<String, usize> = BTreeMap::new();
+    let outcome = apply_plan(
+        conn,
+        &mut plan,
+        &plan_path,
+        &sources,
+        &ApplyOptions {
+            dry_run,
+            skip_repack: false,
+            jobs: 1,
+            // Unused on a dry run (quarantine never executes); a real apply
+            // would resolve the configured store. Kept simple here.
+            quarantine_dir: data_dir.join("quarantine"),
+        },
+        &mut |event| {
+            if let ApplyEvent::OpStarted { op, .. } = event {
+                *by_kind.entry(op.verb.to_string()).or_default() += 1;
+            }
+        },
+    )?;
+
+    Ok(Some(ApplyReport {
+        stale,
+        disk_ok,
+        disk_detail,
+        total_ops,
+        pending,
+        by_kind,
+        dry_run,
+        succeeded: outcome.success_count,
+        failed: outcome.error_count,
     }))
 }
 
@@ -392,5 +483,47 @@ mod tests {
         let db = Database::open_in_memory().unwrap();
         let tmp = tempfile::tempdir().unwrap();
         assert!(pending_work(db.conn(), tmp.path()).unwrap().is_none());
+    }
+
+    #[test]
+    fn apply_dry_run_reports_the_plan_without_mutating() {
+        let db = Database::open_in_memory().unwrap();
+        let conn = db.conn();
+        let tmp = tempfile::tempdir().unwrap();
+        let plans = tmp.path().join("objects/plans");
+        std::fs::create_dir_all(&plans).unwrap();
+
+        let mut plan = crate::plan::Plan::new(compute_state_hash(conn).unwrap());
+        let dest = tmp.path().join("a.rom");
+        plan.add_copy(
+            crate::plan::SourceRef {
+                path: "/staging/a.rom".into(),
+                archive_path: None,
+                sha1: "AAA".into(),
+                entry_name: None,
+            },
+            dest.to_string_lossy().into_owned(),
+            10,
+        );
+        plan.add_delete("/staging/b.rom".into());
+        std::fs::write(plans.join("p.json"), serde_json::to_string(&plan).unwrap()).unwrap();
+
+        let report = apply(conn, tmp.path(), true).unwrap().expect("a plan");
+        assert!(report.dry_run);
+        assert!(!report.stale, "plan hash matches the (empty) catalogue");
+        assert_eq!(report.total_ops, 2);
+        assert_eq!(report.pending, 2);
+        // Tallied from the engine's own progress events.
+        assert_eq!(report.by_kind.get("COPY"), Some(&1));
+        assert_eq!(report.by_kind.get("DELETE"), Some(&1));
+        assert_eq!(report.failed, 0);
+        assert!(!dest.exists(), "a dry run mutates nothing");
+    }
+
+    #[test]
+    fn apply_is_none_without_a_plan() {
+        let db = Database::open_in_memory().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(apply(db.conn(), tmp.path(), true).unwrap().is_none());
     }
 }
