@@ -600,14 +600,16 @@ pub fn generate_plan_filtered(conn: &Connection, opts: &PlanOptions) -> Result<P
                     // kept copy preserves the bytes. In copy mode, or for shared
                     // content, leave it be: a copy run must not remove source files,
                     // and a shared copy may be needed by another destination.
-                    // Delete a redundant loose copy only when its source is
-                    // consume — a preserve source never loses content here.
+                    // Delete a redundant loose copy when its source allows losing
+                    // it given the kept canonical survives at `dest`: a consume
+                    // source always, a preserve source only when `dest` is within
+                    // its own tree (intra-tree dedup — content stays in the tree).
                     if !shared_here {
                         for (i, m) in copies.iter().enumerate() {
                             if Some(i) == keep || m.archive_path.is_some() {
                                 continue;
                             }
-                            if !may_delete_source(&dispositions, &m.source_root) {
+                            if !may_delete(&dispositions, &m.source_root, &dest) {
                                 continue;
                             }
                             let path = format!("{}/{}", m.source_root, m.source_path);
@@ -766,9 +768,12 @@ pub fn generate_plan_filtered(conn: &Connection, opts: &PlanOptions) -> Result<P
                             .sum();
                         bytes += size;
                         // Delete the loose sources the repack consumes only when
-                        // every container feeding it is consume — a preserve source
-                        // is never emptied — and the content isn't shared (a shared
-                        // source may feed another game's archive too).
+                        // every feeder allows losing its loose copy given the
+                        // archive at `dest` survives: a consume feeder always, a
+                        // preserve feeder only when `dest` is in its own tree
+                        // (loose→archive consolidation within the tree). The
+                        // content must not be shared (a shared source may feed
+                        // another game's archive too).
                         let feeders: Vec<&str> = match &build_from {
                             Some(p) => containers[p]
                                 .iter()
@@ -781,7 +786,7 @@ pub fn generate_plan_filtered(conn: &Connection, opts: &PlanOptions) -> Result<P
                                 .collect(),
                         };
                         let consume_feeders = !feeders.is_empty()
-                            && feeders.iter().all(|r| may_delete_source(&dispositions, r));
+                            && feeders.iter().all(|r| may_delete(&dispositions, r, &dest));
                         plan.add_repack(
                             sources,
                             dest.clone(),
@@ -808,8 +813,11 @@ pub fn generate_plan_filtered(conn: &Connection, opts: &PlanOptions) -> Result<P
                             {
                                 continue;
                             }
-                            // Only a consume container is deleted as a duplicate.
-                            if !may_delete_source(&dispositions, &entries[0].source_root) {
+                            // Delete a duplicate container when its source allows
+                            // losing it given the canonical at `dest` survives: a
+                            // consume source always, a preserve source only when
+                            // `dest` is within its own tree.
+                            if !may_delete(&dispositions, &entries[0].source_root, &dest) {
                                 continue;
                             }
                             plan.add_delete(path.clone());
@@ -1193,15 +1201,26 @@ fn may_move(dispositions: &HashMap<String, Disposition>, source_root: &str, dest
     }
 }
 
-/// May a source file at `source_root` be *deleted* (as a redundant duplicate)?
-/// Only a `consume` source — a `preserve` source never loses content here.
-/// (Intra-tree dedup of a `preserve` tree, where a copy survives in the same
-/// tree, is deliberately deferred to the delete-rule work; see the decision.)
-fn may_delete_source(dispositions: &HashMap<String, Disposition>, source_root: &str) -> bool {
-    matches!(
-        disposition_of(dispositions, source_root),
-        Disposition::Consume
-    )
+/// May a file read from `source_root` be *deleted* as redundant, given a copy of
+/// its content survives at `survivor_dest`? A `consume` source may always be
+/// emptied — content is allowed to leave the tree. A `preserve` source may drop
+/// the file only when the survivor stays **within its own tree**: that covers
+/// intra-tree dedup and loose→archive consolidation (the archive at `dest` holds
+/// the content in-tree), while still refusing to lose content to another tree.
+///
+/// This is the same in-tree condition as [`may_move`] — deleting a duplicate
+/// whose survivor lands at `dest` is safe exactly when moving the content there
+/// would be — but it is kept distinct to state the delete intent at each site.
+/// See `decisions/source-disposition.md` (the delete rule).
+fn may_delete(
+    dispositions: &HashMap<String, Disposition>,
+    source_root: &str,
+    survivor_dest: &str,
+) -> bool {
+    match disposition_of(dispositions, source_root) {
+        Disposition::Consume => true,
+        Disposition::Preserve => dest_under(source_root, survivor_dest),
+    }
 }
 
 fn plan_disk_matches(
@@ -1254,13 +1273,15 @@ fn plan_disk_matches(
             }
         };
 
-        // Delete a redundant loose copy only when its source is consume.
+        // Delete a redundant loose copy when its source allows losing it given
+        // the kept canonical survives at `dest`: a consume source always, a
+        // preserve source only when `dest` is within its own tree.
         if !shared_here {
             for (i, m) in copies.iter().enumerate() {
                 if Some(i) == keep || m.archive_path.is_some() {
                     continue;
                 }
-                if !may_delete_source(dispositions, &m.source_root) {
+                if !may_delete(dispositions, &m.source_root, &dest) {
                     continue;
                 }
                 let path = format!("{}/{}", m.source_root, m.source_path);
@@ -2273,6 +2294,76 @@ mod tests {
             })
             .collect();
         assert_eq!(deleted, vec!["/lib/ToSort/SET/Sys/Game.zip".to_string()]);
+    }
+
+    #[test]
+    fn preserve_loose_is_consolidated_into_an_archive_in_the_same_tree() {
+        let db = setup_db();
+        let conn = db.conn();
+        let coll = collections::create_collection(conn, "Lib Coll", "tosec").unwrap();
+        let vid = collections::add_version(conn, coll, "v1", "/dats/l.dat", true).unwrap();
+        let node = dats::create_node(conn, vid, None, "Lib Coll", "dat", "SET/Sys").unwrap();
+        let game = dats::create_game(conn, node, "Game", None, None, false, false, false).unwrap();
+        dats::create_rom(
+            conn,
+            game,
+            "game.rom",
+            10,
+            Some("AAA"),
+            None,
+            None,
+            "good",
+            None,
+        )
+        .unwrap();
+        conn.execute("INSERT INTO files (sha1, size) VALUES ('AAA', 10)", [])
+            .unwrap();
+
+        // The library destination is itself a preserve source, and the loose ROM
+        // already lives inside it. Consolidating it into Game.zip keeps the content
+        // in the same tree, so the loose original may be consumed.
+        conn.execute(
+            "INSERT INTO sources (id, path, case_sensitive, disposition)
+             VALUES (101, '/lib/ROMs/SET/Sys', 0, 'preserve')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO file_locations (sha1, source_id, path, archive_path)
+             VALUES ('AAA', 101, 'game.rom', NULL)",
+            [],
+        )
+        .unwrap();
+        db_config::set_output_format(conn, "SET", "zip").unwrap();
+
+        let plan = generate_plan_filtered(
+            conn,
+            &PlanOptions {
+                default_dest: Some("/lib/ROMs".to_string()),
+                default_format: OutputFormat::Loose, // overridden to zip per-set
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        // One repack builds the canonical Game.zip, and because the archive lands
+        // in the same preserve tree, it consumes the loose source (move_sources) —
+        // the loose original is not left behind. No separate delete is emitted.
+        assert_eq!(plan.summary.repack_count, 1, "the loose ROM is archived");
+        assert_eq!(
+            plan.summary.delete_count, 0,
+            "consumed by the repack, not deleted"
+        );
+        let consumes_loose = plan.operations.iter().any(|op| {
+            matches!(
+                &op.kind,
+                OperationKind::Repack { move_sources: true, dest, .. } if dest.ends_with("Game.zip")
+            )
+        });
+        assert!(
+            consumes_loose,
+            "loose→archive consolidation within a preserve tree consumes the loose source"
+        );
     }
 
     #[test]
