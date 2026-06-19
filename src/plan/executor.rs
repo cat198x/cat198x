@@ -518,6 +518,14 @@ pub struct RepackOutcome {
     pub result: Result<Vec<(String, String)>>,
 }
 
+/// What a repack worker reports — mirrors [`PlacementEvent`]. `Started` fires when
+/// a worker picks a job (carrying its `slot`), `Finished` when it completes, so a
+/// caller can show repacks in the same per-worker slot lanes as placements.
+pub enum RepackEvent {
+    Started { slot: usize, plan_index: usize },
+    Finished { slot: usize, outcome: RepackOutcome },
+}
+
 /// Execute a batch of repacks concurrently on a bounded pool of worker threads.
 ///
 /// A repack is latency-bound over a network mount (read entries + recompress +
@@ -525,10 +533,11 @@ pub struct RepackOutcome {
 /// waits. Workers perform **file operations only** — each job runs the same
 /// audited `execute_repack` as the serial path, including per-entry SHA-1
 /// verification and move-mode delete-after-verify. Everything stateful stays
-/// with the caller: `on_complete` is invoked on the calling thread, one outcome
-/// at a time, as jobs finish — so the rollback journal, the plan status, and
-/// the (non-`Sync`) catalogue connection are mutated serially exactly as in
-/// serial execution, just in completion order rather than plan order.
+/// with the caller: `on_event` is invoked on the calling thread, one event at a
+/// time, so the rollback journal, the plan status, and the (non-`Sync`)
+/// catalogue connection are mutated serially. Each job reports a
+/// [`RepackEvent::Started`] (with the worker's `slot`) and a
+/// [`RepackEvent::Finished`].
 ///
 /// Safe to run jobs concurrently because the planner guarantees disjointness:
 /// each game repacks to its own destination archive, and a loose source shared
@@ -537,7 +546,7 @@ pub struct RepackOutcome {
 pub fn execute_repacks_concurrent(
     jobs: Vec<RepackJob>,
     workers: usize,
-    mut on_complete: impl FnMut(RepackOutcome),
+    mut on_event: impl FnMut(RepackEvent),
 ) {
     if jobs.is_empty() {
         return;
@@ -547,7 +556,8 @@ pub fn execute_repacks_concurrent(
     let (tx, rx) = std::sync::mpsc::channel();
 
     std::thread::scope(|s| {
-        for _ in 0..workers {
+        // Each worker owns a stable `slot`, the lane a live display tracks it by.
+        for slot in 0..workers {
             let tx = tx.clone();
             let queue = &queue;
             s.spawn(move || {
@@ -557,18 +567,33 @@ pub fn execute_repacks_concurrent(
                     // keep draining rather than abandoning the batch.
                     let job = queue.lock().unwrap_or_else(|p| p.into_inner()).next();
                     let Some(job) = job else { break };
+                    if tx
+                        .send(RepackEvent::Started {
+                            slot,
+                            plan_index: job.plan_index,
+                        })
+                        .is_err()
+                    {
+                        break; // receiver gone; nothing left to report to
+                    }
                     let result =
                         execute_repack(&job.sources, &job.dest, &job.format, job.move_sources);
-                    if tx.send(RepackOutcome { job, result }).is_err() {
-                        break; // receiver gone; nothing left to report to
+                    if tx
+                        .send(RepackEvent::Finished {
+                            slot,
+                            outcome: RepackOutcome { job, result },
+                        })
+                        .is_err()
+                    {
+                        break;
                     }
                 }
             });
         }
         drop(tx); // workers hold the remaining senders; rx ends when they finish
 
-        for outcome in rx {
-            on_complete(outcome);
+        for event in rx {
+            on_event(event);
         }
     });
 }
@@ -1808,12 +1833,20 @@ mod tests {
         // runs on the calling thread, the property apply relies on to keep the
         // journal and catalogue updates serial.
         let mut seen = Vec::new();
-        execute_repacks_concurrent(jobs, 4, |outcome| {
-            assert!(outcome.result.is_ok(), "{:?}", outcome.result.err());
-            seen.push(outcome.job.plan_index);
+        let mut started = 0;
+        execute_repacks_concurrent(jobs, 4, |event| match event {
+            RepackEvent::Started { slot, .. } => {
+                assert!(slot < 4);
+                started += 1;
+            }
+            RepackEvent::Finished { outcome, .. } => {
+                assert!(outcome.result.is_ok(), "{:?}", outcome.result.err());
+                seen.push(outcome.job.plan_index);
+            }
         });
 
         seen.sort_unstable();
+        assert_eq!(started, 10, "every job started once");
         assert_eq!(seen, (0..10).collect::<Vec<_>>(), "every job reported once");
         for dest in dests {
             assert!(Path::new(&dest).exists(), "archive built: {dest}");
@@ -1858,8 +1891,10 @@ mod tests {
         let bad_dest = jobs[1].dest.clone();
 
         let mut outcomes: Vec<(usize, bool)> = Vec::new();
-        execute_repacks_concurrent(jobs, 2, |o| {
-            outcomes.push((o.job.plan_index, o.result.is_ok()));
+        execute_repacks_concurrent(jobs, 2, |event| {
+            if let RepackEvent::Finished { outcome, .. } = event {
+                outcomes.push((outcome.job.plan_index, outcome.result.is_ok()));
+            }
         });
         outcomes.sort_unstable();
 

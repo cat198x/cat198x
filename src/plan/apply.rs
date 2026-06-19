@@ -21,9 +21,10 @@ use rusqlite::Connection;
 use crate::db::files::{self, Source};
 use crate::db::quarantine::QuarantineReason;
 use crate::plan::executor::{
-    PlacementEvent, PlacementJob, PlacementKind, PlacementOutcome, RepackJob, RepackOutcome,
-    delete_has_surviving_copy, execute_copy, execute_move, execute_placements_concurrent,
-    execute_quarantine, execute_relocate, execute_repacks_concurrent,
+    PlacementEvent, PlacementJob, PlacementKind, PlacementOutcome, RepackEvent, RepackJob,
+    RepackOutcome, delete_has_surviving_copy, execute_copy, execute_move,
+    execute_placements_concurrent, execute_quarantine, execute_relocate,
+    execute_repacks_concurrent,
 };
 use crate::plan::{OperationKind, OperationLog, OperationStatus, Plan};
 
@@ -719,77 +720,81 @@ fn flush_repack_batch(
         });
     }
 
-    execute_repacks_concurrent(jobs, workers, |outcome: RepackOutcome| {
-        let RepackOutcome { job, result } = outcome;
-        // Repacks report on completion (no separate slot lane); the caller treats
-        // a slotless OpStarted as an op that completes as it is announced.
-        on_event(ApplyEvent::OpStarted {
-            index: job.plan_index,
-            total: total_ops,
-            slot: None,
-            op: OpView {
-                verb: "REPACK",
-                from: job.dest.clone(),
-                to: None,
-                file_count: Some(job.sources.len()),
-                bytes: job.size,
-            },
-        });
+    // A repack op view (verb/paths/size), from a plan index or a job.
+    let repack_view = |sources_len: usize, dest: &str, size: u64| OpView {
+        verb: "REPACK",
+        from: dest.to_string(),
+        to: None,
+        file_count: Some(sources_len),
+        bytes: size,
+    };
 
-        // Log the operation. A move-mode repack reports the loose sources it
-        // consumed so the reverse can extract them back out.
-        if let Some(log) = op_log {
-            let source_paths: Vec<String> = job.sources.iter().map(|s| s.path.clone()).collect();
-            let consumed = result.as_deref().unwrap_or(&[]);
-            log.log_repack(
-                job.operation_id,
-                &source_paths,
-                &job.dest,
-                consumed,
-                result.is_ok(),
-            );
+    execute_repacks_concurrent(jobs, workers, |event| match event {
+        // A worker picked up a repack: surface it in that worker's slot.
+        RepackEvent::Started { slot, plan_index } => {
+            let job_view = OpView::of(&plan.operations[plan_index].kind);
+            on_event(ApplyEvent::OpStarted {
+                index: plan_index,
+                total: total_ops,
+                slot: Some(slot),
+                op: job_view,
+            });
         }
+        // A repack finished: journal it, update status + catalogue, free the slot.
+        RepackEvent::Finished { slot, outcome } => {
+            let RepackOutcome { job, result } = outcome;
+            let view = repack_view(job.sources.len(), &job.dest, job.size);
 
-        let mut detail = None;
-        let op = &mut plan.operations[job.plan_index];
-        match result {
-            Ok(_) => {
-                op.status = OperationStatus::Completed;
-                *success_count += 1;
+            // Log the operation. A move-mode repack reports the loose sources it
+            // consumed so the reverse can extract them back out.
+            if let Some(log) = op_log {
+                let source_paths: Vec<String> =
+                    job.sources.iter().map(|s| s.path.clone()).collect();
+                let consumed = result.as_deref().unwrap_or(&[]);
+                log.log_repack(
+                    job.operation_id,
+                    &source_paths,
+                    &job.dest,
+                    consumed,
+                    result.is_ok(),
+                );
+            }
 
-                // Keep the catalogue in step, as the serial path does per-op.
-                if let Err(e) = sync_catalogue_after(conn, sources, &op.kind) {
-                    on_event(ApplyEvent::CatalogueWarning {
-                        op_id: op.id,
-                        message: e.to_string(),
+            let mut detail = None;
+            let op = &mut plan.operations[job.plan_index];
+            match result {
+                Ok(_) => {
+                    op.status = OperationStatus::Completed;
+                    *success_count += 1;
+
+                    // Keep the catalogue in step, as the serial path does per-op.
+                    if let Err(e) = sync_catalogue_after(conn, sources, &op.kind) {
+                        on_event(ApplyEvent::CatalogueWarning {
+                            op_id: op.id,
+                            message: e.to_string(),
+                        });
+                    }
+                }
+                Err(e) => {
+                    let message = format!("{e:#}");
+                    on_event(ApplyEvent::OpFailed {
+                        index: job.plan_index,
+                        message: message.clone(),
                     });
+                    detail = Some(message);
+                    op.status = OperationStatus::Failed;
+                    *error_count += 1;
                 }
             }
-            Err(e) => {
-                let message = format!("{e:#}");
-                on_event(ApplyEvent::OpFailed {
-                    index: job.plan_index,
-                    message: message.clone(),
-                });
-                detail = Some(message);
-                op.status = OperationStatus::Failed;
-                *error_count += 1;
-            }
-        }
 
-        on_event(ApplyEvent::OpFinished {
-            index: job.plan_index,
-            slot: None,
-            op: OpView {
-                verb: "REPACK",
-                from: job.dest.clone(),
-                to: None,
-                file_count: Some(job.sources.len()),
-                bytes: job.size,
-            },
-            status: op.status,
-            detail,
-        });
+            on_event(ApplyEvent::OpFinished {
+                index: job.plan_index,
+                slot: Some(slot),
+                op: view,
+                status: op.status,
+                detail,
+            });
+        }
     });
 }
 
