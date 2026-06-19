@@ -441,7 +441,11 @@ pub fn apply_streaming(
         &ApplyOptions {
             dry_run: opts.dry_run,
             skip_repack: false,
-            jobs: 1,
+            // Placements and repacks are latency-bound over a network mount, so a
+            // handful of workers overlaps the round-trips (see
+            // decisions/concurrent-apply.md). The library destination is one
+            // volume, so this is bounded by the mount, not the CPU.
+            jobs: 6,
             quarantine_dir,
         },
         &mut |event| {
