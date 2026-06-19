@@ -27,6 +27,14 @@ function shortPath(p) {
   return segs.length <= 3 ? p : "…/" + segs.slice(-3).join("/");
 }
 
+// Shorten the kept-copy path inside a dedup reason ("exact duplicate — kept …")
+// so its filename tail stays visible where a line would otherwise ellipsis it.
+function fmtReason(reason) {
+  if (!reason) return "";
+  const i = reason.indexOf("kept ");
+  return i < 0 ? reason : reason.slice(0, i + 5) + shortPath(reason.slice(i + 5));
+}
+
 function el(tag, attrs = {}, ...children) {
   const node = document.createElement(tag);
   for (const [k, v] of Object.entries(attrs)) {
@@ -392,7 +400,12 @@ function opPaths(kind) {
         el("span", { class: "to" }, `  →  ${kind.dest} [${kind.format}]`)
       );
     case "delete":
-      return el("div", { class: "paths" }, kind.path);
+      return el(
+        "div",
+        { class: "paths" },
+        kind.path,
+        kind.reason ? el("span", { class: "to" }, "  —  " + fmtReason(kind.reason)) : null
+      );
     case "quarantine":
       return el("div", { class: "paths" }, kind.path, el("span", { class: "to" }, "  →  quarantine"));
     default:
@@ -485,10 +498,12 @@ async function streamApply(body, command, startLabel) {
     return to ? `${verb} ${shortPath(from)} → ${shortPath(to)}${size}` : `${verb} ${shortPath(from)}${size}`;
   };
   const ICON = { ok: "✓", failed: "✗", refused: "⚠" };
-  const appendLog = (outcome, verb, from, to, detail) => {
+  // A failure/refusal shows its detail; an otherwise-safe op (a dedup delete)
+  // shows its reason — what survives it — so a mass delete reads as reassuring.
+  const appendLog = (outcome, verb, from, to, detail, reason) => {
     const atBottom = logEl.scrollTop + logEl.clientHeight >= logEl.scrollHeight - 4;
-    const text =
-      `${ICON[outcome] || "·"} ${opText(verb, from, to, 0)}` + (detail ? `  —  ${detail}` : "");
+    const note = detail || (reason ? fmtReason(reason) : "");
+    const text = `${ICON[outcome] || "·"} ${opText(verb, from, to, 0)}` + (note ? `  —  ${note}` : "");
     logEl.append(el("div", { class: `log-line ${outcome}` }, text));
     while (logEl.childElementCount > MAX_LOG) logEl.firstElementChild.remove();
     if (atBottom) logEl.scrollTop = logEl.scrollHeight; // follow the tail
@@ -503,7 +518,7 @@ async function streamApply(body, command, startLabel) {
 
   stop(); // drop any listener from a previous run
   applyUnlisten = await window.__TAURI__.event.listen("apply-progress", (e) => {
-    const { done, total, jobs, slot, finished, verb, from, to, bytes, bytes_done, bytes_total, outcome, detail } =
+    const { done, total, jobs, slot, finished, verb, from, to, bytes, bytes_done, bytes_total, outcome, detail, reason } =
       e.payload;
     ensureSlots(jobs);
 
@@ -528,7 +543,7 @@ async function streamApply(body, command, startLabel) {
     }
 
     // A terminal result (ok/failed/refused) also goes to the log.
-    if (outcome) appendLog(outcome, verb, from, to, detail);
+    if (outcome) appendLog(outcome, verb, from, to, detail, reason);
   });
   try {
     return await invoke(command);

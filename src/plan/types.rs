@@ -139,8 +139,15 @@ pub enum OperationKind {
         #[serde(default)]
         move_sources: bool,
     },
-    /// Delete a file
-    Delete { path: String },
+    /// Delete a file. `reason` records *why* it is safe to remove — for a dedup
+    /// delete, the canonical copy that survives it ("exact duplicate — kept …") —
+    /// so the plan can be reviewed and the live log can show it. Defaults to empty
+    /// for plans written before the field existed.
+    Delete {
+        path: String,
+        #[serde(default)]
+        reason: String,
+    },
     /// Move a file to quarantine (instead of deleting)
     Quarantine {
         path: String,
@@ -271,13 +278,14 @@ impl Plan {
 
     /// Add a delete operation: remove a redundant file outright. Used to drop an
     /// exact-content duplicate whose bytes are preserved by the canonical copy
-    /// kept elsewhere, so nothing unique is lost.
-    pub fn add_delete(&mut self, path: String) {
+    /// kept elsewhere, so nothing unique is lost. `reason` records that "why"
+    /// (e.g. the surviving copy) for review and the live log.
+    pub fn add_delete(&mut self, path: String, reason: String) {
         let id = self.operations.len() as u64;
         self.operations.push(Operation {
             id,
             status: OperationStatus::Pending,
-            kind: OperationKind::Delete { path },
+            kind: OperationKind::Delete { path, reason },
         });
         self.summary.delete_count += 1;
     }
