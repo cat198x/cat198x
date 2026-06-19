@@ -59,11 +59,12 @@ pub fn run(
         return Ok(());
     }
 
-    // Check if plan has any pending operations
+    // Remaining work is fresh pending ops plus retryable failed ones, so a
+    // re-apply after a dropped mount picks up where it left off.
     let pending_count = plan
         .operations
         .iter()
-        .filter(|op| op.status == OperationStatus::Pending)
+        .filter(|op| op.status.is_remaining_work())
         .count();
 
     if pending_count == 0 {
@@ -131,14 +132,28 @@ pub fn run(
     }
 
     println!();
-    println!(
+    print!(
         "Complete: {} succeeded, {} failed",
         outcome.success_count, outcome.error_count
     );
+    if outcome.refused_count > 0 {
+        print!(", {} refused (safety)", outcome.refused_count);
+    }
+    println!();
 
     if outcome.error_count > 0 {
         println!();
-        println!("Some operations failed. Run 'cat198x apply' again to retry.");
+        println!(
+            "Some operations failed (e.g. a dropped mount). Run 'cat198x apply' again to retry them."
+        );
+    }
+    if outcome.refused_count > 0 {
+        println!();
+        println!(
+            "{} operation(s) were refused by the safety net and will not be retried; \
+             regenerate the plan with 'cat198x plan' if the catalogue has since changed.",
+            outcome.refused_count
+        );
     }
 
     // Self-clean: with --prune-empty, remove the directories the move-tidy left

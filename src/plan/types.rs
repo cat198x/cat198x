@@ -67,7 +67,14 @@ pub struct Operation {
     pub kind: OperationKind,
 }
 
-/// Status of an operation
+/// Status of an operation.
+///
+/// `Failed` is **retryable** — a later `apply` re-attempts it, so a transient I/O
+/// error (a dropped network mount mid-run) recovers by running `apply` again.
+/// `Refused` is **sticky** — a safety check (verify-before-delete) declined the
+/// operation, and re-running must not blindly retry it; it stays put until the
+/// plan is regenerated. `Completed` and `Refused` are the terminal states a
+/// re-apply skips; `Pending` and `Failed` are the work it still does.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum OperationStatus {
@@ -75,7 +82,18 @@ pub enum OperationStatus {
     InProgress,
     Completed,
     Failed,
+    /// A safety check declined the operation (e.g. no surviving copy to make a
+    /// delete safe). Sticky: a re-apply does not retry it.
+    Refused,
     Skipped,
+}
+
+impl OperationStatus {
+    /// Whether a re-apply should (re-)attempt this operation. `Pending` work and
+    /// retryable `Failed` ops are run; `Completed`/`Refused`/`Skipped` are not.
+    pub fn is_remaining_work(self) -> bool {
+        matches!(self, OperationStatus::Pending | OperationStatus::Failed)
+    }
 }
 
 /// The type of operation to perform

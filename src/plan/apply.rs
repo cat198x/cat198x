@@ -85,7 +85,12 @@ pub enum ApplyEvent {
 /// The result of applying a plan.
 pub struct ApplyOutcome {
     pub success_count: usize,
+    /// Retryable failures (a later `apply` re-attempts these).
     pub error_count: usize,
+    /// Operations a safety check declined — sticky, not retried. Kept apart from
+    /// `error_count` so an adapter can tell "drove off a flaky mount, run again"
+    /// from "the safety net refused this and re-running won't change it".
+    pub refused_count: usize,
     /// Where the rollback journal was written (absent on a dry run).
     pub log_path: Option<PathBuf>,
 }
@@ -169,6 +174,7 @@ pub fn apply_plan(
 
     let mut success_count = 0;
     let mut error_count = 0;
+    let mut refused_count = 0;
 
     // Consecutive pending repacks accumulate here and run concurrently — they're
     // latency-bound over a network mount, so overlapping them is the wall-clock
@@ -179,8 +185,11 @@ pub fn apply_plan(
     for i in 0..plan.operations.len() {
         {
             let op = &plan.operations[i];
-            if op.status != OperationStatus::Pending {
-                continue; // Skip already completed or failed operations
+            // Skip completed and (sticky) refused operations. A retryable Failed
+            // op IS re-attempted, so a run interrupted by a dropped mount recovers
+            // by applying again — the whole point of issue #47.
+            if !op.status.is_remaining_work() {
+                continue;
             }
 
             if let OperationKind::Repack {
@@ -351,8 +360,10 @@ pub fn apply_plan(
                             index: i,
                             path: path.clone(),
                         });
-                        op.status = OperationStatus::Failed;
-                        error_count += 1;
+                        // Sticky: the safety net declined this delete. Re-running
+                        // must not retry it blindly — only a fresh plan should.
+                        op.status = OperationStatus::Refused;
+                        refused_count += 1;
                         continue;
                     }
                     Err(e) => {
@@ -360,8 +371,8 @@ pub fn apply_plan(
                             index: i,
                             message: format!("{e:#}"),
                         });
-                        op.status = OperationStatus::Failed;
-                        error_count += 1;
+                        op.status = OperationStatus::Refused;
+                        refused_count += 1;
                         continue;
                     }
                 }
@@ -484,6 +495,7 @@ pub fn apply_plan(
     Ok(ApplyOutcome {
         success_count,
         error_count,
+        refused_count,
         log_path,
     })
 }
@@ -760,5 +772,121 @@ mod tests {
         assert_eq!(plan.operations[0].status, OperationStatus::Completed);
         assert!(outcome.log_path.unwrap().exists(), "journal written");
         assert!(plan_path.exists(), "updated plan written");
+    }
+
+    // Issue #47: an op that fails from a transient I/O error (here, a source not
+    // yet present — as when a mount drops mid-run) is `Failed`, and a later apply
+    // re-attempts it. Once the source is readable, the retry completes it.
+    #[test]
+    fn a_failed_op_is_retried_on_a_later_apply() {
+        let db = Database::open_in_memory().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let plans_dir = tmp.path().join("objects/plans");
+        std::fs::create_dir_all(&plans_dir).unwrap();
+        let plan_path = plans_dir.join("plan.json");
+
+        let src = tmp.path().join("in.bin");
+        let dest = tmp.path().join("lib/out.bin");
+        let mut plan = Plan::new("statehash".to_string());
+        // sha1("hello"); the source does not exist yet.
+        plan.add_move(
+            loose(
+                src.to_str().unwrap(),
+                "aaf4c61ddcc5e8a2dabede0f3b482cd9aea9434d",
+            ),
+            dest.to_string_lossy().into_owned(),
+            5,
+        );
+
+        // First apply: source missing → the op fails, but retryably.
+        let first = apply_plan(
+            db.conn(),
+            &mut plan,
+            &plan_path,
+            &[],
+            &opts(false, tmp.path().join("q")),
+            &mut |_| {},
+        )
+        .unwrap();
+        assert_eq!(first.error_count, 1);
+        assert_eq!(first.refused_count, 0, "an I/O failure is not a refusal");
+        assert_eq!(plan.operations[0].status, OperationStatus::Failed);
+        assert!(!dest.exists());
+
+        // The source appears (mount back); a second apply retries the Failed op.
+        std::fs::write(&src, b"hello").unwrap();
+        let second = apply_plan(
+            db.conn(),
+            &mut plan,
+            &plan_path,
+            &[],
+            &opts(false, tmp.path().join("q")),
+            &mut |_| {},
+        )
+        .unwrap();
+        assert_eq!(
+            second.success_count, 1,
+            "the failed op is retried and completes"
+        );
+        assert_eq!(plan.operations[0].status, OperationStatus::Completed);
+        assert_eq!(std::fs::read(&dest).unwrap(), b"hello");
+    }
+
+    // A delete the safety net refuses is `Refused` (sticky): a later apply skips
+    // it rather than blindly retrying — only regenerating the plan should revisit.
+    #[test]
+    fn a_refused_delete_is_sticky_and_not_retried() {
+        use crate::db::files::{add_source, list_sources};
+
+        let db = Database::open_in_memory().unwrap();
+        let conn = db.conn();
+        let tmp = tempfile::tempdir().unwrap();
+        let plans_dir = tmp.path().join("objects/plans");
+        std::fs::create_dir_all(&plans_dir).unwrap();
+        let plan_path = plans_dir.join("plan.json");
+
+        // A registered source holding an uncatalogued file — a delete of it can't
+        // be proven safe (no known surviving copy), so it's refused.
+        let root = tmp.path().to_str().unwrap();
+        add_source(conn, root, false).unwrap();
+        let victim = tmp.path().join("orphan.bin");
+        std::fs::write(&victim, b"data").unwrap();
+        let sources = list_sources(conn).unwrap();
+
+        let mut plan = Plan::new("statehash".to_string());
+        plan.add_delete(victim.to_string_lossy().into_owned());
+
+        let first = apply_plan(
+            conn,
+            &mut plan,
+            &plan_path,
+            &sources,
+            &opts(false, tmp.path().join("q")),
+            &mut |_| {},
+        )
+        .unwrap();
+        assert_eq!(first.refused_count, 1, "uncatalogued delete is refused");
+        assert_eq!(first.error_count, 0, "a refusal is not a retryable failure");
+        assert_eq!(plan.operations[0].status, OperationStatus::Refused);
+        assert!(victim.exists(), "refused → nothing deleted");
+
+        // A second apply skips the sticky Refused op entirely.
+        let second = apply_plan(
+            conn,
+            &mut plan,
+            &plan_path,
+            &sources,
+            &opts(false, tmp.path().join("q")),
+            &mut |_| {},
+        )
+        .unwrap();
+        assert_eq!(second.success_count, 0);
+        assert_eq!(second.error_count, 0);
+        assert_eq!(
+            second.refused_count, 0,
+            "the refused op was skipped, not re-evaluated"
+        );
+        assert_eq!(plan.operations[0].status, OperationStatus::Refused);
+        assert!(victim.exists());
     }
 }

@@ -638,17 +638,21 @@ function renderExecuteResult(body, r) {
   }
 
   const parts = [];
-  const clean = r.failed === 0;
+  const refused = r.refused_ops || 0;
+  const clean = r.failed === 0 && refused === 0;
   parts.push(
     el(
       "div",
       { class: clean ? "disk-ok" : "error" },
       `${r.succeeded.toLocaleString()} operation(s) applied` +
         (r.failed ? `, ${r.failed.toLocaleString()} failed` : "") +
+        (refused ? `, ${refused.toLocaleString()} refused (safety)` : "") +
         "."
     )
   );
 
+  // Retryable failures (e.g. a dropped mount) resume by re-running; refusals are
+  // sticky (the safety net declined them) and need a fresh plan, not a retry.
   if (r.failed > 0) {
     parts.push(
       el(
@@ -660,6 +664,14 @@ function renderExecuteResult(body, r) {
     const resume = el("button", { class: "apply-btn", type: "button" }, "Apply again to resume");
     resume.addEventListener("click", () => runExecute(body));
     parts.push(resume);
+  } else if (refused > 0) {
+    parts.push(
+      el(
+        "div",
+        { class: "muted", style: "margin-top:6px" },
+        `${refused.toLocaleString()} operation(s) were refused by the safety net and won't be retried. Regenerate the plan if the catalogue has changed.`
+      )
+    );
   } else {
     parts.push(
       el("div", { class: "muted", style: "margin-top:6px" }, "The library is now in place.")
