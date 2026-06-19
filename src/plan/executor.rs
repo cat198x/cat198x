@@ -573,6 +573,98 @@ pub fn execute_repacks_concurrent(
     });
 }
 
+/// One placement operation — a copy, move, or relocate — dispatched to a worker.
+#[derive(Debug, Clone)]
+pub struct PlacementJob {
+    /// Index of the operation in the plan, so the caller updates the right entry
+    /// when outcomes arrive out of order.
+    pub plan_index: usize,
+    /// The plan operation's id, for the rollback journal.
+    pub operation_id: u64,
+    pub kind: PlacementKind,
+}
+
+/// The three placement operations a worker can run. Each carries exactly what its
+/// audited executor needs — no catalogue, so it is safe off the calling thread.
+#[derive(Debug, Clone)]
+pub enum PlacementKind {
+    Copy { source: SourceRef, dest: String },
+    Move { source: SourceRef, dest: String },
+    Relocate { source: String, dest: String },
+}
+
+/// The result of one concurrent placement, delivered to the completion callback.
+pub struct PlacementOutcome {
+    pub job: PlacementJob,
+    pub result: Result<()>,
+}
+
+/// Execute a batch of placements (copy / move / relocate) concurrently on a
+/// bounded pool of worker threads — the same contract as
+/// [`execute_repacks_concurrent`], for the same reason: each placement is
+/// latency-bound over a network mount (read/extract + write + verify, each a
+/// round trip), so overlapping several hides the waits.
+///
+/// Workers perform **file operations only**, each running the same audited
+/// `execute_copy`/`execute_move`/`execute_relocate` as the serial path —
+/// including SHA-1 verification and (for a move) delete-after-verify. Everything
+/// stateful stays with the caller: `on_complete` runs on the calling thread, one
+/// outcome at a time as jobs finish, so the rollback journal, the plan status,
+/// and the non-`Sync` catalogue connection are all mutated serially, in
+/// completion order.
+///
+/// Safe to run concurrently because the planner guarantees the batch is disjoint:
+/// distinct content has distinct destinations, and content shared between entries
+/// is copied (never moved), so no job reads a file another job is deleting.
+pub fn execute_placements_concurrent(
+    jobs: Vec<PlacementJob>,
+    workers: usize,
+    mut on_complete: impl FnMut(PlacementOutcome),
+) {
+    if jobs.is_empty() {
+        return;
+    }
+    let workers = workers.clamp(1, jobs.len());
+    let queue = std::sync::Mutex::new(jobs.into_iter());
+    let (tx, rx) = std::sync::mpsc::channel();
+
+    std::thread::scope(|s| {
+        for _ in 0..workers {
+            let tx = tx.clone();
+            let queue = &queue;
+            s.spawn(move || {
+                loop {
+                    let job = queue.lock().unwrap_or_else(|p| p.into_inner()).next();
+                    let Some(job) = job else { break };
+                    let result = match &job.kind {
+                        PlacementKind::Copy { source, dest } => execute_copy(
+                            &source.path,
+                            source.archive_path.as_deref(),
+                            dest,
+                            &source.sha1,
+                        ),
+                        PlacementKind::Move { source, dest } => execute_move(
+                            &source.path,
+                            source.archive_path.as_deref(),
+                            dest,
+                            &source.sha1,
+                        ),
+                        PlacementKind::Relocate { source, dest } => execute_relocate(source, dest),
+                    };
+                    if tx.send(PlacementOutcome { job, result }).is_err() {
+                        break; // receiver gone; nothing left to report to
+                    }
+                }
+            });
+        }
+        drop(tx); // workers hold the remaining senders; rx ends when they finish
+
+        for outcome in rx {
+            on_complete(outcome);
+        }
+    });
+}
+
 /// The raw bytes of a source — read from disk for a loose file, or extracted
 /// from its inner archive entry.
 fn source_bytes(source: &SourceRef) -> Result<Vec<u8>> {
@@ -1742,6 +1834,72 @@ mod tests {
         assert_eq!(outcomes, vec![(0, true), (1, false)]);
         assert!(Path::new(&good_dest).exists());
         assert!(!Path::new(&bad_dest).exists());
+    }
+
+    #[test]
+    fn execute_placements_concurrent_runs_all_and_reports_each() {
+        use crate::plan::SourceRef;
+
+        let temp = TempDir::new().unwrap();
+        // sha1("cpu data") — every good copy verifies against this.
+        let sha = "76218C22675632AEF6A27578DD0A2C6471D995D5";
+
+        // Eight loose copies to distinct destinations, plus one whose expected
+        // hash is wrong so it fails verification — concurrency must not let one
+        // failure take the batch down, and every outcome must be reported once.
+        let mut jobs = Vec::new();
+        let mut good_dests = Vec::new();
+        for i in 0..8 {
+            let src = temp.path().join(format!("src-{i}.rom"));
+            fs::write(&src, b"cpu data").unwrap();
+            let dest = temp.path().join(format!("dst-{i}.rom"));
+            good_dests.push(dest.clone());
+            jobs.push(PlacementJob {
+                plan_index: i,
+                operation_id: i as u64,
+                kind: PlacementKind::Copy {
+                    source: SourceRef {
+                        path: src.to_str().unwrap().to_string(),
+                        archive_path: None,
+                        sha1: sha.to_string(),
+                        entry_name: None,
+                    },
+                    dest: dest.to_str().unwrap().to_string(),
+                },
+            });
+        }
+        let bad_src = temp.path().join("bad.rom");
+        fs::write(&bad_src, b"cpu data").unwrap();
+        let bad_dest = temp.path().join("bad-dst.rom");
+        jobs.push(PlacementJob {
+            plan_index: 8,
+            operation_id: 8,
+            kind: PlacementKind::Copy {
+                source: SourceRef {
+                    path: bad_src.to_str().unwrap().to_string(),
+                    archive_path: None,
+                    sha1: "0000000000000000000000000000000000000000".to_string(),
+                    entry_name: None,
+                },
+                dest: bad_dest.to_str().unwrap().to_string(),
+            },
+        });
+
+        let mut outcomes: Vec<(usize, bool)> = Vec::new();
+        execute_placements_concurrent(jobs, 4, |o| {
+            outcomes.push((o.job.plan_index, o.result.is_ok()));
+        });
+        outcomes.sort_unstable();
+
+        // Every job reported exactly once; the eight good copies landed, the bad
+        // one failed and wrote nothing.
+        assert_eq!(outcomes.len(), 9);
+        for (i, dest) in good_dests.iter().enumerate() {
+            assert_eq!(outcomes[i], (i, true));
+            assert_eq!(fs::read(dest).unwrap(), b"cpu data");
+        }
+        assert_eq!(outcomes[8], (8, false));
+        assert!(!bad_dest.exists());
     }
 
     #[test]
