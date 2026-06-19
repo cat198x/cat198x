@@ -21,7 +21,8 @@ use rusqlite::Connection;
 use crate::db::files::{self, Source};
 use crate::db::quarantine::QuarantineReason;
 use crate::plan::executor::{
-    RepackJob, RepackOutcome, delete_has_surviving_copy, execute_copy, execute_move,
+    PlacementJob, PlacementKind, PlacementOutcome, RepackJob, RepackOutcome,
+    delete_has_surviving_copy, execute_copy, execute_move, execute_placements_concurrent,
     execute_quarantine, execute_relocate, execute_repacks_concurrent,
 };
 use crate::plan::{OperationKind, OperationLog, OperationStatus, Plan};
@@ -176,10 +177,13 @@ pub fn apply_plan(
     let mut error_count = 0;
     let mut refused_count = 0;
 
-    // Consecutive pending repacks accumulate here and run concurrently — they're
-    // latency-bound over a network mount, so overlapping them is the wall-clock
-    // win. Any other pending operation flushes the batch first, so ordering
-    // between repacks and everything else is exactly serial apply's.
+    // Placement (copy/move/relocate) and repack operations accumulate here and
+    // run concurrently — both are latency-bound over a network mount, so
+    // overlapping them is the wall-clock win. A serial operation (delete /
+    // quarantine) flushes both batches first, so the one ordering that matters —
+    // a placement that creates a surviving copy lands before the delete that
+    // relies on it — is preserved exactly as serial apply's.
+    let mut placement_batch: Vec<PlacementJob> = Vec::new();
     let mut repack_batch: Vec<RepackJob> = Vec::new();
 
     for i in 0..plan.operations.len() {
@@ -192,37 +196,89 @@ pub fn apply_plan(
                 continue;
             }
 
-            if let OperationKind::Repack {
-                sources: repack_sources,
-                dest,
-                format,
-                move_sources,
-                size,
-            } = &op.kind
-            {
-                // Leave repacks pending for a later pass when deferred, so the
-                // cheap operations land first and the recompression can run
-                // separately.
-                if opts.skip_repack {
-                    continue;
-                }
-                if !opts.dry_run {
-                    repack_batch.push(RepackJob {
-                        plan_index: i,
-                        operation_id: op.id,
-                        sources: repack_sources.clone(),
-                        dest: dest.clone(),
-                        format: format.clone(),
-                        move_sources: *move_sources,
-                        size: *size,
-                    });
-                    continue;
+            // Deferred repacks stay pending for a later pass, in both dry and real
+            // runs, so the cheap operations land first.
+            if opts.skip_repack && matches!(op.kind, OperationKind::Repack { .. }) {
+                continue;
+            }
+
+            // A real run accumulates the parallelisable operations into their
+            // batches and runs them concurrently. (A dry run falls through to the
+            // serial path below, which tallies each op without touching disk.)
+            if !opts.dry_run {
+                match &op.kind {
+                    OperationKind::Repack {
+                        sources: repack_sources,
+                        dest,
+                        format,
+                        move_sources,
+                        size,
+                    } => {
+                        repack_batch.push(RepackJob {
+                            plan_index: i,
+                            operation_id: op.id,
+                            sources: repack_sources.clone(),
+                            dest: dest.clone(),
+                            format: format.clone(),
+                            move_sources: *move_sources,
+                            size: *size,
+                        });
+                        continue;
+                    }
+                    OperationKind::Copy { source, dest, .. } => {
+                        placement_batch.push(PlacementJob {
+                            plan_index: i,
+                            operation_id: op.id,
+                            kind: PlacementKind::Copy {
+                                source: source.clone(),
+                                dest: dest.clone(),
+                            },
+                        });
+                        continue;
+                    }
+                    OperationKind::Move { source, dest, .. } => {
+                        placement_batch.push(PlacementJob {
+                            plan_index: i,
+                            operation_id: op.id,
+                            kind: PlacementKind::Move {
+                                source: source.clone(),
+                                dest: dest.clone(),
+                            },
+                        });
+                        continue;
+                    }
+                    OperationKind::Relocate { source, dest, .. } => {
+                        placement_batch.push(PlacementJob {
+                            plan_index: i,
+                            operation_id: op.id,
+                            kind: PlacementKind::Relocate {
+                                source: source.clone(),
+                                dest: dest.clone(),
+                            },
+                        });
+                        continue;
+                    }
+                    // Delete / Quarantine are serial — they fall through.
+                    OperationKind::Delete { .. } | OperationKind::Quarantine { .. } => {}
                 }
             }
         }
 
-        // A non-repack operation: complete the batched repacks before it runs,
-        // preserving the plan's ordering between repacks and other operations.
+        // A serial operation (delete/quarantine, or any op on a dry run): complete
+        // both concurrent batches before it runs, so a placement that creates a
+        // surviving copy lands before the delete that depends on it.
+        flush_placement_batch(
+            &mut placement_batch,
+            opts.jobs,
+            plan,
+            &mut op_log,
+            conn,
+            sources,
+            total_ops,
+            &mut success_count,
+            &mut error_count,
+            on_event,
+        );
         flush_repack_batch(
             &mut repack_batch,
             opts.jobs,
@@ -461,7 +517,20 @@ pub fn apply_plan(
         }
     }
 
-    // Repacks at the tail of the plan (the common case) are still batched.
+    // Placements and repacks at the tail of the plan (the common case) are still
+    // batched — drain both.
+    flush_placement_batch(
+        &mut placement_batch,
+        opts.jobs,
+        plan,
+        &mut op_log,
+        conn,
+        sources,
+        total_ops,
+        &mut success_count,
+        &mut error_count,
+        on_event,
+    );
     flush_repack_batch(
         &mut repack_batch,
         opts.jobs,
@@ -498,6 +567,84 @@ pub fn apply_plan(
         refused_count,
         log_path,
     })
+}
+
+/// Execute the accumulated placement batch (copy/move/relocate) concurrently,
+/// then drain it.
+///
+/// The same shape as [`flush_repack_batch`]: workers do the file operations,
+/// while everything stateful — the rollback-journal entry, the plan status, the
+/// catalogue sync, and the progress event — happens here on the calling thread
+/// as each outcome streams in, in completion order. The non-`Sync` database
+/// connection never leaves this thread.
+#[allow(clippy::too_many_arguments)]
+fn flush_placement_batch(
+    batch: &mut Vec<PlacementJob>,
+    workers: usize,
+    plan: &mut Plan,
+    op_log: &mut Option<OperationLog>,
+    conn: &Connection,
+    sources: &[Source],
+    total_ops: usize,
+    success_count: &mut usize,
+    error_count: &mut usize,
+    on_event: &mut dyn FnMut(ApplyEvent),
+) {
+    if batch.is_empty() {
+        return;
+    }
+    let jobs = std::mem::take(batch);
+
+    execute_placements_concurrent(jobs, workers, |outcome: PlacementOutcome| {
+        let PlacementOutcome { job, result } = outcome;
+
+        // The op view (verb, paths, bytes) comes from the plan op itself, before
+        // the mutable borrow below, so the progress display matches serial apply.
+        on_event(ApplyEvent::OpStarted {
+            index: job.plan_index,
+            total: total_ops,
+            op: OpView::of(&plan.operations[job.plan_index].kind),
+        });
+
+        if let Some(log) = op_log {
+            let success = result.is_ok();
+            match &job.kind {
+                PlacementKind::Copy { source, dest } => {
+                    log.log_copy(job.operation_id, &source.path, dest, &source.sha1, success)
+                }
+                PlacementKind::Move { source, dest } => {
+                    log.log_move(job.operation_id, &source.path, dest, &source.sha1, success)
+                }
+                PlacementKind::Relocate { source, dest } => {
+                    log.log_relocate(job.operation_id, source, dest, success)
+                }
+            }
+        }
+
+        let op = &mut plan.operations[job.plan_index];
+        match result {
+            Ok(()) => {
+                op.status = OperationStatus::Completed;
+                *success_count += 1;
+
+                // Keep the catalogue in step, as the serial path does per-op.
+                if let Err(e) = sync_catalogue_after(conn, sources, &op.kind) {
+                    on_event(ApplyEvent::CatalogueWarning {
+                        op_id: op.id,
+                        message: e.to_string(),
+                    });
+                }
+            }
+            Err(e) => {
+                on_event(ApplyEvent::OpFailed {
+                    index: job.plan_index,
+                    message: format!("{e:#}"),
+                });
+                op.status = OperationStatus::Failed;
+                *error_count += 1;
+            }
+        }
+    });
 }
 
 /// Execute the accumulated repack batch concurrently, then drain it.
@@ -888,5 +1035,123 @@ mod tests {
         );
         assert_eq!(plan.operations[0].status, OperationStatus::Refused);
         assert!(victim.exists());
+    }
+
+    fn opts_jobs(jobs: usize, quarantine_dir: PathBuf) -> ApplyOptions {
+        ApplyOptions {
+            dry_run: false,
+            skip_repack: false,
+            jobs,
+            quarantine_dir,
+        }
+    }
+
+    // A batch of placements runs concurrently and every one lands, is journaled,
+    // and reports exactly one progress event — the worker pool integrated into
+    // apply_plan.
+    #[test]
+    fn concurrent_placements_all_complete_and_journal() {
+        let db = Database::open_in_memory().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let plans_dir = tmp.path().join("objects/plans");
+        std::fs::create_dir_all(&plans_dir).unwrap();
+        let plan_path = plans_dir.join("plan.json");
+
+        let mut plan = Plan::new("statehash".to_string());
+        let mut dests = Vec::new();
+        for i in 0..6 {
+            let src = tmp.path().join(format!("in-{i}.bin"));
+            std::fs::write(&src, b"hello").unwrap(); // sha1 aaf4c6…
+            let dest = tmp.path().join(format!("lib/out-{i}.bin"));
+            dests.push(dest.clone());
+            plan.add_copy(
+                loose(
+                    src.to_str().unwrap(),
+                    "aaf4c61ddcc5e8a2dabede0f3b482cd9aea9434d",
+                ),
+                dest.to_string_lossy().into_owned(),
+                5,
+            );
+        }
+
+        let mut started = 0;
+        let outcome = apply_plan(
+            db.conn(),
+            &mut plan,
+            &plan_path,
+            &[],
+            &opts_jobs(4, tmp.path().join("q")),
+            &mut |e| {
+                if matches!(e, ApplyEvent::OpStarted { .. }) {
+                    started += 1;
+                }
+            },
+        )
+        .unwrap();
+
+        assert_eq!(outcome.success_count, 6);
+        assert_eq!(outcome.error_count, 0);
+        assert_eq!(started, 6, "one progress event per op");
+        for dest in &dests {
+            assert_eq!(std::fs::read(dest).unwrap(), b"hello", "every copy landed");
+        }
+        assert!(
+            plan.operations
+                .iter()
+                .all(|o| o.status == OperationStatus::Completed)
+        );
+        assert!(outcome.log_path.unwrap().exists(), "journal written");
+    }
+
+    // The placement batch flushes before a serial delete, so a placement that
+    // creates a surviving copy always lands before the delete that relies on it.
+    #[test]
+    fn placements_flush_before_a_serial_delete() {
+        let db = Database::open_in_memory().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let plans_dir = tmp.path().join("objects/plans");
+        std::fs::create_dir_all(&plans_dir).unwrap();
+        let plan_path = plans_dir.join("plan.json");
+
+        let mut plan = Plan::new("statehash".to_string());
+        for i in 0..4 {
+            let src = tmp.path().join(format!("in-{i}.bin"));
+            std::fs::write(&src, b"hello").unwrap();
+            plan.add_copy(
+                loose(
+                    src.to_str().unwrap(),
+                    "aaf4c61ddcc5e8a2dabede0f3b482cd9aea9434d",
+                ),
+                tmp.path()
+                    .join(format!("out-{i}.bin"))
+                    .to_string_lossy()
+                    .into_owned(),
+                5,
+            );
+        }
+        // An uncatalogued delete (refused) — present only to mark the boundary.
+        plan.add_delete(tmp.path().join("nope.bin").to_string_lossy().into_owned());
+
+        let mut verbs: Vec<&'static str> = Vec::new();
+        apply_plan(
+            db.conn(),
+            &mut plan,
+            &plan_path,
+            &[],
+            &opts_jobs(4, tmp.path().join("q")),
+            &mut |e| {
+                if let ApplyEvent::OpStarted { op, .. } = e {
+                    verbs.push(op.verb);
+                }
+            },
+        )
+        .unwrap();
+
+        let delete_pos = verbs.iter().position(|v| *v == "DELETE").expect("a delete");
+        assert_eq!(verbs.iter().filter(|v| **v == "COPY").count(), 4);
+        assert!(
+            verbs[..delete_pos].iter().all(|v| *v == "COPY"),
+            "all placements flush before the serial delete: {verbs:?}"
+        );
     }
 }

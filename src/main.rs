@@ -196,11 +196,11 @@ enum Commands {
         #[arg(long)]
         skip_repack: bool,
 
-        /// Number of repack operations to run concurrently. Repacks are
-        /// latency-bound over a network mount, so keeping several in flight
-        /// overlaps the round trips; other operation kinds still run one at a
-        /// time, in plan order.
-        #[arg(short = 'j', long, default_value_t = 8, value_parser = clap::value_parser!(u8).range(1..=64))]
+        /// Number of placement (copy/move/relocate) and repack operations to run
+        /// concurrently. These are latency-bound over a network mount, so keeping
+        /// several in flight overlaps the round trips; deletes and quarantines
+        /// still run one at a time, in plan order. 1 reproduces serial apply.
+        #[arg(short = 'j', long, default_value_t = 6, value_parser = clap::value_parser!(u8).range(1..=64))]
         jobs: u8,
 
         /// Rollback the most recent apply operation
