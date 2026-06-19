@@ -335,11 +335,16 @@ pub struct ApplyProgress {
     pub from: String,
     /// The operation's destination, when it has a distinct one.
     pub to: Option<String>,
-    /// This operation's size in bytes (a delete has none, so `0`).
+    /// The current (in-flight) operation's size in bytes — what is still being
+    /// worked on, since a whole file is copied/verified before it counts as done
+    /// (a delete has no size, so `0`).
     pub bytes: u64,
-    /// Cumulative bytes across every operation started so far — a running total
-    /// the adapter can show climbing as the apply proceeds.
+    /// Bytes of the operations that have **completed** — the processed total. It
+    /// excludes the current in-flight operation, so it never runs ahead of what
+    /// is actually on disk.
     pub bytes_done: u64,
+    /// The plan's total bytes, so the adapter can show processed-of-total.
+    pub bytes_total: u64,
 }
 
 /// Like [`apply`], but reports each operation's progress through `on_progress`
@@ -424,7 +429,13 @@ pub fn apply_streaming(
     let sources = files::list_sources(conn)?;
     let mut by_kind: BTreeMap<String, usize> = BTreeMap::new();
     let mut done = 0usize;
+    // `bytes_done` is the *completed* total. Operations run serially (and repacks
+    // report on completion), so when one starts, the previous one has finished —
+    // bank its bytes then. The in-flight op's own bytes are reported separately
+    // as `bytes` ("remaining") and join the total only when the next op starts,
+    // which keeps the processed figure from ever running ahead of the disk.
     let mut bytes_done = 0u64;
+    let mut in_flight_bytes = 0u64;
     let outcome = apply_plan(
         conn,
         &mut plan,
@@ -439,8 +450,10 @@ pub fn apply_streaming(
         &mut |event| {
             if let ApplyEvent::OpStarted { op, .. } = event {
                 *by_kind.entry(op.verb.to_string()).or_default() += 1;
+                // The previously started op has now finished — count its bytes.
+                bytes_done = bytes_done.saturating_add(in_flight_bytes);
+                in_flight_bytes = op.bytes;
                 done += 1;
-                bytes_done = bytes_done.saturating_add(op.bytes);
                 on_progress(ApplyProgress {
                     done,
                     total: total_ops,
@@ -449,6 +462,7 @@ pub fn apply_streaming(
                     to: op.to.clone(),
                     bytes: op.bytes,
                     bytes_done,
+                    bytes_total: total_bytes,
                 });
             }
         },
@@ -845,20 +859,27 @@ mod tests {
         assert_eq!(progress[0].verb, "COPY");
         assert_eq!(progress[1].verb, "DELETE");
 
-        // The copy carries its paths and size; the running byte total accrues it.
+        // The copy is in flight: its size shows as `bytes`, but the processed
+        // total is still 0 — it hasn't completed yet, so the figure never runs
+        // ahead of the disk. The plan total is carried throughout.
         assert_eq!(progress[0].from, "/staging/a.rom");
         assert_eq!(
             progress[0].to.as_deref(),
             Some(tmp.path().join("a.rom").to_string_lossy().as_ref())
         );
         assert_eq!(progress[0].bytes, 10);
-        assert_eq!(progress[0].bytes_done, 10);
+        assert_eq!(
+            progress[0].bytes_done, 0,
+            "current op not counted until done"
+        );
+        assert_eq!(progress[0].bytes_total, 10);
 
-        // The delete has a path but no destination and no bytes, so the running
-        // total holds steady.
+        // When the delete starts, the copy has finished, so its 10 bytes are now
+        // counted as processed. The delete itself has no size.
         assert_eq!(progress[1].from, "/staging/b.rom");
         assert_eq!(progress[1].to, None);
         assert_eq!(progress[1].bytes, 0);
-        assert_eq!(progress[1].bytes_done, 10);
+        assert_eq!(progress[1].bytes_done, 10, "the completed copy now counts");
+        assert_eq!(progress[1].bytes_total, 10);
     }
 }

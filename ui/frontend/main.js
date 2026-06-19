@@ -474,16 +474,18 @@ async function streamApply(body, command, startLabel) {
 
   stop(); // drop any listener from a previous run
   applyUnlisten = await window.__TAURI__.event.listen("apply-progress", (e) => {
-    const { done, total, verb, from, to, bytes, bytes_done } = e.payload;
+    const { done, total, verb, from, to, bytes, bytes_done, bytes_total } = e.payload;
     const pct = total ? Math.round((done / total) * 100) : 0;
     fill.style.width = pct + "%";
+    // Processed counts only completed operations, so it never runs ahead of the
+    // disk; the current file's size is shown separately as what's still to go.
     counts.textContent =
       `${done.toLocaleString()} / ${total.toLocaleString()} (${pct}%) · ${verb}` +
-      ` · ${fmtBytes(bytes_done)} processed`;
-    const size = bytes ? `  (${fmtBytes(bytes)})` : "";
+      ` · ${fmtBytes(bytes_done)} of ${fmtBytes(bytes_total)} processed`;
+    const remaining = bytes ? `  ·  ${fmtBytes(bytes)} remaining` : "";
     detail.textContent = to
-      ? `${shortPath(from)} → ${shortPath(to)}${size}`
-      : `${shortPath(from)}${size}`;
+      ? `${shortPath(from)} → ${shortPath(to)}${remaining}`
+      : `${shortPath(from)}${remaining}`;
   });
   try {
     return await invoke(command);
