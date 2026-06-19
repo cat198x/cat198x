@@ -165,6 +165,23 @@ fn external_copies_present(
     Ok(true)
 }
 
+/// Split matched sources into those reclaim may empty and those it must refuse.
+///
+/// Reclaim deletes a source's files because a copy exists in **another** source —
+/// cross-tree by construction. That is exactly what a `preserve` source forbids:
+/// it must never lose content its own tree alone holds. So only `consume` sources
+/// are reclaimable; preserve sources are refused. (Intra-tree dedup of a preserve
+/// tree — dropping a duplicate where a copy survives in the *same* tree — is the
+/// planner's job, not reclaim's.) See `decisions/source-disposition.md`.
+fn partition_by_disposition<'a>(
+    matched: &[&'a files::Source],
+) -> (Vec<&'a files::Source>, Vec<&'a files::Source>) {
+    matched
+        .iter()
+        .copied()
+        .partition(|s| matches!(s.disposition, files::Disposition::Consume))
+}
+
 /// Run the reclaim command.
 pub fn run(selector: Option<String>, execute: bool, data_dir: Option<PathBuf>) -> Result<()> {
     let selector = selector.context(
@@ -185,8 +202,22 @@ pub fn run(selector: Option<String>, execute: bool, data_dir: Option<PathBuf>) -
         return Ok(());
     }
 
+    // A preserve source must never be emptied because a copy exists elsewhere;
+    // reclaim only operates on consume sources.
+    let (reclaimable, preserved) = partition_by_disposition(&matched);
+    for s in &preserved {
+        println!(
+            "  Skipping '{}' — it is a preserve source; reclaim removes content a tree alone may hold.",
+            s.path
+        );
+    }
+    if reclaimable.is_empty() {
+        println!("Nothing to reclaim: the matched source(s) are all preserve.");
+        return Ok(());
+    }
+
     let mut all: Vec<(i64, ReclaimTarget)> = Vec::new();
-    for s in &matched {
+    for s in &reclaimable {
         for t in compute_reclaimable(conn, s.id)? {
             all.push((s.id, t));
         }
@@ -298,6 +329,49 @@ mod tests {
 
     fn setup() -> Database {
         Database::open_in_memory().unwrap()
+    }
+
+    fn source(id: i64, path: &str, disposition: files::Disposition) -> files::Source {
+        files::Source {
+            id,
+            path: path.to_string(),
+            case_sensitive: false,
+            added_at: String::new(),
+            last_scanned: None,
+            disposition,
+        }
+    }
+
+    // Reclaim's model — delete here because a copy exists in another source — is
+    // forbidden for a preserve tree, so only consume sources are reclaimable.
+    #[test]
+    fn reclaim_refuses_preserve_sources() {
+        let staging = source(1, "/ToSort", files::Disposition::Consume);
+        let master = source(2, "/Master", files::Disposition::Preserve);
+        let matched = vec![&staging, &master];
+
+        let (reclaimable, preserved) = partition_by_disposition(&matched);
+        assert_eq!(
+            reclaimable.iter().map(|s| s.id).collect::<Vec<_>>(),
+            vec![1],
+            "only the consume source is reclaimable"
+        );
+        assert_eq!(
+            preserved.iter().map(|s| s.id).collect::<Vec<_>>(),
+            vec![2],
+            "the preserve source is refused"
+        );
+    }
+
+    // A selector matching only preserve sources reclaims nothing.
+    #[test]
+    fn reclaim_partition_is_empty_when_all_preserve() {
+        let a = source(1, "/MasterA", files::Disposition::Preserve);
+        let b = source(2, "/MasterB", files::Disposition::Preserve);
+        let matched = vec![&a, &b];
+        let (reclaimable, preserved) = partition_by_disposition(&matched);
+        assert!(reclaimable.is_empty());
+        assert_eq!(preserved.len(), 2);
     }
 
     #[test]
