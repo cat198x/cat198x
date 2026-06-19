@@ -399,6 +399,17 @@ pub fn generate_plan_filtered(conn: &Connection, opts: &PlanOptions) -> Result<P
     let mut filter_matched_any = false;
     let mut skipped_no_dest: Vec<String> = Vec::new();
 
+    // Source containers a repack rebuilt from and that are safe to lose afterwards
+    // — recorded here and emitted as deletes *after* every repack, so the apply
+    // runs the rebuilds first and the verify-before-delete net sees each entry
+    // surviving at its destination before removing the container. `(container,
+    // a representative destination)` — deduplicated, since a container feeding
+    // several games is recorded once per game. Draining these is what lets
+    // `consume` staging empty for recompressed archive sets (a shared .cue/.sub
+    // forces a rebuild over a whole-file relocate). Safety rests on the net, not
+    // on a plan-time guess: a container still needed elsewhere is refused, sticky.
+    let mut drain_after_repack: Vec<(String, String)> = Vec::new();
+
     for collection in &all_collections {
         if let Some(pattern) = dat_filter
             && !glob_match(pattern, &collection.name)
@@ -795,6 +806,31 @@ pub fn generate_plan_filtered(conn: &Connection, opts: &PlanOptions) -> Result<P
                             consume_feeders && !game_shared,
                         );
                         to_write += 1;
+
+                        // We rebuilt from a single source container rather than
+                        // relocating it whole (a shared .cue/.sub forced the
+                        // rebuild). Once this archive is built, the container is a
+                        // redundant copy whose loss its source permits — record it
+                        // to drain after all repacks. The verify-before-delete net
+                        // is the safety check: it removes the container only once
+                        // every entry it held is confirmed surviving (here, at
+                        // `dest`), so a container another game still needs is
+                        // refused rather than lost.
+                        if let Some(container) = build_from.as_ref().filter(|c| {
+                            **c != dest
+                                && containers
+                                    .get(c.as_str())
+                                    .and_then(|e| e.first())
+                                    .is_some_and(|m| {
+                                        // Only a real archive container is drained as
+                                        // a unit; a loose build-from is already
+                                        // handled by `move_sources` above.
+                                        m.archive_path.is_some()
+                                            && may_delete(&dispositions, &m.source_root, &dest)
+                                    })
+                        }) {
+                            drain_after_repack.push((container.clone(), dest.clone()));
+                        }
                     }
 
                     // Delete duplicate whole-archive copies: any container that is
@@ -856,6 +892,21 @@ pub fn generate_plan_filtered(conn: &Connection, opts: &PlanOptions) -> Result<P
             already_correct,
             bytes,
         });
+    }
+
+    // Drain the source containers the repacks rebuilt from — emitted last, so the
+    // apply runs every rebuild before these deletes and the verify-before-delete
+    // net can see each entry surviving at its destination. Deduplicated: a
+    // container feeding several games appears once. The reason names a destination
+    // its content went to (for plan review and the live log); the net guarantees
+    // safety regardless.
+    {
+        let mut seen = HashSet::new();
+        for (container, dest) in &drain_after_repack {
+            if seen.insert(container.clone()) {
+                plan.add_delete(container.clone(), format!("consolidated into {dest}"));
+            }
+        }
     }
 
     // Never skip silently: report collections left out because no destination
@@ -2835,8 +2886,7 @@ mod tests {
         .unwrap();
 
         // The shared container is repacked per game (extracting each game's own
-        // entry), never relocated whole (which would strand the other game) and
-        // never deleted (the other game still needs it).
+        // entry), never relocated whole (which would strand the other game).
         let relocates = plan
             .operations
             .iter()
@@ -2850,9 +2900,142 @@ mod tests {
             plan.summary.repack_count, 2,
             "each game repacks its own entry"
         );
+        // Once *both* games are repacked, every entry the container held survives
+        // in a game archive, so the consume container is drained — exactly once,
+        // despite feeding two games. The verify-before-delete net is the guard at
+        // apply time: it removes the container only after confirming each entry
+        // survives elsewhere, so the order (drain emitted after all repacks) and
+        // the net together make this safe.
         assert_eq!(
-            plan.summary.delete_count, 0,
-            "the shared container is never deleted"
+            plan.summary.delete_count, 1,
+            "the fully-consolidated shared container is drained, once"
+        );
+        let drained: Vec<_> = plan
+            .operations
+            .iter()
+            .filter_map(|op| match &op.kind {
+                OperationKind::Delete { path, reason } => Some((path.clone(), reason.clone())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(drained.len(), 1);
+        assert_eq!(drained[0].0, "/lib/ToSort/SET/bundle.zip");
+        assert!(
+            drained[0].1.starts_with("consolidated into "),
+            "reason names where the content went: {:?}",
+            drained[0].1
+        );
+    }
+
+    #[test]
+    fn single_game_consume_container_drains_when_a_shared_entry_forces_a_repack() {
+        let db = setup_db();
+        let conn = db.conn();
+        // The real CD-image case: g1.zip, in a CONSUME staging source, holds
+        // GameOne in full — its own ROM plus a ROM whose content (CCC) is shared
+        // with GameTwo (a common .cue/.sub). The shared entry makes GameOne
+        // `game_shared`, which blocks a whole-file relocate and forces a rebuild.
+        // The container is then drained — earlier this was the stranded case.
+        let coll = collections::create_collection(conn, "ISO Coll", "tosec").unwrap();
+        let vid = collections::add_version(conn, coll, "v1", "/dats/i.dat", true).unwrap();
+        let node = dats::create_node(conn, vid, None, "ISO Coll", "dat", "SET/Sys").unwrap();
+        let g1 = dats::create_game(conn, node, "GameOne", None, None, false, false, false).unwrap();
+        dats::create_rom(
+            conn,
+            g1,
+            "own.rom",
+            10,
+            Some("AAA"),
+            None,
+            None,
+            "good",
+            None,
+        )
+        .unwrap();
+        dats::create_rom(
+            conn,
+            g1,
+            "common.rom",
+            10,
+            Some("CCC"),
+            None,
+            None,
+            "good",
+            None,
+        )
+        .unwrap();
+        let g2 = dats::create_game(conn, node, "GameTwo", None, None, false, false, false).unwrap();
+        dats::create_rom(
+            conn,
+            g2,
+            "other.rom",
+            10,
+            Some("BBB"),
+            None,
+            None,
+            "good",
+            None,
+        )
+        .unwrap();
+        dats::create_rom(
+            conn,
+            g2,
+            "common.rom",
+            10,
+            Some("CCC"),
+            None,
+            None,
+            "good",
+            None,
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO files (sha1, size) VALUES ('AAA',10),('BBB',10),('CCC',10)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO sources (id, path, case_sensitive, disposition)
+             VALUES (220, '/lib/ToSort/SET', 0, 'consume')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO file_locations (sha1, source_id, path, archive_path) VALUES
+                ('AAA', 220, 'g1.zip', 'own.rom'),
+                ('CCC', 220, 'g1.zip', 'common.rom'),
+                ('BBB', 220, 'g2.zip', 'other.rom'),
+                ('CCC', 220, 'g2.zip', 'common.rom')",
+            [],
+        )
+        .unwrap();
+        db_config::set_output_format(conn, "SET", "zip").unwrap();
+
+        let plan = generate_plan_filtered(
+            conn,
+            &PlanOptions {
+                default_dest: Some("/lib/ROMs".to_string()),
+                default_format: OutputFormat::Loose,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        // GameOne's source container is drained (its content is now in GameOne's
+        // archive). The shared CCC entry — which earlier flagged the container as
+        // "shared" and stranded it — no longer blocks the drain, because safety is
+        // the verify-before-delete net's job, not a plan-time guess.
+        let drained: Vec<&str> = plan
+            .operations
+            .iter()
+            .filter_map(|op| match &op.kind {
+                OperationKind::Delete { path, .. } => Some(path.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            drained.contains(&"/lib/ToSort/SET/g1.zip"),
+            "GameOne's single-game consume container is drained: {drained:?}"
         );
     }
 
