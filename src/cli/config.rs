@@ -40,13 +40,11 @@ fn load_file_config(data_dir: Option<PathBuf>) -> Result<(PathBuf, Config)> {
 
 /// The quarantine store directory: the configured `quarantine_dir`, or
 /// `<data_dir>/quarantine` when unset. Shared by every quarantine operation
-/// (move, prune, restore) so the store location stays consistent.
+/// (move, prune, restore) so the store location stays consistent. Delegates to
+/// the library resolver [`crate::config::resolve_quarantine_dir`] — the apply
+/// engine resolves the same store there — so the CLI and the library never drift.
 pub fn resolve_quarantine_dir(data_dir: Option<PathBuf>) -> Result<PathBuf> {
-    let (_, config) = load_file_config(data_dir.clone())?;
-    match config.quarantine_dir {
-        Some(dir) => Ok(PathBuf::from(dir)),
-        None => Ok(get_data_dir(data_dir)?.join("quarantine")),
-    }
+    crate::config::resolve_quarantine_dir(&get_data_dir(data_dir)?)
 }
 
 /// The canonical lowercase string for an output format.
