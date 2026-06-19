@@ -459,12 +459,6 @@ pub fn apply_streaming(
     let mut by_kind: BTreeMap<String, usize> = BTreeMap::new();
     let mut done = 0usize;
     let mut bytes_done = 0u64;
-    // An op's identity (verb, from, to, was-it-in-a-worker-slot), remembered at
-    // start so a later finish or failure can name it in the log; and the error
-    // message of a placement failure, stashed until its finish event logs it.
-    let mut op_info: std::collections::HashMap<usize, (String, String, Option<String>, bool)> =
-        std::collections::HashMap::new();
-    let mut errors: std::collections::HashMap<usize, String> = std::collections::HashMap::new();
 
     // Build one progress update. The varying fields are passed in; `total_ops`,
     // `total_bytes`, and the worker count are constant for the run.
@@ -507,142 +501,53 @@ pub fn apply_streaming(
             jobs: APPLY_JOBS,
             quarantine_dir,
         },
+        // Every op emits OpStarted then OpFinished, so the consumer is uniform: a
+        // start occupies a worker slot (or shows a serial op) without counting; a
+        // finish counts the op, banks its bytes on success, frees the slot, and
+        // logs the outcome. No per-op state to stash.
         &mut |event| match event {
-            ApplyEvent::OpStarted {
-                index, op, slot, ..
-            } => {
-                // Tally each op once, and remember its identity for the log.
+            ApplyEvent::OpStarted { op, slot, .. } => {
                 *by_kind.entry(op.verb.to_string()).or_default() += 1;
-                op_info.insert(
-                    index,
-                    (
-                        op.verb.to_string(),
-                        op.from.clone(),
-                        op.to.clone(),
-                        slot.is_some(),
-                    ),
-                );
-                match slot {
-                    // A placement starting in a worker slot: occupy the slot, but
-                    // don't count its bytes until it finishes.
-                    Some(s) => on_progress(mk(
-                        done,
-                        Some(s),
-                        false,
-                        op.verb.to_string(),
-                        op.from.clone(),
-                        op.to.clone(),
-                        op.bytes,
-                        bytes_done,
-                        None,
-                        None,
-                    )),
-                    // A serial op (delete/quarantine) — or any op on a dry run —
-                    // runs and completes on this thread as it is announced, so
-                    // count it and its bytes now.
-                    None => {
-                        done += 1;
-                        bytes_done = bytes_done.saturating_add(op.bytes);
-                        on_progress(mk(
-                            done,
-                            None,
-                            true,
-                            op.verb.to_string(),
-                            op.from.clone(),
-                            op.to.clone(),
-                            op.bytes,
-                            bytes_done,
-                            None,
-                            None,
-                        ));
-                    }
-                }
+                on_progress(mk(
+                    done,
+                    slot,
+                    false,
+                    op.verb.to_string(),
+                    op.from.clone(),
+                    op.to.clone(),
+                    op.bytes,
+                    bytes_done,
+                    None,
+                    None,
+                ));
             }
-            // A placement finished: free its slot, bank its bytes (only now, so the
-            // processed total never runs ahead of the disk), and log the outcome.
             ApplyEvent::OpFinished {
-                index,
                 slot,
-                bytes,
-                success,
+                op,
+                status,
+                detail,
+                ..
             } => {
                 done += 1;
-                if success {
-                    bytes_done = bytes_done.saturating_add(bytes);
-                }
-                let (verb, from, to, _) = op_info.remove(&index).unwrap_or_default();
-                let (outcome, detail) = if success {
-                    ("ok".to_string(), None)
-                } else {
-                    ("failed".to_string(), errors.remove(&index))
+                let outcome = match status {
+                    crate::plan::OperationStatus::Completed => {
+                        bytes_done = bytes_done.saturating_add(op.bytes);
+                        "ok"
+                    }
+                    crate::plan::OperationStatus::Refused => "refused",
+                    _ => "failed",
                 };
                 on_progress(mk(
                     done,
                     slot,
                     true,
-                    verb,
-                    from,
-                    to,
-                    bytes,
+                    op.verb.to_string(),
+                    op.from.clone(),
+                    op.to.clone(),
+                    op.bytes,
                     bytes_done,
-                    Some(outcome),
+                    Some(outcome.to_string()),
                     detail,
-                ));
-            }
-            // A placement failure is logged on its OpFinished (stash the reason
-            // until then); a serial/repack failure has no OpFinished, so log here.
-            ApplyEvent::OpFailed { index, message } => {
-                let slotted = op_info.get(&index).map(|t| t.3).unwrap_or(false);
-                if slotted {
-                    errors.insert(index, message.clone());
-                } else {
-                    let (verb, from, to, _) = op_info.get(&index).cloned().unwrap_or_default();
-                    on_progress(mk(
-                        done,
-                        None,
-                        false,
-                        verb,
-                        from,
-                        to,
-                        0,
-                        bytes_done,
-                        Some("failed".to_string()),
-                        Some(message.clone()),
-                    ));
-                }
-            }
-            // Refusals are always serial; log them with the reason.
-            ApplyEvent::DeleteRefused { index, path } => {
-                let (verb, from, to, _) = op_info
-                    .get(&index)
-                    .cloned()
-                    .unwrap_or_else(|| ("DELETE".to_string(), path.clone(), None, false));
-                on_progress(mk(
-                    done,
-                    None,
-                    false,
-                    verb,
-                    from,
-                    to,
-                    0,
-                    bytes_done,
-                    Some("refused".to_string()),
-                    Some("no surviving copy on disk".to_string()),
-                ));
-            }
-            ApplyEvent::DeleteVerifyError { index, message } => {
-                let (verb, from, to, _) = op_info.get(&index).cloned().unwrap_or_default();
-                on_progress(mk(
-                    done,
-                    None,
-                    false,
-                    verb,
-                    from,
-                    to,
-                    0,
-                    bytes_done,
-                    Some("refused".to_string()),
-                    Some(message.clone()),
                 ));
             }
             _ => {}
@@ -1035,31 +940,35 @@ mod tests {
         .unwrap()
         .expect("a plan");
 
-        // A dry run goes through the serial path, so each op is a slotless update
-        // that completes as it is announced: one per operation, monotonic.
-        assert_eq!(progress.len(), 2);
-        assert_eq!((progress[0].done, progress[0].total), (1, 2));
-        assert_eq!((progress[1].done, progress[1].total), (2, 2));
-        assert_eq!(progress[0].verb, "COPY");
-        assert_eq!(progress[1].verb, "DELETE");
-        assert!(progress.iter().all(|p| p.slot.is_none() && p.finished));
-        assert!(progress.iter().all(|p| p.bytes_total == 10));
+        // Every op emits a start then a finish, both slotless on a dry run. The
+        // finishes carry the count, the running bytes, and an "ok" log outcome.
+        let finishes: Vec<_> = progress.iter().filter(|p| p.finished).collect();
+        assert_eq!(finishes.len(), 2, "one finish per operation");
+        assert!(
+            progress
+                .iter()
+                .all(|p| p.slot.is_none() && p.bytes_total == 10)
+        );
 
-        // The copy carries its paths and size; the processed total accrues it.
-        assert_eq!(progress[0].from, "/staging/a.rom");
+        assert_eq!((finishes[0].done, finishes[0].total), (1, 2));
+        assert_eq!(finishes[0].verb, "COPY");
+        assert_eq!(finishes[0].from, "/staging/a.rom");
         assert_eq!(
-            progress[0].to.as_deref(),
+            finishes[0].to.as_deref(),
             Some(tmp.path().join("a.rom").to_string_lossy().as_ref())
         );
-        assert_eq!(progress[0].bytes, 10);
-        assert_eq!(progress[0].bytes_done, 10);
+        assert_eq!(finishes[0].bytes, 10);
+        assert_eq!(finishes[0].bytes_done, 10, "the copy's bytes are banked");
+        assert_eq!(finishes[0].outcome.as_deref(), Some("ok"));
 
-        // The delete has a path but no destination and no bytes, so the running
-        // total holds steady.
-        assert_eq!(progress[1].from, "/staging/b.rom");
-        assert_eq!(progress[1].to, None);
-        assert_eq!(progress[1].bytes, 0);
-        assert_eq!(progress[1].bytes_done, 10);
+        // The delete is logged too (no longer the silent gap), with no bytes.
+        assert_eq!((finishes[1].done, finishes[1].total), (2, 2));
+        assert_eq!(finishes[1].verb, "DELETE");
+        assert_eq!(finishes[1].from, "/staging/b.rom");
+        assert_eq!(finishes[1].to, None);
+        assert_eq!(finishes[1].bytes, 0);
+        assert_eq!(finishes[1].bytes_done, 10);
+        assert_eq!(finishes[1].outcome.as_deref(), Some("ok"));
     }
 
     // A real apply runs placements concurrently: each reports a start (occupying a
