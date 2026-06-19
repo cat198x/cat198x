@@ -71,14 +71,18 @@ pub enum ApplyEvent {
         slot: Option<usize>,
         op: OpView,
     },
-    /// An operation has finished (success or not). Pairs with an earlier
-    /// `OpStarted` of the same `index`/`slot`; carries the op's `bytes` so a
-    /// caller can bank processed bytes only on completion, and free the slot.
+    /// An operation has finished. Pairs with an earlier `OpStarted` of the same
+    /// `index`/`slot`. Every operation emits exactly one of these — so a caller
+    /// banks processed bytes only on completion, frees the worker slot, and logs
+    /// the outcome (the `op` view names it). `status` is the terminal state
+    /// (`Completed`/`Failed`/`Refused`); `detail` carries the error or refusal
+    /// reason when not completed.
     OpFinished {
         index: usize,
         slot: Option<usize>,
-        bytes: u64,
-        success: bool,
+        op: OpView,
+        status: OperationStatus,
+        detail: Option<String>,
     },
     /// A delete or copy/repack reverse whose target was already gone — an
     /// idempotent success, not a failure.
@@ -314,159 +318,159 @@ pub fn apply_plan(
             op: OpView::of(&op.kind),
         });
 
-        match &op.kind {
-            OperationKind::Copy { source, dest, .. } => {
-                if opts.dry_run {
-                    success_count += 1;
-                    continue;
-                }
+        // A dry run performs nothing and leaves the op pending, but still reports a
+        // (notional) completion so the preview tallies every op uniformly.
+        if opts.dry_run {
+            success_count += 1;
+            on_event(ApplyEvent::OpFinished {
+                index: i,
+                slot: None,
+                op: OpView::of(&op.kind),
+                status: OperationStatus::Completed,
+                detail: None,
+            });
+            continue;
+        }
 
+        // The op's terminal state and (when not completed) the reason, set by the
+        // arm below and reported once at the tail.
+        let mut detail: Option<String> = None;
+
+        match &op.kind {
+            // Copy/Move/Relocate/Repack run in their concurrent batches and never
+            // reach here in a real run; these arms are a defensive fallback.
+            OperationKind::Copy { source, dest, .. } => {
                 let result = execute_copy(
                     &source.path,
                     source.archive_path.as_deref(),
                     dest,
                     &source.sha1,
                 );
-                let success = result.is_ok();
-
                 if let Some(ref mut log) = op_log {
-                    log.log_copy(op.id, &source.path, dest, &source.sha1, success);
+                    log.log_copy(op.id, &source.path, dest, &source.sha1, result.is_ok());
                 }
-
                 match result {
                     Ok(()) => {
                         op.status = OperationStatus::Completed;
                         success_count += 1;
                     }
                     Err(e) => {
+                        let message = format!("{e:#}");
                         on_event(ApplyEvent::OpFailed {
                             index: i,
-                            message: format!("{e:#}"),
+                            message: message.clone(),
                         });
+                        detail = Some(message);
                         op.status = OperationStatus::Failed;
                         error_count += 1;
                     }
                 }
             }
             OperationKind::Move { source, dest, .. } => {
-                if opts.dry_run {
-                    success_count += 1;
-                    continue;
-                }
-
                 let result = execute_move(
                     &source.path,
                     source.archive_path.as_deref(),
                     dest,
                     &source.sha1,
                 );
-                let success = result.is_ok();
-
                 if let Some(ref mut log) = op_log {
-                    log.log_move(op.id, &source.path, dest, &source.sha1, success);
+                    log.log_move(op.id, &source.path, dest, &source.sha1, result.is_ok());
                 }
-
                 match result {
                     Ok(()) => {
                         op.status = OperationStatus::Completed;
                         success_count += 1;
                     }
                     Err(e) => {
+                        let message = format!("{e:#}");
                         on_event(ApplyEvent::OpFailed {
                             index: i,
-                            message: format!("{e:#}"),
+                            message: message.clone(),
                         });
+                        detail = Some(message);
                         op.status = OperationStatus::Failed;
                         error_count += 1;
                     }
                 }
             }
             OperationKind::Relocate { source, dest, .. } => {
-                if opts.dry_run {
-                    success_count += 1;
-                    continue;
-                }
-
                 let result = execute_relocate(source, dest);
-                let success = result.is_ok();
-
                 if let Some(ref mut log) = op_log {
-                    log.log_relocate(op.id, source, dest, success);
+                    log.log_relocate(op.id, source, dest, result.is_ok());
                 }
-
                 match result {
                     Ok(()) => {
                         op.status = OperationStatus::Completed;
                         success_count += 1;
                     }
                     Err(e) => {
+                        let message = format!("{e:#}");
                         on_event(ApplyEvent::OpFailed {
                             index: i,
-                            message: format!("{e:#}"),
+                            message: message.clone(),
                         });
+                        detail = Some(message);
                         op.status = OperationStatus::Failed;
                         error_count += 1;
                     }
                 }
             }
             OperationKind::Repack { .. } => {
-                // Reachable only on a dry run: live repacks were batched above
-                // for concurrent execution and never fall through to here.
-                success_count += 1;
-                continue;
+                // Unreachable: live repacks are batched. Mark failed defensively
+                // rather than silently miscount, should a batching bug send one here.
+                detail = Some("internal: repack reached the serial path".to_string());
+                op.status = OperationStatus::Failed;
+                error_count += 1;
             }
             OperationKind::Delete { path } => {
-                if opts.dry_run {
-                    success_count += 1;
-                    continue;
-                }
-
                 // Verify-before-delete: a plan deletes a file only because its
                 // content is held elsewhere, but never destroy the last copy on
                 // a stale record. Refuse if no surviving copy physically exists.
                 match delete_has_surviving_copy(conn, sources, path) {
-                    Ok(true) => {}
+                    // Refused (sticky): the safety net declined this delete; only a
+                    // fresh plan should revisit it. Skip the removal entirely.
                     Ok(false) => {
                         on_event(ApplyEvent::DeleteRefused {
                             index: i,
                             path: path.clone(),
                         });
-                        // Sticky: the safety net declined this delete. Re-running
-                        // must not retry it blindly — only a fresh plan should.
+                        detail = Some("no surviving copy on disk".to_string());
                         op.status = OperationStatus::Refused;
                         refused_count += 1;
-                        continue;
                     }
                     Err(e) => {
+                        let message = format!("{e:#}");
                         on_event(ApplyEvent::DeleteVerifyError {
                             index: i,
-                            message: format!("{e:#}"),
+                            message: message.clone(),
                         });
+                        detail = Some(message);
                         op.status = OperationStatus::Refused;
                         refused_count += 1;
-                        continue;
                     }
-                }
-
-                match fs::remove_file(path) {
-                    Ok(()) => {
-                        op.status = OperationStatus::Completed;
-                        success_count += 1;
-                    }
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                        // File already gone, consider success
-                        op.status = OperationStatus::Completed;
-                        success_count += 1;
-                        on_event(ApplyEvent::AlreadyGone { index: i });
-                    }
-                    Err(e) => {
-                        on_event(ApplyEvent::OpFailed {
-                            index: i,
-                            message: format!("{e:#}"),
-                        });
-                        op.status = OperationStatus::Failed;
-                        error_count += 1;
-                    }
+                    // Safe to remove.
+                    Ok(true) => match fs::remove_file(path) {
+                        Ok(()) => {
+                            op.status = OperationStatus::Completed;
+                            success_count += 1;
+                        }
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                            // Already gone — an idempotent success.
+                            op.status = OperationStatus::Completed;
+                            success_count += 1;
+                            on_event(ApplyEvent::AlreadyGone { index: i });
+                        }
+                        Err(e) => {
+                            let message = format!("{e:#}");
+                            on_event(ApplyEvent::OpFailed {
+                                index: i,
+                                message: message.clone(),
+                            });
+                            detail = Some(message);
+                            op.status = OperationStatus::Failed;
+                            error_count += 1;
+                        }
+                    },
                 }
             }
             OperationKind::Quarantine {
@@ -476,11 +480,6 @@ pub fn apply_plan(
                 reason,
                 collection,
             } => {
-                if opts.dry_run {
-                    success_count += 1;
-                    continue;
-                }
-
                 let reason_enum =
                     QuarantineReason::parse(reason).unwrap_or(QuarantineReason::PathChanged);
 
@@ -507,10 +506,12 @@ pub fn apply_plan(
                         success_count += 1;
                     }
                     Err(e) => {
+                        let message = format!("{e:#}");
                         on_event(ApplyEvent::OpFailed {
                             index: i,
-                            message: format!("{e:#}"),
+                            message: message.clone(),
                         });
+                        detail = Some(message);
                         op.status = OperationStatus::Failed;
                         error_count += 1;
                     }
@@ -521,8 +522,7 @@ pub fn apply_plan(
         // Keep the catalogue in step with what just happened on disk, so a
         // re-plan converges without a re-scan. Catalogue-local and cheap; a
         // failure here doesn't undo the file operation that already succeeded.
-        if !opts.dry_run
-            && op.status == OperationStatus::Completed
+        if op.status == OperationStatus::Completed
             && let Err(e) = sync_catalogue_after(conn, sources, &op.kind)
         {
             on_event(ApplyEvent::CatalogueWarning {
@@ -530,6 +530,15 @@ pub fn apply_plan(
                 message: e.to_string(),
             });
         }
+
+        // Report the op's terminal state once — counted, logged, slot-free.
+        on_event(ApplyEvent::OpFinished {
+            index: i,
+            slot: None,
+            op: OpView::of(&op.kind),
+            status: op.status,
+            detail,
+        });
     }
 
     // Placements and repacks at the tail of the plan (the common case) are still
@@ -624,7 +633,7 @@ fn flush_placement_batch(
         // A job finished: journal it, update status + catalogue, free the slot.
         PlacementEvent::Finished { slot, outcome } => {
             let PlacementOutcome { job, result } = outcome;
-            let bytes = OpView::of(&plan.operations[job.plan_index].kind).bytes;
+            let view = OpView::of(&plan.operations[job.plan_index].kind);
 
             if let Some(log) = op_log {
                 let success = result.is_ok();
@@ -641,7 +650,7 @@ fn flush_placement_batch(
                 }
             }
 
-            let success = result.is_ok();
+            let mut detail = None;
             let op = &mut plan.operations[job.plan_index];
             match result {
                 Ok(()) => {
@@ -657,10 +666,12 @@ fn flush_placement_batch(
                     }
                 }
                 Err(e) => {
+                    let message = format!("{e:#}");
                     on_event(ApplyEvent::OpFailed {
                         index: job.plan_index,
-                        message: format!("{e:#}"),
+                        message: message.clone(),
                     });
+                    detail = Some(message);
                     op.status = OperationStatus::Failed;
                     *error_count += 1;
                 }
@@ -669,8 +680,9 @@ fn flush_placement_batch(
             on_event(ApplyEvent::OpFinished {
                 index: job.plan_index,
                 slot: Some(slot),
-                bytes,
-                success,
+                op: view,
+                status: op.status,
+                detail,
             });
         }
     });
@@ -738,6 +750,7 @@ fn flush_repack_batch(
             );
         }
 
+        let mut detail = None;
         let op = &mut plan.operations[job.plan_index];
         match result {
             Ok(_) => {
@@ -753,14 +766,30 @@ fn flush_repack_batch(
                 }
             }
             Err(e) => {
+                let message = format!("{e:#}");
                 on_event(ApplyEvent::OpFailed {
                     index: job.plan_index,
-                    message: format!("{e:#}"),
+                    message: message.clone(),
                 });
+                detail = Some(message);
                 op.status = OperationStatus::Failed;
                 *error_count += 1;
             }
         }
+
+        on_event(ApplyEvent::OpFinished {
+            index: job.plan_index,
+            slot: None,
+            op: OpView {
+                verb: "REPACK",
+                from: job.dest.clone(),
+                to: None,
+                file_count: Some(job.sources.len()),
+                bytes: job.size,
+            },
+            status: op.status,
+            detail,
+        });
     });
 }
 
