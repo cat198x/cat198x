@@ -331,6 +331,15 @@ pub struct ApplyProgress {
     pub total: usize,
     /// The verb of the operation just started (COPY/MOVE/RELOCATE/…).
     pub verb: String,
+    /// The operation's source (or, for a repack, the destination archive).
+    pub from: String,
+    /// The operation's destination, when it has a distinct one.
+    pub to: Option<String>,
+    /// This operation's size in bytes (a delete has none, so `0`).
+    pub bytes: u64,
+    /// Cumulative bytes across every operation started so far — a running total
+    /// the adapter can show climbing as the apply proceeds.
+    pub bytes_done: u64,
 }
 
 /// Like [`apply`], but reports each operation's progress through `on_progress`
@@ -415,6 +424,7 @@ pub fn apply_streaming(
     let sources = files::list_sources(conn)?;
     let mut by_kind: BTreeMap<String, usize> = BTreeMap::new();
     let mut done = 0usize;
+    let mut bytes_done = 0u64;
     let outcome = apply_plan(
         conn,
         &mut plan,
@@ -430,10 +440,15 @@ pub fn apply_streaming(
             if let ApplyEvent::OpStarted { op, .. } = event {
                 *by_kind.entry(op.verb.to_string()).or_default() += 1;
                 done += 1;
+                bytes_done = bytes_done.saturating_add(op.bytes);
                 on_progress(ApplyProgress {
                     done,
                     total: total_ops,
                     verb: op.verb.to_string(),
+                    from: op.from.clone(),
+                    to: op.to.clone(),
+                    bytes: op.bytes,
+                    bytes_done,
                 });
             }
         },
@@ -829,5 +844,21 @@ mod tests {
         assert_eq!((progress[1].done, progress[1].total), (2, 2));
         assert_eq!(progress[0].verb, "COPY");
         assert_eq!(progress[1].verb, "DELETE");
+
+        // The copy carries its paths and size; the running byte total accrues it.
+        assert_eq!(progress[0].from, "/staging/a.rom");
+        assert_eq!(
+            progress[0].to.as_deref(),
+            Some(tmp.path().join("a.rom").to_string_lossy().as_ref())
+        );
+        assert_eq!(progress[0].bytes, 10);
+        assert_eq!(progress[0].bytes_done, 10);
+
+        // The delete has a path but no destination and no bytes, so the running
+        // total holds steady.
+        assert_eq!(progress[1].from, "/staging/b.rom");
+        assert_eq!(progress[1].to, None);
+        assert_eq!(progress[1].bytes, 0);
+        assert_eq!(progress[1].bytes_done, 10);
     }
 }

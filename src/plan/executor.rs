@@ -507,6 +507,8 @@ pub struct RepackJob {
     pub dest: String,
     pub format: String,
     pub move_sources: bool,
+    /// The repacked archive's size in bytes, for progress reporting.
+    pub size: u64,
 }
 
 /// The result of one concurrent repack, delivered to the caller's completion
@@ -1670,6 +1672,7 @@ mod tests {
                         .to_string(),
                     format: "zip".to_string(),
                     move_sources: false,
+                    size: 8,
                 }
             })
             .collect();
@@ -1718,6 +1721,7 @@ mod tests {
                 .to_string(),
             format: "zip".to_string(),
             move_sources: false,
+            size: 8,
         };
 
         let jobs = vec![

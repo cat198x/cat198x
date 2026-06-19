@@ -52,6 +52,9 @@ pub struct OpView {
     pub to: Option<String>,
     /// The number of files folded into a repack.
     pub file_count: Option<usize>,
+    /// The operation's size in bytes (a delete has none, so `0`). Adapters show
+    /// it as a per-op figure and accumulate it into a running total.
+    pub bytes: u64,
 }
 
 /// A progress event emitted as a plan is applied. The library never prints;
@@ -90,41 +93,52 @@ pub struct ApplyOutcome {
 impl OpView {
     fn of(kind: &OperationKind) -> Self {
         match kind {
-            OperationKind::Copy { source, dest, .. } => OpView {
+            OperationKind::Copy { source, dest, size } => OpView {
                 verb: "COPY",
                 from: source.path.clone(),
                 to: Some(dest.clone()),
                 file_count: None,
+                bytes: *size,
             },
-            OperationKind::Move { source, dest, .. } => OpView {
+            OperationKind::Move { source, dest, size } => OpView {
                 verb: "MOVE",
                 from: source.path.clone(),
                 to: Some(dest.clone()),
                 file_count: None,
+                bytes: *size,
             },
-            OperationKind::Relocate { source, dest, .. } => OpView {
+            OperationKind::Relocate { source, dest, size } => OpView {
                 verb: "RELOCATE",
                 from: source.clone(),
                 to: Some(dest.clone()),
                 file_count: None,
+                bytes: *size,
             },
-            OperationKind::Repack { sources, dest, .. } => OpView {
+            OperationKind::Repack {
+                sources,
+                dest,
+                size,
+                ..
+            } => OpView {
                 verb: "REPACK",
                 from: dest.clone(),
                 to: None,
                 file_count: Some(sources.len()),
+                bytes: *size,
             },
             OperationKind::Delete { path } => OpView {
                 verb: "DELETE",
                 from: path.clone(),
                 to: None,
                 file_count: None,
+                bytes: 0,
             },
-            OperationKind::Quarantine { path, .. } => OpView {
+            OperationKind::Quarantine { path, size, .. } => OpView {
                 verb: "QUARANTINE",
                 from: path.clone(),
                 to: None,
                 file_count: None,
+                bytes: *size,
             },
         }
     }
@@ -174,7 +188,7 @@ pub fn apply_plan(
                 dest,
                 format,
                 move_sources,
-                ..
+                size,
             } = &op.kind
             {
                 // Leave repacks pending for a later pass when deferred, so the
@@ -191,6 +205,7 @@ pub fn apply_plan(
                         dest: dest.clone(),
                         format: format.clone(),
                         move_sources: *move_sources,
+                        size: *size,
                     });
                     continue;
                 }
@@ -514,6 +529,7 @@ fn flush_repack_batch(
                 from: job.dest.clone(),
                 to: None,
                 file_count: Some(job.sources.len()),
+                bytes: job.size,
             },
         });
 

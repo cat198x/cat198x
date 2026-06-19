@@ -296,8 +296,20 @@ tr:hover td {
 }
 
 .prog-wrap .muted {
-  margin-bottom: 10px;
+  margin-bottom: 6px;
   font-variant-numeric: tabular-nums;
+}
+
+/* the current operation's source → destination, under the counts line */
+.prog-detail {
+  margin-bottom: 10px;
+  min-height: 1.2em;
+  color: var(--muted);
+  font-size: 0.85em;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .progress {
