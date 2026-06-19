@@ -599,6 +599,22 @@ pub struct PlacementOutcome {
     pub result: Result<()>,
 }
 
+/// What a worker reports as it runs the batch. `Started` fires when a worker
+/// picks a job (so a caller can show which of its `slot`s is now busy with which
+/// operation); `Finished` fires when that job completes. Both carry the worker's
+/// `slot` (`0..workers`), the stable lane that lets a live display track one
+/// worker across the jobs it runs.
+pub enum PlacementEvent {
+    Started {
+        slot: usize,
+        plan_index: usize,
+    },
+    Finished {
+        slot: usize,
+        outcome: PlacementOutcome,
+    },
+}
+
 /// Execute a batch of placements (copy / move / relocate) concurrently on a
 /// bounded pool of worker threads — the same contract as
 /// [`execute_repacks_concurrent`], for the same reason: each placement is
@@ -608,10 +624,12 @@ pub struct PlacementOutcome {
 /// Workers perform **file operations only**, each running the same audited
 /// `execute_copy`/`execute_move`/`execute_relocate` as the serial path —
 /// including SHA-1 verification and (for a move) delete-after-verify. Everything
-/// stateful stays with the caller: `on_complete` runs on the calling thread, one
-/// outcome at a time as jobs finish, so the rollback journal, the plan status,
-/// and the non-`Sync` catalogue connection are all mutated serially, in
-/// completion order.
+/// stateful stays with the caller: `on_event` runs on the calling thread, one
+/// event at a time, so the rollback journal, the plan status, and the non-`Sync`
+/// catalogue connection are all mutated serially. Each job reports a
+/// [`PlacementEvent::Started`] (carrying the worker's `slot`) when a worker picks
+/// it up and a [`PlacementEvent::Finished`] when it completes, so a caller can
+/// drive a live per-worker display alongside the completion bookkeeping.
 ///
 /// Safe to run concurrently because the planner guarantees the batch is disjoint:
 /// distinct content has distinct destinations, and content shared between entries
@@ -619,7 +637,7 @@ pub struct PlacementOutcome {
 pub fn execute_placements_concurrent(
     jobs: Vec<PlacementJob>,
     workers: usize,
-    mut on_complete: impl FnMut(PlacementOutcome),
+    mut on_event: impl FnMut(PlacementEvent),
 ) {
     if jobs.is_empty() {
         return;
@@ -629,13 +647,23 @@ pub fn execute_placements_concurrent(
     let (tx, rx) = std::sync::mpsc::channel();
 
     std::thread::scope(|s| {
-        for _ in 0..workers {
+        // Each worker owns a stable `slot`, the lane a live display tracks it by.
+        for slot in 0..workers {
             let tx = tx.clone();
             let queue = &queue;
             s.spawn(move || {
                 loop {
                     let job = queue.lock().unwrap_or_else(|p| p.into_inner()).next();
                     let Some(job) = job else { break };
+                    if tx
+                        .send(PlacementEvent::Started {
+                            slot,
+                            plan_index: job.plan_index,
+                        })
+                        .is_err()
+                    {
+                        break; // receiver gone; nothing left to report to
+                    }
                     let result = match &job.kind {
                         PlacementKind::Copy { source, dest } => execute_copy(
                             &source.path,
@@ -651,16 +679,22 @@ pub fn execute_placements_concurrent(
                         ),
                         PlacementKind::Relocate { source, dest } => execute_relocate(source, dest),
                     };
-                    if tx.send(PlacementOutcome { job, result }).is_err() {
-                        break; // receiver gone; nothing left to report to
+                    if tx
+                        .send(PlacementEvent::Finished {
+                            slot,
+                            outcome: PlacementOutcome { job, result },
+                        })
+                        .is_err()
+                    {
+                        break;
                     }
                 }
             });
         }
         drop(tx); // workers hold the remaining senders; rx ends when they finish
 
-        for outcome in rx {
-            on_complete(outcome);
+        for event in rx {
+            on_event(event);
         }
     });
 }
@@ -1886,13 +1920,21 @@ mod tests {
         });
 
         let mut outcomes: Vec<(usize, bool)> = Vec::new();
-        execute_placements_concurrent(jobs, 4, |o| {
-            outcomes.push((o.job.plan_index, o.result.is_ok()));
+        let mut started = 0;
+        execute_placements_concurrent(jobs, 4, |e| match e {
+            PlacementEvent::Started { slot, .. } => {
+                assert!(slot < 4, "slot is within the worker pool");
+                started += 1;
+            }
+            PlacementEvent::Finished { outcome, .. } => {
+                outcomes.push((outcome.job.plan_index, outcome.result.is_ok()));
+            }
         });
         outcomes.sort_unstable();
 
-        // Every job reported exactly once; the eight good copies landed, the bad
-        // one failed and wrote nothing.
+        // Each job started and finished exactly once; the eight good copies
+        // landed, the bad one failed and wrote nothing.
+        assert_eq!(started, 9, "one start event per job");
         assert_eq!(outcomes.len(), 9);
         for (i, dest) in good_dests.iter().enumerate() {
             assert_eq!(outcomes[i], (i, true));

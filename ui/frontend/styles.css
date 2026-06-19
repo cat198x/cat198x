@@ -312,6 +312,36 @@ tr:hover td {
   text-overflow: ellipsis;
 }
 
+/* one row per worker slot — the live per-worker view */
+.slots {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-bottom: 10px;
+}
+
+.slot {
+  font-size: 0.85em;
+  font-variant-numeric: tabular-nums;
+  padding: 4px 8px;
+  border-radius: 6px;
+  border: 1px solid var(--line);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.slot.idle {
+  color: var(--muted);
+  opacity: 0.5;
+}
+
+.slot.busy {
+  color: var(--ink);
+  background: rgba(124, 122, 255, 0.08);
+  border-color: rgba(124, 122, 255, 0.3);
+}
+
 .progress {
   height: 10px;
   background: var(--panel-2);

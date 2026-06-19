@@ -28,6 +28,13 @@ use crate::db::{collections, files};
 use crate::plan::executor::check_disk_space;
 use crate::plan::{ApplyEvent, ApplyOptions, Plan, apply_plan, compute_state_hash};
 
+/// Worker concurrency for a UI/MCP-driven apply. Placements and repacks are
+/// latency-bound over a network mount, so a handful of workers overlaps the
+/// round-trips (see decisions/concurrent-apply.md); the destination is one
+/// volume, so this is bounded by the mount, not the CPU. The CLI tunes this via
+/// `--jobs`; the adapters here use a fixed sensible default.
+const APPLY_JOBS: usize = 6;
+
 /// Completeness of one collection against its active DAT.
 #[derive(Debug, Clone, Serialize)]
 pub struct CollectionStatus {
@@ -327,14 +334,24 @@ pub fn apply(
     apply_streaming(conn, data_dir, opts, &mut |_| {})
 }
 
-/// One operation's worth of progress, reported as a plan is applied.
+/// One progress update as a plan is applied — either an operation *starting* in a
+/// worker slot, or one *finishing*. A live display tracks `jobs` concurrent slots
+/// from these: occupy a slot on a start, free it on a finish.
 #[derive(Debug, Clone, Serialize)]
 pub struct ApplyProgress {
-    /// Operations started so far (monotonic; counts each op as it begins).
+    /// Operations completed so far (monotonic).
     pub done: usize,
     /// Total operations in the plan.
     pub total: usize,
-    /// The verb of the operation just started (COPY/MOVE/RELOCATE/…).
+    /// Number of worker slots (the configured concurrency), so the display sizes
+    /// its grid. A serial op (delete/quarantine) reports `slot: None`.
+    pub jobs: usize,
+    /// Which worker slot this update concerns, or `None` for a serial op.
+    pub slot: Option<usize>,
+    /// `true` when the operation finished (free the slot, bank its bytes); `false`
+    /// when it started (occupy the slot).
+    pub finished: bool,
+    /// The verb of the operation (COPY/MOVE/RELOCATE/…). Empty on a finish event.
     pub verb: String,
     /// The operation's source (or, for a repack, the destination archive).
     pub from: String,
@@ -342,9 +359,12 @@ pub struct ApplyProgress {
     pub to: Option<String>,
     /// This operation's size in bytes (a delete has none, so `0`).
     pub bytes: u64,
-    /// Cumulative bytes across every operation started so far — a running total
-    /// the adapter can show climbing as the apply proceeds.
+    /// Bytes of the operations that have **completed** — the processed total, which
+    /// never runs ahead of the disk because an in-flight op's bytes join it only
+    /// when it finishes.
     pub bytes_done: u64,
+    /// The plan's total bytes, so the display can show processed-of-total.
+    pub bytes_total: u64,
 }
 
 /// Like [`apply`], but reports each operation's progress through `on_progress`
@@ -441,28 +461,78 @@ pub fn apply_streaming(
         &ApplyOptions {
             dry_run: opts.dry_run,
             skip_repack: false,
-            // Placements and repacks are latency-bound over a network mount, so a
-            // handful of workers overlaps the round-trips (see
-            // decisions/concurrent-apply.md). The library destination is one
-            // volume, so this is bounded by the mount, not the CPU.
-            jobs: 6,
+            jobs: APPLY_JOBS,
             quarantine_dir,
         },
-        &mut |event| {
-            if let ApplyEvent::OpStarted { op, .. } = event {
+        &mut |event| match event {
+            ApplyEvent::OpStarted { op, slot, .. } => {
+                // Tally each op once as it begins.
                 *by_kind.entry(op.verb.to_string()).or_default() += 1;
+                match slot {
+                    // A placement starting in a worker slot: occupy the slot, but
+                    // don't count its bytes until it finishes.
+                    Some(s) => on_progress(ApplyProgress {
+                        done,
+                        total: total_ops,
+                        jobs: APPLY_JOBS,
+                        slot: Some(s),
+                        finished: false,
+                        verb: op.verb.to_string(),
+                        from: op.from.clone(),
+                        to: op.to.clone(),
+                        bytes: op.bytes,
+                        bytes_done,
+                        bytes_total: total_bytes,
+                    }),
+                    // A serial op (delete/quarantine) — or any op on a dry run —
+                    // runs and completes on this thread as it is announced, so
+                    // count it and its bytes now.
+                    None => {
+                        done += 1;
+                        bytes_done = bytes_done.saturating_add(op.bytes);
+                        on_progress(ApplyProgress {
+                            done,
+                            total: total_ops,
+                            jobs: APPLY_JOBS,
+                            slot: None,
+                            finished: true,
+                            verb: op.verb.to_string(),
+                            from: op.from.clone(),
+                            to: op.to.clone(),
+                            bytes: op.bytes,
+                            bytes_done,
+                            bytes_total: total_bytes,
+                        });
+                    }
+                }
+            }
+            // A placement finished: free its slot and bank its bytes (only now, so
+            // the processed total never runs ahead of the disk).
+            ApplyEvent::OpFinished {
+                slot,
+                bytes,
+                success,
+                ..
+            } => {
                 done += 1;
-                bytes_done = bytes_done.saturating_add(op.bytes);
+                if success {
+                    bytes_done = bytes_done.saturating_add(bytes);
+                }
                 on_progress(ApplyProgress {
                     done,
                     total: total_ops,
-                    verb: op.verb.to_string(),
-                    from: op.from.clone(),
-                    to: op.to.clone(),
-                    bytes: op.bytes,
+                    jobs: APPLY_JOBS,
+                    slot,
+                    finished: true,
+                    verb: String::new(),
+                    from: String::new(),
+                    to: None,
+                    bytes,
                     bytes_done,
+                    bytes_total: total_bytes,
                 });
             }
+            _ => {}
         },
     )?;
 
@@ -852,14 +922,17 @@ mod tests {
         .unwrap()
         .expect("a plan");
 
-        // One progress callback per operation, monotonic, total carried through.
+        // A dry run goes through the serial path, so each op is a slotless update
+        // that completes as it is announced: one per operation, monotonic.
         assert_eq!(progress.len(), 2);
         assert_eq!((progress[0].done, progress[0].total), (1, 2));
         assert_eq!((progress[1].done, progress[1].total), (2, 2));
         assert_eq!(progress[0].verb, "COPY");
         assert_eq!(progress[1].verb, "DELETE");
+        assert!(progress.iter().all(|p| p.slot.is_none() && p.finished));
+        assert!(progress.iter().all(|p| p.bytes_total == 10));
 
-        // The copy carries its paths and size; the running byte total accrues it.
+        // The copy carries its paths and size; the processed total accrues it.
         assert_eq!(progress[0].from, "/staging/a.rom");
         assert_eq!(
             progress[0].to.as_deref(),
@@ -874,5 +947,61 @@ mod tests {
         assert_eq!(progress[1].to, None);
         assert_eq!(progress[1].bytes, 0);
         assert_eq!(progress[1].bytes_done, 10);
+    }
+
+    // A real apply runs placements concurrently: each reports a start (occupying a
+    // worker slot, bytes not yet counted) and a finish (freeing the slot, bytes
+    // banked), so the processed total never runs ahead of the disk.
+    #[test]
+    fn real_apply_reports_slotted_start_and_finish_per_placement() {
+        let db = Database::open_in_memory().unwrap();
+        let conn = db.conn();
+        let tmp = tempfile::tempdir().unwrap();
+        let plans = tmp.path().join("objects/plans");
+        std::fs::create_dir_all(&plans).unwrap();
+
+        let mut plan = crate::plan::Plan::new(compute_state_hash(conn).unwrap());
+        let src = tmp.path().join("a.rom");
+        std::fs::write(&src, b"hello").unwrap(); // sha1 aaf4c6…, 5 bytes
+        plan.add_move(
+            crate::plan::SourceRef {
+                path: src.to_string_lossy().into_owned(),
+                archive_path: None,
+                sha1: "aaf4c61ddcc5e8a2dabede0f3b482cd9aea9434d".into(),
+                entry_name: None,
+            },
+            tmp.path().join("lib/a.rom").to_string_lossy().into_owned(),
+            5,
+        );
+        std::fs::write(plans.join("p.json"), serde_json::to_string(&plan).unwrap()).unwrap();
+
+        let mut progress = Vec::new();
+        apply_streaming(
+            conn,
+            tmp.path(),
+            ApplyRunOptions {
+                dry_run: false,
+                skip_space_check: false,
+            },
+            &mut |p| progress.push(p),
+        )
+        .unwrap()
+        .expect("a plan");
+
+        // A start (slotted, processed still 0) then a finish (slot freed, bytes
+        // banked) — the move's 5 bytes count only once it has completed.
+        let start = progress.iter().find(|p| !p.finished).expect("a start");
+        assert!(start.slot.is_some(), "a placement runs in a worker slot");
+        assert_eq!(start.verb, "MOVE");
+        assert_eq!(start.bytes_done, 0, "bytes not counted while in flight");
+
+        let finish = progress
+            .iter()
+            .rev()
+            .find(|p| p.finished)
+            .expect("a finish");
+        assert!(finish.slot.is_some());
+        assert_eq!(finish.bytes_done, 5, "bytes banked on completion");
+        assert_eq!(finish.done, 1);
     }
 }

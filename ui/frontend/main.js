@@ -457,13 +457,27 @@ let applyUnlisten = null;
 // report. The two commands never run at once, so they share the one channel; the
 // caller decides how to render success, and an error propagates to its catch.
 async function streamApply(body, command, startLabel) {
-  // Two rows above the bar: a counts line (N/total, %, running bytes) and a
-  // detail line (the current operation's source → destination).
+  // A counts line, then one row per worker slot (filled lazily once the first
+  // event reveals how many), then the bar. Each slot shows the file that worker
+  // is currently on; serial ops (delete/quarantine) show on a shared line.
   const counts = el("div", { class: "muted" }, startLabel);
-  const detail = el("div", { class: "prog-detail" }, "");
+  const slotsEl = el("div", { class: "slots" });
+  const serial = el("div", { class: "prog-detail" }, "");
   const fill = el("span", {});
   const bar = el("div", { class: "progress" }, fill);
-  body.replaceChildren(el("div", { class: "prog-wrap" }, counts, detail, bar));
+  body.replaceChildren(el("div", { class: "prog-wrap" }, counts, slotsEl, serial, bar));
+
+  let slotRows = null; // one element per worker, built on the first event
+
+  const ensureSlots = (jobs) => {
+    if (slotRows || !jobs) return;
+    slotRows = Array.from({ length: jobs }, () => el("div", { class: "slot idle" }, "idle"));
+    slotsEl.replaceChildren(...slotRows);
+  };
+  const opText = (verb, from, to, bytes) => {
+    const size = bytes ? `  ·  ${fmtBytes(bytes)}` : "";
+    return to ? `${verb} ${shortPath(from)} → ${shortPath(to)}${size}` : `${verb} ${shortPath(from)}${size}`;
+  };
 
   const stop = () => {
     if (applyUnlisten) {
@@ -474,16 +488,29 @@ async function streamApply(body, command, startLabel) {
 
   stop(); // drop any listener from a previous run
   applyUnlisten = await window.__TAURI__.event.listen("apply-progress", (e) => {
-    const { done, total, verb, from, to, bytes, bytes_done } = e.payload;
+    const { done, total, jobs, slot, finished, verb, from, to, bytes, bytes_done, bytes_total } =
+      e.payload;
+    ensureSlots(jobs);
+
     const pct = total ? Math.round((done / total) * 100) : 0;
     fill.style.width = pct + "%";
     counts.textContent =
-      `${done.toLocaleString()} / ${total.toLocaleString()} (${pct}%) · ${verb}` +
-      ` · ${fmtBytes(bytes_done)} processed`;
-    const size = bytes ? `  (${fmtBytes(bytes)})` : "";
-    detail.textContent = to
-      ? `${shortPath(from)} → ${shortPath(to)}${size}`
-      : `${shortPath(from)}${size}`;
+      `${done.toLocaleString()} / ${total.toLocaleString()} (${pct}%)` +
+      ` · ${fmtBytes(bytes_done)} of ${fmtBytes(bytes_total)} processed`;
+
+    if (slot != null && slotRows && slotRows[slot]) {
+      const row = slotRows[slot];
+      if (finished) {
+        row.className = "slot idle";
+        row.textContent = "idle";
+      } else {
+        row.className = "slot busy";
+        row.textContent = opText(verb, from, to, bytes);
+      }
+    } else if (slot == null && verb) {
+      // A serial op (delete/quarantine/repack) — show it on the shared line.
+      serial.textContent = opText(verb, from, to, bytes);
+    }
   });
   try {
     return await invoke(command);

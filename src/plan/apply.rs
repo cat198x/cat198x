@@ -21,7 +21,7 @@ use rusqlite::Connection;
 use crate::db::files::{self, Source};
 use crate::db::quarantine::QuarantineReason;
 use crate::plan::executor::{
-    PlacementJob, PlacementKind, PlacementOutcome, RepackJob, RepackOutcome,
+    PlacementEvent, PlacementJob, PlacementKind, PlacementOutcome, RepackJob, RepackOutcome,
     delete_has_surviving_copy, execute_copy, execute_move, execute_placements_concurrent,
     execute_quarantine, execute_relocate, execute_repacks_concurrent,
 };
@@ -62,11 +62,23 @@ pub struct OpView {
 /// adapters turn these into console lines, UI updates, or summaries.
 #[derive(Debug, Clone)]
 pub enum ApplyEvent {
-    /// An operation is starting (or, on a dry run, would run).
+    /// An operation is starting (or, on a dry run, would run). `slot` is the
+    /// worker lane running it for a concurrent placement (`0..jobs`), or `None`
+    /// for a serial operation (delete/quarantine) and on a dry run.
     OpStarted {
         index: usize,
         total: usize,
+        slot: Option<usize>,
         op: OpView,
+    },
+    /// An operation has finished (success or not). Pairs with an earlier
+    /// `OpStarted` of the same `index`/`slot`; carries the op's `bytes` so a
+    /// caller can bank processed bytes only on completion, and free the slot.
+    OpFinished {
+        index: usize,
+        slot: Option<usize>,
+        bytes: u64,
+        success: bool,
     },
     /// A delete or copy/repack reverse whose target was already gone — an
     /// idempotent success, not a failure.
@@ -293,9 +305,12 @@ pub fn apply_plan(
         );
 
         let op = &mut plan.operations[i];
+        // A serial op (delete/quarantine, or any op on a dry run) runs on this
+        // thread, so it has no worker slot.
         on_event(ApplyEvent::OpStarted {
             index: i,
             total: total_ops,
+            slot: None,
             op: OpView::of(&op.kind),
         });
 
@@ -595,54 +610,68 @@ fn flush_placement_batch(
     }
     let jobs = std::mem::take(batch);
 
-    execute_placements_concurrent(jobs, workers, |outcome: PlacementOutcome| {
-        let PlacementOutcome { job, result } = outcome;
-
-        // The op view (verb, paths, bytes) comes from the plan op itself, before
-        // the mutable borrow below, so the progress display matches serial apply.
-        on_event(ApplyEvent::OpStarted {
-            index: job.plan_index,
-            total: total_ops,
-            op: OpView::of(&plan.operations[job.plan_index].kind),
-        });
-
-        if let Some(log) = op_log {
-            let success = result.is_ok();
-            match &job.kind {
-                PlacementKind::Copy { source, dest } => {
-                    log.log_copy(job.operation_id, &source.path, dest, &source.sha1, success)
-                }
-                PlacementKind::Move { source, dest } => {
-                    log.log_move(job.operation_id, &source.path, dest, &source.sha1, success)
-                }
-                PlacementKind::Relocate { source, dest } => {
-                    log.log_relocate(job.operation_id, source, dest, success)
-                }
-            }
+    execute_placements_concurrent(jobs, workers, |event| match event {
+        // A worker picked up a job: surface it in that worker's slot. The op view
+        // (verb, paths, bytes) comes from the plan op itself.
+        PlacementEvent::Started { slot, plan_index } => {
+            on_event(ApplyEvent::OpStarted {
+                index: plan_index,
+                total: total_ops,
+                slot: Some(slot),
+                op: OpView::of(&plan.operations[plan_index].kind),
+            });
         }
+        // A job finished: journal it, update status + catalogue, free the slot.
+        PlacementEvent::Finished { slot, outcome } => {
+            let PlacementOutcome { job, result } = outcome;
+            let bytes = OpView::of(&plan.operations[job.plan_index].kind).bytes;
 
-        let op = &mut plan.operations[job.plan_index];
-        match result {
-            Ok(()) => {
-                op.status = OperationStatus::Completed;
-                *success_count += 1;
-
-                // Keep the catalogue in step, as the serial path does per-op.
-                if let Err(e) = sync_catalogue_after(conn, sources, &op.kind) {
-                    on_event(ApplyEvent::CatalogueWarning {
-                        op_id: op.id,
-                        message: e.to_string(),
-                    });
+            if let Some(log) = op_log {
+                let success = result.is_ok();
+                match &job.kind {
+                    PlacementKind::Copy { source, dest } => {
+                        log.log_copy(job.operation_id, &source.path, dest, &source.sha1, success)
+                    }
+                    PlacementKind::Move { source, dest } => {
+                        log.log_move(job.operation_id, &source.path, dest, &source.sha1, success)
+                    }
+                    PlacementKind::Relocate { source, dest } => {
+                        log.log_relocate(job.operation_id, source, dest, success)
+                    }
                 }
             }
-            Err(e) => {
-                on_event(ApplyEvent::OpFailed {
-                    index: job.plan_index,
-                    message: format!("{e:#}"),
-                });
-                op.status = OperationStatus::Failed;
-                *error_count += 1;
+
+            let success = result.is_ok();
+            let op = &mut plan.operations[job.plan_index];
+            match result {
+                Ok(()) => {
+                    op.status = OperationStatus::Completed;
+                    *success_count += 1;
+
+                    // Keep the catalogue in step, as the serial path does per-op.
+                    if let Err(e) = sync_catalogue_after(conn, sources, &op.kind) {
+                        on_event(ApplyEvent::CatalogueWarning {
+                            op_id: op.id,
+                            message: e.to_string(),
+                        });
+                    }
+                }
+                Err(e) => {
+                    on_event(ApplyEvent::OpFailed {
+                        index: job.plan_index,
+                        message: format!("{e:#}"),
+                    });
+                    op.status = OperationStatus::Failed;
+                    *error_count += 1;
+                }
             }
+
+            on_event(ApplyEvent::OpFinished {
+                index: job.plan_index,
+                slot: Some(slot),
+                bytes,
+                success,
+            });
         }
     });
 }
@@ -680,9 +709,12 @@ fn flush_repack_batch(
 
     execute_repacks_concurrent(jobs, workers, |outcome: RepackOutcome| {
         let RepackOutcome { job, result } = outcome;
+        // Repacks report on completion (no separate slot lane); the caller treats
+        // a slotless OpStarted as an op that completes as it is announced.
         on_event(ApplyEvent::OpStarted {
             index: job.plan_index,
             total: total_ops,
+            slot: None,
             op: OpView {
                 verb: "REPACK",
                 from: job.dest.clone(),
