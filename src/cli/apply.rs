@@ -193,7 +193,12 @@ pub fn run(
 /// Errors, refusals, and warnings go to stderr; everything else to stdout.
 fn print_event(event: &ApplyEvent) {
     match event {
-        ApplyEvent::OpStarted { index, total, op } => {
+        // The CLI prints one line per op as it starts; the slot lane and the
+        // paired OpFinished are for live displays, so it ignores them here.
+        ApplyEvent::OpFinished { .. } => {}
+        ApplyEvent::OpStarted {
+            index, total, op, ..
+        } => {
             let n = index + 1;
             match (op.file_count, &op.to) {
                 (Some(count), _) => println!(

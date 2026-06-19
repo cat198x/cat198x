@@ -129,23 +129,29 @@ async fn apply_preview() -> Result<Option<ApplyReport>, String> {
     .map_err(|e| e.to_string())
 }
 
+/// Forward an apply-progress update to the webview, throttled to ~30/s so even an
+/// instant-rename burst can't flood IPC, while every worker-slot transition still
+/// arrives promptly (ops are network-latency-bound, so they change slower than
+/// the throttle). The terminal update (`done == total`) is always forwarded.
+fn emit_progress(app: &tauri::AppHandle, last: &mut std::time::Instant, p: &ops::ApplyProgress) {
+    if p.done == p.total || last.elapsed() >= std::time::Duration::from_millis(33) {
+        *last = std::time::Instant::now();
+        let _ = app.emit("apply-progress", p);
+    }
+}
+
 /// A dry-run apply that streams per-operation progress to the frontend as it
 /// runs (the `apply-progress` event), then returns the final report. Same as
-/// `apply_preview` but with a live progress bar; the live (real) apply will
-/// reuse this exact stream. Emits are throttled to ~1% steps so a large plan
-/// doesn't flood the webview.
+/// `apply_preview` but with a live progress bar; the live (real) apply reuses
+/// this exact stream.
 #[tauri::command]
 async fn apply_stream(app: tauri::AppHandle) -> Result<Option<ApplyReport>, String> {
     tauri::async_runtime::spawn_blocking(move || -> anyhow::Result<_> {
         let dir = data_dir()?;
         let db = Database::open(&dir.join("db.sqlite"))?;
-        let mut last_emit = 0usize;
+        let mut last = std::time::Instant::now();
         ops::apply_streaming(db.conn(), &dir, ops::ApplyRunOptions::preview(), &mut |p| {
-            let step = (p.total / 100).max(1);
-            if p.done == p.total || p.done - last_emit >= step {
-                last_emit = p.done;
-                let _ = app.emit("apply-progress", &p);
-            }
+            emit_progress(&app, &mut last, &p)
         })
     })
     .await
@@ -168,7 +174,7 @@ async fn apply_execute(app: tauri::AppHandle) -> Result<Option<ApplyReport>, Str
     tauri::async_runtime::spawn_blocking(move || -> anyhow::Result<_> {
         let dir = data_dir()?;
         let db = Database::open(&dir.join("db.sqlite"))?;
-        let mut last_emit = 0usize;
+        let mut last = std::time::Instant::now();
         ops::apply_streaming(
             db.conn(),
             &dir,
@@ -176,13 +182,7 @@ async fn apply_execute(app: tauri::AppHandle) -> Result<Option<ApplyReport>, Str
                 dry_run: false,
                 skip_space_check: false,
             },
-            &mut |p| {
-                let step = (p.total / 100).max(1);
-                if p.done == p.total || p.done - last_emit >= step {
-                    last_emit = p.done;
-                    let _ = app.emit("apply-progress", &p);
-                }
-            },
+            &mut |p| emit_progress(&app, &mut last, &p),
         )
     })
     .await
