@@ -287,6 +287,9 @@ pub struct ApplyReport {
     pub disk_detail: Option<String>,
     pub total_ops: usize,
     pub pending: usize,
+    /// Bytes the plan would transfer (copy/move), from the plan summary — the
+    /// figure a confirm gate states before a real apply ("move ~X").
+    pub total_bytes: u64,
     /// Operation count by kind (copy/move/relocate/repack/delete/quarantine),
     /// tallied from the apply engine's own progress events.
     pub by_kind: BTreeMap<String, usize>,
@@ -352,6 +355,7 @@ pub fn apply_streaming(
         Err(e) => (false, Some(e.to_string())),
     };
     let total_ops = plan.operations.len();
+    let total_bytes = plan.summary.total_bytes;
     let pending = plan
         .operations
         .iter()
@@ -383,6 +387,7 @@ pub fn apply_streaming(
                 disk_detail,
                 total_ops,
                 pending,
+                total_bytes,
             )));
         }
         if !disk_ok && !opts.skip_space_check {
@@ -397,6 +402,7 @@ pub fn apply_streaming(
                 disk_detail,
                 total_ops,
                 pending,
+                total_bytes,
             )));
         }
     }
@@ -439,6 +445,7 @@ pub fn apply_streaming(
         disk_detail,
         total_ops,
         pending,
+        total_bytes,
         by_kind,
         dry_run: opts.dry_run,
         refused: None,
@@ -457,6 +464,7 @@ fn refused_report(
     disk_detail: Option<String>,
     total_ops: usize,
     pending: usize,
+    total_bytes: u64,
 ) -> ApplyReport {
     ApplyReport {
         stale,
@@ -464,6 +472,7 @@ fn refused_report(
         disk_detail,
         total_ops,
         pending,
+        total_bytes,
         by_kind: BTreeMap::new(),
         dry_run: false,
         refused: Some(reason),
@@ -654,6 +663,10 @@ mod tests {
         assert!(!report.stale, "plan hash matches the (empty) catalogue");
         assert_eq!(report.total_ops, 2);
         assert_eq!(report.pending, 2);
+        assert_eq!(
+            report.total_bytes, 10,
+            "the copy's bytes, from the plan summary"
+        );
         // Tallied from the engine's own progress events.
         assert_eq!(report.by_kind.get("COPY"), Some(&1));
         assert_eq!(report.by_kind.get("DELETE"), Some(&1));
