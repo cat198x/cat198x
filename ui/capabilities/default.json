@@ -1,7 +1,7 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "Capabilities for the main window: it invokes the app's own read-only commands and needs no extra core permissions.",
+  "description": "Capabilities for the main window: it invokes the app's own commands (including the confirm-gated apply) and needs no extra core permissions.",
   "windows": ["main"],
   "permissions": ["core:default"]
 }

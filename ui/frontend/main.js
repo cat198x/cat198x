@@ -441,15 +441,15 @@ function renderPlan(body, plan) {
   body.replaceChildren(summary, meta, list);
 }
 
-// ---- Apply preview (dry run) ----
+// ---- Apply preview + confirm-gated apply ----
 let applyUnlisten = null;
 
-async function loadPreview() {
-  const body = document.getElementById("preview-body");
-  body.className = "";
-
-  // Live progress bar, fed by the apply engine's `apply-progress` events.
-  const label = el("div", { class: "muted" }, "Starting dry run…");
+// Run an apply command — the dry-run preview or the real execute — with a live
+// progress bar fed by the engine's `apply-progress` events, and return the final
+// report. The two commands never run at once, so they share the one channel; the
+// caller decides how to render success, and an error propagates to its catch.
+async function streamApply(body, command, startLabel) {
+  const label = el("div", { class: "muted" }, startLabel);
   const fill = el("span", {});
   const bar = el("div", { class: "progress" }, fill);
   body.replaceChildren(el("div", { class: "prog-wrap" }, label, bar));
@@ -461,19 +461,27 @@ async function loadPreview() {
     }
   };
 
+  stop(); // drop any listener from a previous run
+  applyUnlisten = await window.__TAURI__.event.listen("apply-progress", (e) => {
+    const { done, total, verb } = e.payload;
+    const pct = total ? Math.round((done / total) * 100) : 0;
+    fill.style.width = pct + "%";
+    label.textContent = `${done.toLocaleString()} / ${total.toLocaleString()} (${pct}%) — ${verb}`;
+  });
   try {
-    stop(); // drop any listener from a previous run
-    applyUnlisten = await window.__TAURI__.event.listen("apply-progress", (e) => {
-      const { done, total, verb } = e.payload;
-      const pct = total ? Math.round((done / total) * 100) : 0;
-      fill.style.width = pct + "%";
-      label.textContent = `${done.toLocaleString()} / ${total.toLocaleString()} (${pct}%) — ${verb}`;
-    });
-    const report = await invoke("apply_stream");
+    return await invoke(command);
+  } finally {
     stop();
+  }
+}
+
+async function loadPreview() {
+  const body = document.getElementById("preview-body");
+  body.className = "";
+  try {
+    const report = await streamApply(body, "apply_stream", "Starting dry run…");
     renderPreview(body, report);
   } catch (e) {
-    stop();
     showError(body, e);
   }
 }
@@ -486,13 +494,29 @@ function renderPreview(body, r) {
     );
     return;
   }
+
+  // A plan with some operations already done is mid-flight: re-applying resumes
+  // it (the library allows a started plan through the staleness gate), so its
+  // own catalogue drift is expected, not a reason to regenerate.
+  const started = r.pending < r.total_ops;
+
   const parts = [];
-  if (r.stale) {
+  // Only warn "regenerate" when staleness would actually block — a fresh plan.
+  // A started+stale plan resumes instead, so it gets a resume note, not a block.
+  if (r.stale && !started) {
     parts.push(
       el(
         "div",
         { class: "stale-banner" },
         "⚠ The plan predates the current catalogue — regenerate with `cat198x plan` before applying."
+      )
+    );
+  } else if (started) {
+    parts.push(
+      el(
+        "div",
+        { class: "stale-banner" },
+        `↻ A previous apply was interrupted — ${r.pending.toLocaleString()} operation(s) remain. Apply to resume.`
       )
     );
   }
@@ -525,6 +549,105 @@ function renderPreview(body, r) {
       `${r.total_ops.toLocaleString()} operation(s), ${r.pending.toLocaleString()} pending · dry run — nothing was changed`
     )
   );
+
+  // Offer the real apply only when there is pending work that would actually run:
+  // it must fit on disk, and either be a fresh non-stale plan or a started one to
+  // resume. A fresh+stale plan is blocked at the library gate, so don't present a
+  // button that could only be refused.
+  if (r.pending > 0 && r.disk_ok && (!r.stale || started)) {
+    parts.push(applyGate(body, r, started));
+  }
+
+  body.replaceChildren(...parts);
+}
+
+// The confirm gate: an "Apply…" button whose click reveals an explicit
+// confirmation. Nothing mutates until that confirmation is clicked — the click
+// is the authorisation. Cancel returns to the preview, having done nothing.
+function applyGate(body, r, started) {
+  const wrap = el("div", { class: "apply-gate" });
+
+  const verb = started ? "Resume — apply" : "Apply";
+  const ask = el(
+    "button",
+    { class: "apply-btn", type: "button" },
+    `${verb} ${r.pending.toLocaleString()} operation(s)…`
+  );
+
+  ask.addEventListener("click", () => {
+    const msg = el(
+      "div",
+      { class: "confirm-msg" },
+      `Apply ${r.pending.toLocaleString()} operation(s), moving ~${fmtBytes(r.total_bytes)}? ` +
+        "Files are moved and staging freed — reversible only with `cat198x apply --rollback`."
+    );
+    const go = el("button", { class: "apply-btn danger", type: "button" }, "Confirm apply");
+    const cancel = el("button", { class: "ghost-btn", type: "button" }, "Cancel");
+    cancel.addEventListener("click", () => loadPreview());
+    go.addEventListener("click", () => runExecute(body));
+    wrap.replaceChildren(msg, el("div", { class: "confirm-row" }, go, cancel));
+  });
+
+  wrap.replaceChildren(ask);
+  return wrap;
+}
+
+// Drive the real apply and render its outcome. Reused by the confirm gate and by
+// the "Apply again to resume" button, which re-runs the same mutating command —
+// a started plan resumes its still-pending operations.
+async function runExecute(body) {
+  try {
+    const report = await streamApply(body, "apply_execute", "Applying…");
+    renderExecuteResult(body, report);
+  } catch (e) {
+    showError(body, e);
+  }
+}
+
+// The outcome of a real apply. A flaky network mount can drop mid-run, so some
+// operations may have failed; apply is resumable (per-op status, journaled), so
+// surface "N done, M remaining — Apply again to resume" rather than treat a
+// partial run as a dead end.
+function renderExecuteResult(body, r) {
+  body.className = "";
+  if (!r) {
+    body.replaceChildren(el("div", { class: "empty" }, "No plan to apply."));
+    return;
+  }
+  // The library refused at a gate (stale / won't fit): nothing was touched.
+  if (r.refused) {
+    body.replaceChildren(el("div", { class: "stale-banner" }, "⚠ Apply refused: " + r.refused));
+    return;
+  }
+
+  const parts = [];
+  const clean = r.failed === 0;
+  parts.push(
+    el(
+      "div",
+      { class: clean ? "disk-ok" : "error" },
+      `${r.succeeded.toLocaleString()} operation(s) applied` +
+        (r.failed ? `, ${r.failed.toLocaleString()} failed` : "") +
+        "."
+    )
+  );
+
+  if (r.failed > 0) {
+    parts.push(
+      el(
+        "div",
+        { class: "muted", style: "margin-top:6px" },
+        `${r.succeeded.toLocaleString()} done, ${r.failed.toLocaleString()} remaining — the mount may have dropped. Apply again to resume the rest.`
+      )
+    );
+    const resume = el("button", { class: "apply-btn", type: "button" }, "Apply again to resume");
+    resume.addEventListener("click", () => runExecute(body));
+    parts.push(resume);
+  } else {
+    parts.push(
+      el("div", { class: "muted", style: "margin-top:6px" }, "The library is now in place.")
+    );
+  }
   body.replaceChildren(...parts);
 }
 
