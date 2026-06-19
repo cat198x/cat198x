@@ -316,6 +316,58 @@ tr:hover td {
   transition: width 0.15s ease;
 }
 
+/* confirm-gated apply */
+.apply-gate {
+  margin-top: 16px;
+}
+
+.apply-btn {
+  font: inherit;
+  color: #fff;
+  background: var(--accent);
+  border: 1px solid var(--accent);
+  border-radius: 8px;
+  padding: 9px 16px;
+  cursor: pointer;
+}
+
+.apply-btn:hover {
+  filter: brightness(1.1);
+}
+
+.apply-btn.danger {
+  background: var(--bad);
+  border-color: var(--bad);
+}
+
+.ghost-btn {
+  font: inherit;
+  color: var(--muted);
+  background: transparent;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 9px 16px;
+  cursor: pointer;
+}
+
+.ghost-btn:hover {
+  color: var(--ink);
+}
+
+.confirm-msg {
+  color: var(--ink);
+  background: rgba(224, 122, 122, 0.08);
+  border: 1px solid rgba(224, 122, 122, 0.3);
+  border-radius: 8px;
+  padding: 10px 14px;
+  margin-bottom: 12px;
+}
+
+.confirm-row {
+  display: flex;
+  gap: 10px;
+}
+
 /* per-node pending detail overlay */
 .detail-overlay {
   position: fixed;
