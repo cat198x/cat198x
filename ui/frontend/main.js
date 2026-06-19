@@ -19,6 +19,14 @@ function fmtBytes(n) {
   return i === 0 ? `${v} ${u[i]}` : `${v.toFixed(2)} ${u[i]}`;
 }
 
+// The tail of a path — the last few segments — so a long absolute path stays
+// legible on one progress line. Short paths are returned whole.
+function shortPath(p) {
+  if (!p) return "";
+  const segs = p.split("/").filter(Boolean);
+  return segs.length <= 3 ? p : "…/" + segs.slice(-3).join("/");
+}
+
 function el(tag, attrs = {}, ...children) {
   const node = document.createElement(tag);
   for (const [k, v] of Object.entries(attrs)) {
@@ -449,10 +457,13 @@ let applyUnlisten = null;
 // report. The two commands never run at once, so they share the one channel; the
 // caller decides how to render success, and an error propagates to its catch.
 async function streamApply(body, command, startLabel) {
-  const label = el("div", { class: "muted" }, startLabel);
+  // Two rows above the bar: a counts line (N/total, %, running bytes) and a
+  // detail line (the current operation's source → destination).
+  const counts = el("div", { class: "muted" }, startLabel);
+  const detail = el("div", { class: "prog-detail" }, "");
   const fill = el("span", {});
   const bar = el("div", { class: "progress" }, fill);
-  body.replaceChildren(el("div", { class: "prog-wrap" }, label, bar));
+  body.replaceChildren(el("div", { class: "prog-wrap" }, counts, detail, bar));
 
   const stop = () => {
     if (applyUnlisten) {
@@ -463,10 +474,16 @@ async function streamApply(body, command, startLabel) {
 
   stop(); // drop any listener from a previous run
   applyUnlisten = await window.__TAURI__.event.listen("apply-progress", (e) => {
-    const { done, total, verb } = e.payload;
+    const { done, total, verb, from, to, bytes, bytes_done } = e.payload;
     const pct = total ? Math.round((done / total) * 100) : 0;
     fill.style.width = pct + "%";
-    label.textContent = `${done.toLocaleString()} / ${total.toLocaleString()} (${pct}%) — ${verb}`;
+    counts.textContent =
+      `${done.toLocaleString()} / ${total.toLocaleString()} (${pct}%) · ${verb}` +
+      ` · ${fmtBytes(bytes_done)} processed`;
+    const size = bytes ? `  (${fmtBytes(bytes)})` : "";
+    detail.textContent = to
+      ? `${shortPath(from)} → ${shortPath(to)}${size}`
+      : `${shortPath(from)}${size}`;
   });
   try {
     return await invoke(command);
