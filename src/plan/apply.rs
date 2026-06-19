@@ -57,6 +57,10 @@ pub struct OpView {
     /// The operation's size in bytes (a delete has none, so `0`). Adapters show
     /// it as a per-op figure and accumulate it into a running total.
     pub bytes: u64,
+    /// Why this op is safe to do, when it carries a reason: a dedup delete names
+    /// the canonical copy it keeps; a quarantine names what flagged it. `None`
+    /// for ops whose intent is evident from the verb and paths.
+    pub reason: Option<String>,
 }
 
 /// A progress event emitted as a plan is applied. The library never prints;
@@ -122,6 +126,7 @@ impl OpView {
                 to: Some(dest.clone()),
                 file_count: None,
                 bytes: *size,
+                reason: None,
             },
             OperationKind::Move { source, dest, size } => OpView {
                 verb: "MOVE",
@@ -129,6 +134,7 @@ impl OpView {
                 to: Some(dest.clone()),
                 file_count: None,
                 bytes: *size,
+                reason: None,
             },
             OperationKind::Relocate { source, dest, size } => OpView {
                 verb: "RELOCATE",
@@ -136,6 +142,7 @@ impl OpView {
                 to: Some(dest.clone()),
                 file_count: None,
                 bytes: *size,
+                reason: None,
             },
             OperationKind::Repack {
                 sources,
@@ -148,20 +155,25 @@ impl OpView {
                 to: None,
                 file_count: Some(sources.len()),
                 bytes: *size,
+                reason: None,
             },
-            OperationKind::Delete { path } => OpView {
+            OperationKind::Delete { path, reason } => OpView {
                 verb: "DELETE",
                 from: path.clone(),
                 to: None,
                 file_count: None,
                 bytes: 0,
+                reason: (!reason.is_empty()).then(|| reason.clone()),
             },
-            OperationKind::Quarantine { path, size, .. } => OpView {
+            OperationKind::Quarantine {
+                path, size, reason, ..
+            } => OpView {
                 verb: "QUARANTINE",
                 from: path.clone(),
                 to: None,
                 file_count: None,
                 bytes: *size,
+                reason: Some(reason.clone()),
             },
         }
     }
@@ -423,7 +435,7 @@ pub fn apply_plan(
                 op.status = OperationStatus::Failed;
                 error_count += 1;
             }
-            OperationKind::Delete { path } => {
+            OperationKind::Delete { path, .. } => {
                 // Verify-before-delete: a plan deletes a file only because its
                 // content is held elsewhere, but never destroy the last copy on
                 // a stale record. Refuse if no surviving copy physically exists.
@@ -727,6 +739,7 @@ fn flush_repack_batch(
         to: None,
         file_count: Some(sources_len),
         bytes: size,
+        reason: None,
     };
 
     execute_repacks_concurrent(jobs, workers, |event| match event {
@@ -853,7 +866,7 @@ fn sync_catalogue_after(conn: &Connection, sources: &[Source], kind: &OperationK
                 }
             }
         }
-        OperationKind::Quarantine { path, .. } | OperationKind::Delete { path } => {
+        OperationKind::Quarantine { path, .. } | OperationKind::Delete { path, .. } => {
             if let Some((src, rel)) = files::resolve_in_sources(sources, path) {
                 files::remove_locations_at(conn, src, &rel)?;
             }
@@ -1067,7 +1080,10 @@ mod tests {
         let sources = list_sources(conn).unwrap();
 
         let mut plan = Plan::new("statehash".to_string());
-        plan.add_delete(victim.to_string_lossy().into_owned());
+        plan.add_delete(
+            victim.to_string_lossy().into_owned(),
+            "exact duplicate — kept elsewhere".into(),
+        );
 
         let first = apply_plan(
             conn,
@@ -1196,7 +1212,10 @@ mod tests {
             );
         }
         // An uncatalogued delete (refused) — present only to mark the boundary.
-        plan.add_delete(tmp.path().join("nope.bin").to_string_lossy().into_owned());
+        plan.add_delete(
+            tmp.path().join("nope.bin").to_string_lossy().into_owned(),
+            "exact duplicate — kept elsewhere".into(),
+        );
 
         let mut verbs: Vec<&'static str> = Vec::new();
         apply_plan(

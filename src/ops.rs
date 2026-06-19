@@ -371,6 +371,10 @@ pub struct ApplyProgress {
     pub outcome: Option<String>,
     /// The error message or refusal reason, for a `failed`/`refused` log line.
     pub detail: Option<String>,
+    /// Why the operation is safe to do, when it carries one — a dedup delete names
+    /// the canonical copy it keeps, a quarantine names what flagged it. Lets the
+    /// display reassure on a mass delete ("kept …"); `None` for self-evident ops.
+    pub reason: Option<String>,
 }
 
 /// Like [`apply`], but reports each operation's progress through `on_progress`
@@ -472,7 +476,8 @@ pub fn apply_streaming(
               bytes,
               bytes_done,
               outcome,
-              detail| {
+              detail,
+              reason| {
         ApplyProgress {
             done,
             total: total_ops,
@@ -487,6 +492,7 @@ pub fn apply_streaming(
             bytes_total: total_bytes,
             outcome,
             detail,
+            reason,
         }
     };
 
@@ -519,6 +525,7 @@ pub fn apply_streaming(
                     bytes_done,
                     None,
                     None,
+                    op.reason.clone(),
                 ));
             }
             ApplyEvent::OpFinished {
@@ -548,6 +555,7 @@ pub fn apply_streaming(
                     bytes_done,
                     Some(outcome.to_string()),
                     detail,
+                    op.reason.clone(),
                 ));
             }
             _ => {}
@@ -769,7 +777,10 @@ mod tests {
             dest.to_string_lossy().into_owned(),
             10,
         );
-        plan.add_delete("/staging/b.rom".into());
+        plan.add_delete(
+            "/staging/b.rom".into(),
+            "exact duplicate — kept /lib/b.rom".into(),
+        );
         std::fs::write(plans.join("p.json"), serde_json::to_string(&plan).unwrap()).unwrap();
 
         let report = apply(conn, tmp.path(), ApplyRunOptions::preview())
@@ -930,7 +941,10 @@ mod tests {
             tmp.path().join("a.rom").to_string_lossy().into_owned(),
             10,
         );
-        plan.add_delete("/staging/b.rom".into());
+        plan.add_delete(
+            "/staging/b.rom".into(),
+            "exact duplicate — kept /lib/b.rom".into(),
+        );
         std::fs::write(plans.join("p.json"), serde_json::to_string(&plan).unwrap()).unwrap();
 
         let mut progress = Vec::new();

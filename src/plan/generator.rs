@@ -616,7 +616,7 @@ pub fn generate_plan_filtered(conn: &Connection, opts: &PlanOptions) -> Result<P
                             if path == dest || is_in_library(&path, default_dest, &dest_root) {
                                 continue;
                             }
-                            plan.add_delete(path);
+                            plan.add_delete(path, dedup_reason(&dest));
                             deduped += 1;
                         }
                     }
@@ -820,7 +820,7 @@ pub fn generate_plan_filtered(conn: &Connection, opts: &PlanOptions) -> Result<P
                             if !may_delete(&dispositions, &entries[0].source_root, &dest) {
                                 continue;
                             }
-                            plan.add_delete(path.clone());
+                            plan.add_delete(path.clone(), dedup_reason(&dest));
                             deduped += 1;
                         }
                     }
@@ -1212,6 +1212,14 @@ fn may_move(dispositions: &HashMap<String, Disposition>, source_root: &str, dest
 /// whose survivor lands at `dest` is safe exactly when moving the content there
 /// would be — but it is kept distinct to state the delete intent at each site.
 /// See `decisions/source-disposition.md` (the delete rule).
+/// The reason recorded on a dedup delete: the canonical copy that survives it.
+/// Every delete the planner emits is a redundant exact-content duplicate, so this
+/// names the kept copy — what makes the removal safe — for plan review and the
+/// live log.
+fn dedup_reason(survivor_dest: &str) -> String {
+    format!("exact duplicate — kept {survivor_dest}")
+}
+
 fn may_delete(
     dispositions: &HashMap<String, Disposition>,
     source_root: &str,
@@ -1288,7 +1296,7 @@ fn plan_disk_matches(
                 if path == dest || is_in_library(&path, opts.default_dest.as_deref(), dest_root) {
                     continue;
                 }
-                plan.add_delete(path);
+                plan.add_delete(path, dedup_reason(&dest));
                 counts.deduped += 1;
             }
         }
@@ -2037,7 +2045,7 @@ mod tests {
             .operations
             .iter()
             .filter_map(|op| match &op.kind {
-                OperationKind::Delete { path } => Some(path.clone()),
+                OperationKind::Delete { path, .. } => Some(path.clone()),
                 _ => None,
             })
             .collect();
@@ -2233,11 +2241,20 @@ mod tests {
             .operations
             .iter()
             .filter_map(|op| match &op.kind {
-                OperationKind::Delete { path } => Some(path.clone()),
+                OperationKind::Delete { path, reason } => Some((path.clone(), reason.clone())),
                 _ => None,
             })
             .collect();
-        assert_eq!(deleted, vec!["/lib/ToSort/SET/Sys/game.rom".to_string()]);
+        assert_eq!(deleted.len(), 1);
+        assert_eq!(deleted[0].0, "/lib/ToSort/SET/Sys/game.rom");
+        // The delete records why it is safe: the canonical copy it keeps. Every
+        // planner delete is a dedup, so the reason names a surviving path.
+        assert!(
+            deleted[0].1.starts_with("exact duplicate — kept ")
+                && deleted[0].1.contains("game.rom"),
+            "reason names the kept copy: {:?}",
+            deleted[0].1
+        );
     }
 
     #[test]
@@ -2289,7 +2306,7 @@ mod tests {
             .operations
             .iter()
             .filter_map(|op| match &op.kind {
-                OperationKind::Delete { path } => Some(path.clone()),
+                OperationKind::Delete { path, .. } => Some(path.clone()),
                 _ => None,
             })
             .collect();
