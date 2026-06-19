@@ -301,7 +301,12 @@ pub struct ApplyReport {
     /// (which only reports the gate flags above, never blocks on them).
     pub refused: Option<String>,
     pub succeeded: usize,
+    /// Retryable failures — a later apply re-attempts these (e.g. a dropped mount).
     pub failed: usize,
+    /// Operations a safety check declined (verify-before-delete). Sticky: not
+    /// retried by re-applying. Distinct from `failed` so the UI can say "run again
+    /// to resume" only when there is genuinely retryable work.
+    pub refused_ops: usize,
 }
 
 /// Drive the apply engine over the latest plan and report what it did (or, on a
@@ -365,10 +370,13 @@ pub fn apply_streaming(
     };
     let total_ops = plan.operations.len();
     let total_bytes = plan.summary.total_bytes;
+    // Remaining work is fresh `Pending` ops plus retryable `Failed` ones — so a
+    // plan left part-done by a dropped mount still reports work to do, and the UI
+    // offers an apply that resumes it.
     let pending = plan
         .operations
         .iter()
-        .filter(|op| op.status == crate::plan::OperationStatus::Pending)
+        .filter(|op| op.status.is_remaining_work())
         .count();
 
     // A real apply enforces the gates the dry-run preview only reports: it refuses
@@ -466,6 +474,7 @@ pub fn apply_streaming(
         refused: None,
         succeeded: outcome.success_count,
         failed: outcome.error_count,
+        refused_ops: outcome.refused_count,
     }))
 }
 
@@ -493,6 +502,7 @@ fn refused_report(
         refused: Some(reason),
         succeeded: 0,
         failed: 0,
+        refused_ops: 0,
     }
 }
 
