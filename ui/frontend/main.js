@@ -465,9 +465,15 @@ async function streamApply(body, command, startLabel) {
   const serial = el("div", { class: "prog-detail" }, "");
   const fill = el("span", {});
   const bar = el("div", { class: "progress" }, fill);
-  body.replaceChildren(el("div", { class: "prog-wrap" }, counts, slotsEl, serial, bar));
+  // A scrolling log of each completed/failed/refused operation, newest at the
+  // bottom, capped so a long run can't grow it without bound.
+  const logEl = el("div", { class: "apply-log" });
+  body.replaceChildren(
+    el("div", { class: "prog-wrap" }, counts, slotsEl, serial, bar, logEl)
+  );
 
   let slotRows = null; // one element per worker, built on the first event
+  const MAX_LOG = 200;
 
   const ensureSlots = (jobs) => {
     if (slotRows || !jobs) return;
@@ -477,6 +483,15 @@ async function streamApply(body, command, startLabel) {
   const opText = (verb, from, to, bytes) => {
     const size = bytes ? `  ·  ${fmtBytes(bytes)}` : "";
     return to ? `${verb} ${shortPath(from)} → ${shortPath(to)}${size}` : `${verb} ${shortPath(from)}${size}`;
+  };
+  const ICON = { ok: "✓", failed: "✗", refused: "⚠" };
+  const appendLog = (outcome, verb, from, to, detail) => {
+    const atBottom = logEl.scrollTop + logEl.clientHeight >= logEl.scrollHeight - 4;
+    const text =
+      `${ICON[outcome] || "·"} ${opText(verb, from, to, 0)}` + (detail ? `  —  ${detail}` : "");
+    logEl.append(el("div", { class: `log-line ${outcome}` }, text));
+    while (logEl.childElementCount > MAX_LOG) logEl.firstElementChild.remove();
+    if (atBottom) logEl.scrollTop = logEl.scrollHeight; // follow the tail
   };
 
   const stop = () => {
@@ -488,7 +503,7 @@ async function streamApply(body, command, startLabel) {
 
   stop(); // drop any listener from a previous run
   applyUnlisten = await window.__TAURI__.event.listen("apply-progress", (e) => {
-    const { done, total, jobs, slot, finished, verb, from, to, bytes, bytes_done, bytes_total } =
+    const { done, total, jobs, slot, finished, verb, from, to, bytes, bytes_done, bytes_total, outcome, detail } =
       e.payload;
     ensureSlots(jobs);
 
@@ -507,10 +522,13 @@ async function streamApply(body, command, startLabel) {
         row.className = "slot busy";
         row.textContent = opText(verb, from, to, bytes);
       }
-    } else if (slot == null && verb) {
+    } else if (slot == null && verb && !outcome) {
       // A serial op (delete/quarantine/repack) — show it on the shared line.
       serial.textContent = opText(verb, from, to, bytes);
     }
+
+    // A terminal result (ok/failed/refused) also goes to the log.
+    if (outcome) appendLog(outcome, verb, from, to, detail);
   });
   try {
     return await invoke(command);

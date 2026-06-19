@@ -342,6 +342,38 @@ tr:hover td {
   border-color: rgba(124, 122, 255, 0.3);
 }
 
+/* scrolling log of completed/failed/refused operations */
+.apply-log {
+  margin-top: 12px;
+  max-height: 220px;
+  overflow-y: auto;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 6px 8px;
+  background: var(--bg);
+}
+
+.log-line {
+  font-size: 0.8em;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  padding: 1px 0;
+}
+
+.log-line.ok {
+  color: var(--muted);
+}
+
+.log-line.failed {
+  color: var(--bad);
+}
+
+.log-line.refused {
+  color: var(--warn);
+}
+
 .progress {
   height: 10px;
   background: var(--panel-2);
