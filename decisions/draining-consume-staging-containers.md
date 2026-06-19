@@ -1,12 +1,12 @@
 # Draining consume staging containers after a repack
 
-**Status:** Investigated, implemented forward-only — **not shipped** (rollback gap). 2026-06-19.
-**Scope:** Cat198x flagship — the planner's repack path and the verify-before-delete safety net.
-**Related:** [source-disposition.md](source-disposition.md) (consume vs preserve, the delete rule); [concurrent-apply.md](concurrent-apply.md) (repacks run concurrently, deletes serial). WIP on branch `feat/drain-consume-containers`, commit `19ef5a6`.
+**Status:** **Shipped.** Forward drain + rollback coherence both implemented and tested. 2026-06-19.
+**Scope:** Cat198x flagship — the planner's repack path, the verify-before-delete safety net, and the rollback journal.
+**Related:** [source-disposition.md](source-disposition.md) (consume vs preserve, the delete rule); [concurrent-apply.md](concurrent-apply.md) (repacks run concurrently, deletes serial). Landed on branch `feat/drain-consume-containers` (WIP commit `19ef5a6`, rollback fix on top).
 
 ## Bottom line
 
-A `consume` staging area (`ToSort/`) does **not** drain for archive sets that have to be *recompressed* into the library — e.g. TOSEC-ISO CD images. The content gets copied into the library, but the original staging container is left behind, so the same bytes sit in two places (a real **~12 GB** for the TOSEC-ISO run on 2026-06-18). The forward fix is built and well-tested; it is **blocked on a rollback-coherence gap** and must not merge until that is closed.
+A `consume` staging area (`ToSort/`) did **not** drain for archive sets that have to be *recompressed* into the library — e.g. TOSEC-ISO CD images. The content got copied into the library, but the original staging container was left behind, so the same bytes sat in two places (a real **~12 GB** for the TOSEC-ISO run on 2026-06-18). The fix now drains the container *and* journals a reverse that rebuilds it on rollback, so no command can lose content in either direction.
 
 ## The symptom
 
@@ -34,24 +34,22 @@ The planner records each build-from archive container that a repack rebuilt from
 
 Tests (all green): the single-game shared-entry case drains (the real CD case); the fully-consolidated shared container drains exactly once; loose build-froms are left to the existing `move_sources`; and an apply-level test proves the net permits the drain only when every entry survives and refuses the instant one does not.
 
-## Why it is not shipped — the rollback gap
+## How the rollback gap was closed
 
-A copy-mode repack's journal reverse is `Delete dest`. A plain `Delete` carries **no restoring reverse** (deletes are not journaled). So rolling back a plan that drained containers would remove the destination **and** never rebuild the container → **content lost**. The forward path refuses to lose data during apply; the rollback path would.
+A copy-mode repack's journal reverse is `Delete dest`. A *plain* `Delete` carries no restoring reverse (deletes are not journaled), so on its own a drained container would be removed on rollback with the destination — losing content.
 
-This is the coupling the *executor-internal* approach (drain inside `execute_repack`, reverse = rebuild-container-from-dest) had correct, and that the separate-`Delete` route decouples and breaks.
+The drain now journals a **rebuild-container-from-`dest`** reverse. A container-drain is a `Delete` carrying an optional `ContainerRebuild` spec (`OperationKind::Delete { rebuild: Some(..) }`): for each entry the container held, *which* destination archive it was repacked into, its name there, the name it had in the container, and its SHA1. The forward path is unchanged — it still routes through the verify-before-delete net, which decides safety — but on a real removal it journals a `LoggedOperation::RebuildContainer` reverse. On rollback that reverse rebuilds the container by extracting each entry back out of its destination via `execute_repack` (SHA1-verified, partial archive removed on mismatch) and deletes nothing.
 
-## The defined next step
+The ordering is what makes it coherent: drains are emitted *after* every repack, and the serial drain logs after the repack batch flushes, so the drain's journal entry sits **after** the repack's. Rollback runs in **reverse journal order**, so `RebuildContainer` runs **before** the repack's `Delete dest` — the container is rebuilt from the destination while the destination still exists, then the destination is removed. A container that fed several games spreads its entries across several destinations; the single `ContainerRebuild` names each entry's own `dest`, and because it is reversed first (emitted last) every destination is still present when the rebuild reads them.
 
-Couple the drain to the repack's reverse. The container-drain must journal a **rebuild-container-from-`dest`** reverse (extract the entries back out of the destination archive, verified by SHA1, then it is the repack's reverse that deletes `dest`). Because rollback runs in **reverse plan order** and the drain is emitted *after* the repack, the drain's rebuild reverse runs **before** the repack's `Delete dest` — so the container is restored from the destination before the destination is removed. Content preserved.
+This realises the *executor-internal coupling* the first approach had — reverse = rebuild-container-from-`dest` — but reuses the verify-before-delete net as the forward arbiter rather than guessing safety at plan time. Round-trip proven by `rolling_back_a_drained_container_rebuilds_it_before_the_destination_is_deleted` (the container is restored with its original in-container entry names and the destination is gone — which can only happen if the rebuild ran first).
 
-Concretely this grafts the WIP branch's first-approach machinery (a `RebuildContainer` logged reverse + executor support, which was prototyped and round-trip-tested) onto this branch's verify-before-delete guard. Keep the forward guard (the net decides safety); add the reverse (rollback restores).
+## Reclaiming the interim space
 
-## Interim reality
-
-The TOSEC-ISO content is **safe** — every drained-candidate container's bytes are verified present in the library. The ~12 GB of redundant staging copies are harmless (wasted space), not at risk. Do not hand-delete `ToSort/TOSEC-ISO/` to reclaim space until the tool can do it reversibly, or accept that manual removal is one-way.
+The ~12 GB of redundant TOSEC-ISO staging copies were always safe (verified present in the library), just wasted space. They can now be reclaimed reversibly: re-plan and apply, and the drain removes them with a journaled rebuild reverse — a mistaken run is recoverable with `apply --rollback`.
 
 ## Drift triggers
 
 - "Just guard on `!shared_containers`" — no; it flags single-game CD containers as shared and blocks the fix. The net, not a plan-time guess, is the arbiter.
 - "Delete the container inside the repack worker" — the worker does file I/O only and has no catalogue/verify access; and an unjournaled in-worker delete reintroduces the rollback gap. Route through the net, journal a rebuild reverse.
-- "Drain it as a separate delete and call it done" — that is exactly the shipped-forward / broken-rollback state recorded here. The reverse is mandatory before merge.
+- "Drain it as a plain delete" / "drop the `ContainerRebuild` spec" — that reintroduces the broken-rollback state this work closed: a drained container with no reverse is removed on rollback alongside its destination, losing content. The rebuild reverse is load-bearing; the `rolling_back_a_drained_container…` test guards it.

@@ -5,6 +5,8 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::Path;
 
+use crate::plan::types::RebuildEntry;
+
 /// An operation log entry with forward and reverse operations
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LogEntry {
@@ -64,6 +66,19 @@ pub enum LoggedOperation {
     UnpackRepack {
         dest: String,
         restore: Vec<(String, String)>,
+    },
+    /// Reverse of a container-drain delete: rebuild the staging container that
+    /// was removed by extracting each of its entries back out of the destination
+    /// archive it was repacked into (verifying SHA1), then writing them into a
+    /// fresh archive at `container`. `entries` pairs, per entry, the destination
+    /// to extract from, its name there, the name it had in the container, and its
+    /// SHA1. It deletes nothing: the destinations are removed by the repacks' own
+    /// reverses, which rollback (reverse plan order) runs *after* this — so the
+    /// container is restored before any destination disappears.
+    RebuildContainer {
+        container: String,
+        format: String,
+        entries: Vec<RebuildEntry>,
     },
     /// Quarantine operation — a file moved into the quarantine store. Its
     /// reverse is a Move back to `original_path`.
@@ -229,6 +244,40 @@ impl OperationLog {
             })
         };
 
+        self.entries.push(LogEntry {
+            operation_id,
+            executed_at: chrono_now(),
+            forward,
+            reverse,
+            status: if success {
+                LogStatus::Completed
+            } else {
+                LogStatus::Failed
+            },
+        });
+    }
+
+    /// Add a completed container-drain delete. The forward op deleted the staging
+    /// `container`; its reverse rebuilds it from the destination archives its
+    /// entries were repacked into, so a rollback restores the container before
+    /// those destinations are removed. `entries` is the rebuild spec captured at
+    /// plan time. No reverse is journaled for a failed (or refused) drain.
+    pub fn log_container_drain(
+        &mut self,
+        operation_id: u64,
+        container: &str,
+        format: &str,
+        entries: &[RebuildEntry],
+        success: bool,
+    ) {
+        let forward = LoggedOperation::Delete {
+            path: container.to_string(),
+        };
+        let reverse = success.then(|| LoggedOperation::RebuildContainer {
+            container: container.to_string(),
+            format: format.to_string(),
+            entries: entries.to_vec(),
+        });
         self.entries.push(LogEntry {
             operation_id,
             executed_at: chrono_now(),

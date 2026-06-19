@@ -157,7 +157,7 @@ impl OpView {
                 bytes: *size,
                 reason: None,
             },
-            OperationKind::Delete { path, reason } => OpView {
+            OperationKind::Delete { path, reason, .. } => OpView {
                 verb: "DELETE",
                 from: path.clone(),
                 to: None,
@@ -435,7 +435,7 @@ pub fn apply_plan(
                 op.status = OperationStatus::Failed;
                 error_count += 1;
             }
-            OperationKind::Delete { path, .. } => {
+            OperationKind::Delete { path, rebuild, .. } => {
                 // Verify-before-delete: a plan deletes a file only because its
                 // content is held elsewhere, but never destroy the last copy on
                 // a stale record. Refuse if no surviving copy physically exists.
@@ -464,6 +464,20 @@ pub fn apply_plan(
                     // Safe to remove.
                     Ok(true) => match fs::remove_file(path) {
                         Ok(()) => {
+                            // A container-drain delete journals a reverse that
+                            // rebuilds the container from the destinations its
+                            // entries were repacked into — but only because *this*
+                            // run did the removal (the already-gone arm below does
+                            // not, since a prior run's log owns that reversal).
+                            if let (Some(log), Some(rebuild)) = (&mut op_log, rebuild) {
+                                log.log_container_drain(
+                                    op.id,
+                                    path,
+                                    &rebuild.format,
+                                    &rebuild.entries,
+                                    true,
+                                );
+                            }
                             op.status = OperationStatus::Completed;
                             success_count += 1;
                         }

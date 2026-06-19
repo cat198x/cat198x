@@ -5,7 +5,7 @@ use rusqlite::Connection;
 use sha2::{Digest as Sha2Digest, Sha256};
 use std::collections::{BTreeMap, HashMap, HashSet};
 
-use super::{CollectionPlanStat, Plan, SourceRef};
+use super::{CollectionPlanStat, ContainerRebuild, Plan, RebuildEntry, SourceRef};
 use crate::config::{MergeMode, OutputFormat};
 use crate::db::files::Disposition;
 use crate::db::{collections, config as db_config, dats, files};
@@ -402,13 +402,18 @@ pub fn generate_plan_filtered(conn: &Connection, opts: &PlanOptions) -> Result<P
     // Source containers a repack rebuilt from and that are safe to lose afterwards
     // — recorded here and emitted as deletes *after* every repack, so the apply
     // runs the rebuilds first and the verify-before-delete net sees each entry
-    // surviving at its destination before removing the container. `(container,
-    // a representative destination)` — deduplicated, since a container feeding
-    // several games is recorded once per game. Draining these is what lets
-    // `consume` staging empty for recompressed archive sets (a shared .cue/.sub
-    // forces a rebuild over a whole-file relocate). Safety rests on the net, not
-    // on a plan-time guess: a container still needed elsewhere is refused, sticky.
-    let mut drain_after_repack: Vec<(String, String)> = Vec::new();
+    // surviving at its destination before removing the container. Draining these
+    // is what lets `consume` staging empty for recompressed archive sets (a shared
+    // .cue/.sub forces a rebuild over a whole-file relocate). Safety rests on the
+    // net, not a plan-time guess: a container still needed elsewhere is refused,
+    // sticky.
+    //
+    // Keyed by container path so a container feeding several games is drained
+    // once; the accumulated `entries` gather, across those games, where each of
+    // the container's entries was repacked to — the rollback spec that rebuilds
+    // the container before those destinations are deleted. `reason_dest` is just a
+    // representative destination for the human-readable reason.
+    let mut drain_after_repack: BTreeMap<String, ContainerDrain> = BTreeMap::new();
 
     for collection in &all_collections {
         if let Some(pattern) = dat_filter
@@ -829,7 +834,29 @@ pub fn generate_plan_filtered(conn: &Connection, opts: &PlanOptions) -> Result<P
                                             && may_delete(&dispositions, &m.source_root, &dest)
                                     })
                         }) {
-                            drain_after_repack.push((container.clone(), dest.clone()));
+                            // Record where each of this container's entries was
+                            // repacked to. `containers` is per-game, so a container
+                            // feeding several games contributes each game's entries
+                            // across the games' iterations — together they cover
+                            // every entry the container held, the full rebuild spec.
+                            let drain =
+                                drain_after_repack
+                                    .entry(container.clone())
+                                    .or_insert_with(|| ContainerDrain {
+                                        format: container_archive_format(container),
+                                        reason_dest: dest.clone(),
+                                        entries: Vec::new(),
+                                    });
+                            for m in &containers[container] {
+                                if let Some(archive_entry) = &m.archive_path {
+                                    drain.entries.push(RebuildEntry {
+                                        dest: dest.clone(),
+                                        dest_entry: m.rom_name.clone(),
+                                        container_entry: archive_entry.clone(),
+                                        sha1: m.sha1.clone(),
+                                    });
+                                }
+                            }
                         }
                     }
 
@@ -896,17 +923,30 @@ pub fn generate_plan_filtered(conn: &Connection, opts: &PlanOptions) -> Result<P
 
     // Drain the source containers the repacks rebuilt from — emitted last, so the
     // apply runs every rebuild before these deletes and the verify-before-delete
-    // net can see each entry surviving at its destination. Deduplicated: a
-    // container feeding several games appears once. The reason names a destination
-    // its content went to (for plan review and the live log); the net guarantees
-    // safety regardless.
-    {
+    // net can see each entry surviving at its destination. Each carries a rebuild
+    // spec (where every entry went) so a rollback restores the container before
+    // those destinations are removed. The reason names a destination its content
+    // went to (for plan review and the live log); the net guarantees safety
+    // regardless.
+    for (container, drain) in drain_after_repack {
+        // One entry per in-container name: a name repeated across the feeding
+        // games is the same content (extractable from either destination), so
+        // keep the first.
         let mut seen = HashSet::new();
-        for (container, dest) in &drain_after_repack {
-            if seen.insert(container.clone()) {
-                plan.add_delete(container.clone(), format!("consolidated into {dest}"));
-            }
-        }
+        let entries: Vec<RebuildEntry> = drain
+            .entries
+            .into_iter()
+            .filter(|e| seen.insert(e.container_entry.clone()))
+            .collect();
+        let reason = format!("consolidated into {}", drain.reason_dest);
+        plan.add_container_drain(
+            container,
+            reason,
+            ContainerRebuild {
+                format: drain.format,
+                entries,
+            },
+        );
     }
 
     // Never skip silently: report collections left out because no destination
@@ -1143,6 +1183,29 @@ fn is_relocatable_archive(entries: &[MatchedRom], src: &str, ext: &str) -> bool 
 
 /// Build a repack source reference from a matched ROM, carrying its canonical
 /// ROM name as the archive entry name.
+/// Accumulates, across the games that repack from one staging container, the
+/// spec to rebuild that container on rollback. See `drain_after_repack`.
+struct ContainerDrain {
+    /// Archive format to rebuild the container in (`zip` or `7z`).
+    format: String,
+    /// A representative destination, for the human-readable drain reason.
+    reason_dest: String,
+    /// Where each of the container's entries was repacked to.
+    entries: Vec<RebuildEntry>,
+}
+
+/// The archive format to rebuild a drained container in, inferred from its path.
+/// A `.7z` container rebuilds as 7z; everything else (including `.zip` sources
+/// originally written by any tool) rebuilds as a plain content-faithful zip —
+/// the catalogue keys on inner-entry SHA1s, not the archive's own bytes.
+fn container_archive_format(path: &str) -> String {
+    if path.to_ascii_lowercase().ends_with(".7z") {
+        "7z".to_string()
+    } else {
+        "zip".to_string()
+    }
+}
+
 fn source_ref_for(m: &MatchedRom) -> SourceRef {
     SourceRef {
         path: format!("{}/{}", m.source_root, m.source_path),
@@ -2292,7 +2355,7 @@ mod tests {
             .operations
             .iter()
             .filter_map(|op| match &op.kind {
-                OperationKind::Delete { path, reason } => Some((path.clone(), reason.clone())),
+                OperationKind::Delete { path, reason, .. } => Some((path.clone(), reason.clone())),
                 _ => None,
             })
             .collect();
@@ -2914,7 +2977,7 @@ mod tests {
             .operations
             .iter()
             .filter_map(|op| match &op.kind {
-                OperationKind::Delete { path, reason } => Some((path.clone(), reason.clone())),
+                OperationKind::Delete { path, reason, .. } => Some((path.clone(), reason.clone())),
                 _ => None,
             })
             .collect();

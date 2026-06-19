@@ -143,10 +143,21 @@ pub enum OperationKind {
     /// delete, the canonical copy that survives it ("exact duplicate — kept …") —
     /// so the plan can be reviewed and the live log can show it. Defaults to empty
     /// for plans written before the field existed.
+    ///
+    /// `rebuild` is present only when this delete *drains a staging container* a
+    /// repack rebuilt from: removing it is safe (the verify-before-delete net
+    /// confirms every entry survives at its destination archive), but a rollback
+    /// must put the container back before those destinations are removed. The
+    /// spec records how — extract each entry out of the destination it was
+    /// repacked into (SHA1-verified) and rebuild the container archive. An
+    /// ordinary dedup delete leaves it `None` and carries no reverse, exactly as
+    /// before. See [`Plan::add_container_drain`].
     Delete {
         path: String,
         #[serde(default)]
         reason: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        rebuild: Option<ContainerRebuild>,
     },
     /// Move a file to quarantine (instead of deleting)
     Quarantine {
@@ -156,6 +167,41 @@ pub enum OperationKind {
         reason: String,
         collection: Option<String>,
     },
+}
+
+/// How to rebuild a drained staging container on rollback — the reverse of a
+/// container-drain delete.
+///
+/// The container's content survives, after the drain, inside the destination
+/// archive(s) its entries were repacked into. To restore the container we
+/// extract each entry back out of the destination it lives in (verifying SHA1)
+/// and write it into a fresh archive at the container's path. Crucially this
+/// runs *before* the repacks' own reverses delete those destinations: a drain is
+/// emitted after every repack, so rollback (reverse plan order) rebuilds the
+/// container while every destination still exists.
+///
+/// A container that fed several games spreads its entries across several
+/// destinations — each [`RebuildEntry`] therefore names its own `dest`, not one
+/// shared archive.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContainerRebuild {
+    /// Archive format to rebuild the container in (`zip` or `7z`).
+    pub format: String,
+    /// Every entry the container held, with where to pull it back from.
+    pub entries: Vec<RebuildEntry>,
+}
+
+/// One entry pulled back into a drained container on rollback.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RebuildEntry {
+    /// The destination archive the entry was repacked into; extracted from here.
+    pub dest: String,
+    /// The entry's name within `dest`.
+    pub dest_entry: String,
+    /// The name the entry had inside the container; restored under this name.
+    pub container_entry: String,
+    /// Content SHA1, re-verified on extract.
+    pub sha1: String,
 }
 
 /// Reference to a source file
@@ -285,7 +331,31 @@ impl Plan {
         self.operations.push(Operation {
             id,
             status: OperationStatus::Pending,
-            kind: OperationKind::Delete { path, reason },
+            kind: OperationKind::Delete {
+                path,
+                reason,
+                rebuild: None,
+            },
+        });
+        self.summary.delete_count += 1;
+    }
+
+    /// Add a container-drain delete: remove a staging container a repack rebuilt
+    /// from, once its content is safely consolidated into destination archive(s).
+    /// Like [`Plan::add_delete`] it runs through the verify-before-delete net, but
+    /// it also carries a [`ContainerRebuild`] so a rollback restores the container
+    /// (extracting its entries back out of the destinations) before those
+    /// destinations are themselves removed by the repacks' reverses.
+    pub fn add_container_drain(&mut self, path: String, reason: String, rebuild: ContainerRebuild) {
+        let id = self.operations.len() as u64;
+        self.operations.push(Operation {
+            id,
+            status: OperationStatus::Pending,
+            kind: OperationKind::Delete {
+                path,
+                reason,
+                rebuild: Some(rebuild),
+            },
         });
         self.summary.delete_count += 1;
     }
