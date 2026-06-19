@@ -29,6 +29,13 @@ use crate::util::{format_bytes, verify_sha1};
 /// contents aren't catalogued, or any content has no surviving on-disk copy
 /// outside this path.
 ///
+/// The surviving copy must satisfy the source's disposition
+/// (`decisions/source-disposition.md`, the delete rule): a `consume` source may
+/// be emptied, so a copy in **any** other location counts; a `preserve` source
+/// must never lose content its tree alone holds, so only a copy **in the same
+/// tree** (same source) counts — a copy in another tree does not authorise the
+/// delete. An unresolved source is treated as `preserve`, the strict default.
+///
 /// This is the shared verify-before-delete net: `apply`'s delete operations and
 /// `clean-superseded` both gate on it so the safety check can't drift between
 /// them.
@@ -37,11 +44,18 @@ pub fn delete_has_surviving_copy(
     sources: &[crate::db::files::Source],
     abs_path: &str,
 ) -> Result<bool> {
-    use crate::db::files;
+    use crate::db::files::{self, Disposition};
 
     let Some((source_id, rel)) = files::resolve_in_sources(sources, abs_path) else {
         return Ok(false);
     };
+    // A preserve tree may only be deduped against itself; a copy elsewhere must
+    // not authorise removing this tree's content. An unknown source stays strict.
+    let preserve = sources
+        .iter()
+        .find(|s| s.id == source_id)
+        .map(|s| matches!(s.disposition, Disposition::Preserve))
+        .unwrap_or(true);
     let sha1s = files::contents_at_location(conn, source_id, &rel)?;
     if sha1s.is_empty() {
         return Ok(false);
@@ -51,6 +65,11 @@ pub fn delete_has_surviving_copy(
         for loc in files::get_file_locations(conn, sha1)? {
             // The copy we're about to delete doesn't count as its own backup.
             if loc.source_id == source_id && loc.path == rel {
+                continue;
+            }
+            // For a preserve-tree file, only a surviving copy within the same
+            // tree counts — a copy in another tree must not justify the delete.
+            if preserve && loc.source_id != source_id {
                 continue;
             }
             let Some(root) = sources

@@ -558,11 +558,16 @@ pub fn run_rollback(
 #[cfg(test)]
 mod tests {
     use crate::db::Database;
-    use crate::db::files::{add_source, get_source_by_path, upsert_file, upsert_file_location};
+    use crate::db::files::{
+        Disposition, add_source, get_source_by_path, set_source_disposition, upsert_file,
+        upsert_file_location,
+    };
     use crate::plan::executor::delete_has_surviving_copy;
 
     // A delete is allowed only while a surviving copy physically exists; once the
     // other copy is gone, the same record must no longer authorise the delete.
+    // The staging source is `consume`, so a copy in the library (another tree)
+    // does authorise emptying it.
     #[test]
     fn delete_refused_when_no_surviving_copy_on_disk() {
         let tosort = tempfile::TempDir::new().unwrap();
@@ -579,6 +584,8 @@ mod tests {
         let conn = db.conn();
         add_source(conn, tosort_root, false).unwrap();
         add_source(conn, library_root, false).unwrap();
+        // ToSort is staging — consume — so a cross-tree library copy counts.
+        set_source_disposition(conn, tosort_root, Disposition::Consume).unwrap();
         upsert_file(conn, "AAAA", None, None, None, 7).unwrap();
         let ts = get_source_by_path(conn, tosort_root).unwrap().unwrap();
         let lib = get_source_by_path(conn, library_root).unwrap().unwrap();
@@ -594,6 +601,67 @@ mod tests {
         // Library copy gone on disk (stale catalogue record) → refuse the delete.
         std::fs::remove_file(library.path().join("game.zip")).unwrap();
         assert!(!delete_has_surviving_copy(conn, &sources, &tosort_abs).unwrap());
+    }
+
+    // A `preserve` source must not be emptied because a copy exists in another
+    // tree: only a same-tree copy authorises the delete. The default disposition
+    // is preserve, so this is the safe baseline.
+    #[test]
+    fn delete_of_preserve_file_refused_when_only_copy_is_in_another_tree() {
+        let master = tempfile::TempDir::new().unwrap();
+        let library = tempfile::TempDir::new().unwrap();
+        let master_root = master.path().to_str().unwrap();
+        let library_root = library.path().to_str().unwrap();
+
+        // The same content sits in a preserve reference master and in the library.
+        std::fs::write(master.path().join("game.zip"), b"content").unwrap();
+        std::fs::write(library.path().join("game.zip"), b"content").unwrap();
+
+        let db = Database::open_in_memory().unwrap();
+        let conn = db.conn();
+        add_source(conn, master_root, false).unwrap(); // defaults to preserve
+        add_source(conn, library_root, false).unwrap();
+        upsert_file(conn, "AAAA", None, None, None, 7).unwrap();
+        let master_src = get_source_by_path(conn, master_root).unwrap().unwrap();
+        let lib = get_source_by_path(conn, library_root).unwrap().unwrap();
+        upsert_file_location(conn, "AAAA", master_src.id, "game.zip", None).unwrap();
+        upsert_file_location(conn, "AAAA", lib.id, "game.zip", None).unwrap();
+
+        let sources = crate::db::files::list_sources(conn).unwrap();
+        let master_abs = format!("{}/game.zip", master_root);
+
+        // A library copy in a different tree does NOT authorise emptying the
+        // preserve master — that would lose content the master's tree held.
+        assert!(!delete_has_surviving_copy(conn, &sources, &master_abs).unwrap());
+    }
+
+    // Within a single preserve tree, a duplicate (the same content at a second
+    // path) may be dropped — the content survives in the same tree.
+    #[test]
+    fn delete_of_preserve_file_allowed_when_a_same_tree_copy_survives() {
+        let master = tempfile::TempDir::new().unwrap();
+        let master_root = master.path().to_str().unwrap();
+
+        // The same content sits at two paths within the one preserve tree.
+        std::fs::write(master.path().join("dup.zip"), b"content").unwrap();
+        std::fs::write(master.path().join("canonical.zip"), b"content").unwrap();
+
+        let db = Database::open_in_memory().unwrap();
+        let conn = db.conn();
+        add_source(conn, master_root, false).unwrap(); // preserve
+        upsert_file(conn, "AAAA", None, None, None, 7).unwrap();
+        let src = get_source_by_path(conn, master_root).unwrap().unwrap();
+        upsert_file_location(conn, "AAAA", src.id, "dup.zip", None).unwrap();
+        upsert_file_location(conn, "AAAA", src.id, "canonical.zip", None).unwrap();
+
+        let sources = crate::db::files::list_sources(conn).unwrap();
+        let dup_abs = format!("{}/dup.zip", master_root);
+
+        // The canonical copy in the same tree survives → dropping the duplicate
+        // loses nothing. Once that same-tree copy is gone, the delete is refused.
+        assert!(delete_has_surviving_copy(conn, &sources, &dup_abs).unwrap());
+        std::fs::remove_file(master.path().join("canonical.zip")).unwrap();
+        assert!(!delete_has_surviving_copy(conn, &sources, &dup_abs).unwrap());
     }
 
     // A path whose contents aren't catalogued can't be reasoned about — refuse.
