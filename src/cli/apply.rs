@@ -4,9 +4,11 @@ use anyhow::{Context, Result};
 use std::fs;
 
 use crate::plan::executor::{
-    check_disk_space, execute_relocate, execute_rollback_move, extract_from_archive,
+    check_disk_space, execute_relocate, execute_repack, execute_rollback_move, extract_from_archive,
 };
-use crate::plan::{ApplyEvent, ApplyOptions, OperationStatus, apply_plan, compute_state_hash};
+use crate::plan::{
+    ApplyEvent, ApplyOptions, OperationStatus, SourceRef, apply_plan, compute_state_hash,
+};
 use crate::util::truncate_path;
 
 use super::{open_database, plan::load_latest_plan};
@@ -540,6 +542,56 @@ pub fn run_rollback(
                     }
                 }
             }
+            LoggedOperation::RebuildContainer {
+                ref container,
+                ref format,
+                ref entries,
+            } => {
+                // Reverse of a container-drain delete: rebuild the staging
+                // container by extracting each entry back out of the destination
+                // it was repacked into, verifying SHA1. This deletes nothing — the
+                // destinations are removed by the repacks' own reverses, which run
+                // after this (reverse plan order), so every destination still
+                // exists here.
+                println!(
+                    "[{}] REBUILD {} ({} entry/entries)",
+                    operation_id,
+                    truncate_path(container, 40),
+                    entries.len()
+                );
+
+                if dry_run {
+                    success_count += 1;
+                    continue;
+                }
+
+                // Each entry becomes an archive-member source pulled from its
+                // destination, named back to its in-container name. execute_repack
+                // verifies every entry's SHA1 before finalising and removes the
+                // partial archive on mismatch, so a corrupt destination can't yield
+                // a silently wrong container.
+                let sources: Vec<SourceRef> = entries
+                    .iter()
+                    .map(|e| SourceRef {
+                        path: e.dest.clone(),
+                        archive_path: Some(e.dest_entry.clone()),
+                        sha1: e.sha1.clone(),
+                        entry_name: Some(e.container_entry.clone()),
+                    })
+                    .collect();
+
+                match execute_repack(&sources, container, format, false) {
+                    Ok(_) => {
+                        log.entries[idx].status = LogStatus::RolledBack;
+                        success_count += 1;
+                    }
+                    Err(e) => {
+                        eprintln!("  ERROR: {:#}", e);
+                        log.entries[idx].status = LogStatus::Failed;
+                        error_count += 1;
+                    }
+                }
+            }
             LoggedOperation::Quarantine { .. } => {
                 // A quarantine never appears as a reverse op — its reverse is a
                 // Move (restore from quarantine), handled by the Move arm above.
@@ -695,5 +747,138 @@ mod tests {
         let sources = crate::db::files::list_sources(conn).unwrap();
         let abs = format!("{}/unknown.zip", root);
         assert!(!delete_has_surviving_copy(conn, &sources, &abs).unwrap());
+    }
+
+    // The rollback-coherence guarantee for a drained staging container. A plan
+    // that drained a container left two coupled journal entries: the repack
+    // (reverse = delete the destination archive) and the drain (reverse = rebuild
+    // the container from that destination). Because rollback runs in reverse plan
+    // order and the drain is emitted last, the container is rebuilt from the
+    // destination *before* the destination is deleted — so rolling back restores
+    // the container's content rather than losing it. If the order were wrong, the
+    // rebuild would find the destination already gone and fail; this test passing
+    // (container restored, destination removed) is exactly that ordering holding.
+    #[test]
+    fn rolling_back_a_drained_container_rebuilds_it_before_the_destination_is_deleted() {
+        use crate::plan::executor::execute_repack;
+        use crate::plan::{OperationLog, RebuildEntry, SourceRef};
+        use crate::util::hex_upper;
+        use sha1::{Digest, Sha1};
+        use std::io::Read;
+        use std::path::Path;
+
+        let sha1_of = |bytes: &[u8]| hex_upper(Sha1::digest(bytes));
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let data_dir = tmp.path().join("data");
+        let logs_dir = data_dir.join("objects/logs");
+        std::fs::create_dir_all(&logs_dir).unwrap();
+
+        // Two entries the container held, now consolidated into the library
+        // archive under their canonical names. The container named them
+        // differently, to prove the rebuild restores the in-container names.
+        let own = b"own-rom-data".as_slice();
+        let common = b"common-cue-data".as_slice();
+        let sha_own = sha1_of(own);
+        let sha_common = sha1_of(common);
+
+        let src_dir = tmp.path().join("src");
+        std::fs::create_dir_all(&src_dir).unwrap();
+        let loose_own = src_dir.join("own.rom");
+        let loose_common = src_dir.join("common.rom");
+        std::fs::write(&loose_own, own).unwrap();
+        std::fs::write(&loose_common, common).unwrap();
+
+        // The destination archive the repack built (the surviving content).
+        let lib = tmp.path().join("lib");
+        std::fs::create_dir_all(&lib).unwrap();
+        let dest = lib.join("GameOne.zip").to_str().unwrap().to_string();
+        let dest_sources = vec![
+            SourceRef {
+                path: loose_own.to_str().unwrap().to_string(),
+                archive_path: None,
+                sha1: sha_own.clone(),
+                entry_name: Some("own.rom".to_string()),
+            },
+            SourceRef {
+                path: loose_common.to_str().unwrap().to_string(),
+                archive_path: None,
+                sha1: sha_common.clone(),
+                entry_name: Some("common.rom".to_string()),
+            },
+        ];
+        execute_repack(&dest_sources, &dest, "zip", false).unwrap();
+
+        // The container was drained (deleted) during the forward apply, so it does
+        // not exist now — rollback must recreate it.
+        let container = tmp
+            .path()
+            .join("tosort/g1.zip")
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert!(!Path::new(&container).exists());
+
+        // The journal as the forward apply wrote it: the repack first (reverse =
+        // delete dest), the drain last (reverse = rebuild container from dest).
+        let mut log = OperationLog::new("rollbackcoherence".to_string());
+        log.log_repack(
+            0,
+            &[
+                loose_own.to_str().unwrap().to_string(),
+                loose_common.to_str().unwrap().to_string(),
+            ],
+            &dest,
+            &[],
+            true,
+        );
+        log.log_container_drain(
+            1,
+            &container,
+            "zip",
+            &[
+                RebuildEntry {
+                    dest: dest.clone(),
+                    dest_entry: "own.rom".to_string(),
+                    container_entry: "track01.bin".to_string(),
+                    sha1: sha_own.clone(),
+                },
+                RebuildEntry {
+                    dest: dest.clone(),
+                    dest_entry: "common.rom".to_string(),
+                    container_entry: "track02.cue".to_string(),
+                    sha1: sha_common.clone(),
+                },
+            ],
+            true,
+        );
+        log.complete();
+        log.save(&logs_dir).unwrap();
+
+        super::run_rollback(false, false, Some(data_dir)).unwrap();
+
+        // The destination archive is gone (the repack's reverse ran)...
+        assert!(
+            !Path::new(&dest).exists(),
+            "the destination archive should be removed by the repack's reverse"
+        );
+        // ...and the container is back, with its original in-container entry names
+        // and byte-faithful content — which can only have happened if the rebuild
+        // ran while the destination still existed.
+        assert!(
+            Path::new(&container).exists(),
+            "the drained container should be rebuilt by rollback"
+        );
+        let file = std::fs::File::open(&container).unwrap();
+        let mut archive = zip::ZipArchive::new(file).unwrap();
+        assert_eq!(archive.len(), 2, "both entries restored");
+        let mut read_entry = |name: &str| {
+            let mut e = archive.by_name(name).unwrap();
+            let mut buf = Vec::new();
+            e.read_to_end(&mut buf).unwrap();
+            buf
+        };
+        assert_eq!(read_entry("track01.bin"), own);
+        assert_eq!(read_entry("track02.cue"), common);
     }
 }

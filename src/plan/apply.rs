@@ -157,7 +157,7 @@ impl OpView {
                 bytes: *size,
                 reason: None,
             },
-            OperationKind::Delete { path, reason } => OpView {
+            OperationKind::Delete { path, reason, .. } => OpView {
                 verb: "DELETE",
                 from: path.clone(),
                 to: None,
@@ -435,7 +435,7 @@ pub fn apply_plan(
                 op.status = OperationStatus::Failed;
                 error_count += 1;
             }
-            OperationKind::Delete { path, .. } => {
+            OperationKind::Delete { path, rebuild, .. } => {
                 // Verify-before-delete: a plan deletes a file only because its
                 // content is held elsewhere, but never destroy the last copy on
                 // a stale record. Refuse if no surviving copy physically exists.
@@ -464,6 +464,20 @@ pub fn apply_plan(
                     // Safe to remove.
                     Ok(true) => match fs::remove_file(path) {
                         Ok(()) => {
+                            // A container-drain delete journals a reverse that
+                            // rebuilds the container from the destinations its
+                            // entries were repacked into — but only because *this*
+                            // run did the removal (the already-gone arm below does
+                            // not, since a prior run's log owns that reversal).
+                            if let (Some(log), Some(rebuild)) = (&mut op_log, rebuild) {
+                                log.log_container_drain(
+                                    op.id,
+                                    path,
+                                    &rebuild.format,
+                                    &rebuild.entries,
+                                    true,
+                                );
+                            }
                             op.status = OperationStatus::Completed;
                             success_count += 1;
                         }
@@ -1237,6 +1251,88 @@ mod tests {
         assert!(
             verbs[..delete_pos].iter().all(|v| *v == "COPY"),
             "all placements flush before the serial delete: {verbs:?}"
+        );
+    }
+
+    // The safety guarantee behind draining a consume staging container: the
+    // verify-before-delete net treats a container at the entry level — it removes
+    // the container only once *every* entry it held is confirmed surviving (here,
+    // in the rebuilt library archive). Drop one survivor and the net refuses,
+    // proving a container another game still needs is never lost.
+    #[test]
+    fn draining_a_container_is_permitted_only_when_every_entry_survives() {
+        use crate::db::files::{Disposition, Source};
+
+        let db = Database::open_in_memory().unwrap();
+        let conn = db.conn();
+        let tmp = tempfile::tempdir().unwrap();
+
+        // The rebuilt library archive exists on disk (the net checks the survivor
+        // physically exists); the staging container need not — it's the candidate.
+        let lib = tmp.path().join("lib");
+        std::fs::create_dir_all(&lib).unwrap();
+        let game_zip = lib.join("game.zip");
+        std::fs::write(&game_zip, b"rebuilt archive").unwrap();
+
+        conn.execute(
+            "INSERT INTO files (sha1, size) VALUES ('AAA',10),('BBB',10)",
+            [],
+        )
+        .unwrap();
+        // The staging container holds two entries; the rebuilt archive holds the
+        // same two (as a repack's catalogue sync would record).
+        conn.execute(
+            "INSERT INTO sources (id, path, case_sensitive, disposition)
+             VALUES (1, '/tosort', 0, 'consume'), (2, ?1, 0, 'preserve')",
+            [lib.to_str().unwrap()],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO file_locations (sha1, source_id, path, archive_path) VALUES
+                ('AAA', 1, 'bundle.zip', 'a.bin'),
+                ('BBB', 1, 'bundle.zip', 'b.cue'),
+                ('AAA', 2, 'game.zip', 'a.bin'),
+                ('BBB', 2, 'game.zip', 'b.cue')",
+            [],
+        )
+        .unwrap();
+
+        let now = "2026-01-01".to_string();
+        let sources = vec![
+            Source {
+                id: 1,
+                path: "/tosort".into(),
+                case_sensitive: false,
+                added_at: now.clone(),
+                last_scanned: None,
+                disposition: Disposition::Consume,
+            },
+            Source {
+                id: 2,
+                path: lib.to_str().unwrap().into(),
+                case_sensitive: false,
+                added_at: now,
+                last_scanned: None,
+                disposition: Disposition::Preserve,
+            },
+        ];
+
+        // Both entries survive in the rebuilt archive on disk → the drain is safe.
+        assert!(
+            delete_has_surviving_copy(conn, &sources, "/tosort/bundle.zip").unwrap(),
+            "every entry survives in the library archive, so the container drains"
+        );
+
+        // Drop one entry's surviving location — now b.cue lives only in the
+        // container. The net must refuse: removing it would lose that content.
+        conn.execute(
+            "DELETE FROM file_locations WHERE sha1='BBB' AND source_id=2",
+            [],
+        )
+        .unwrap();
+        assert!(
+            !delete_has_surviving_copy(conn, &sources, "/tosort/bundle.zip").unwrap(),
+            "an entry held only by the container blocks the drain"
         );
     }
 }

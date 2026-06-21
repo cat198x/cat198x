@@ -10,5 +10,6 @@ pub use apply::{ApplyEvent, ApplyOptions, ApplyOutcome, OpView, apply_plan};
 pub use generator::{PlanOptions, compute_state_hash, generate_plan, generate_plan_filtered};
 pub use log::{LogEntry, LogStatus, LoggedOperation, OperationLog};
 pub use types::{
-    CollectionPlanStat, Operation, OperationKind, OperationStatus, Plan, PlanSummary, SourceRef,
+    CollectionPlanStat, ContainerRebuild, Operation, OperationKind, OperationStatus, Plan,
+    PlanSummary, RebuildEntry, SourceRef,
 };
