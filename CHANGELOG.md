@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.1](https://github.com/cat198x/cat198x/compare/v0.4.0...v0.4.1) - 2026-06-22
+
+### Added
+
+- plan oversized collections by bounding holders per content ([#56](https://github.com/cat198x/cat198x/pull/56))
+
+### Other
+
+- defer the multi-format hashes table ([#58](https://github.com/cat198x/cat198x/pull/58))
+
 ## [0.4.0](https://github.com/cat198x/cat198x/compare/v0.3.1...v0.4.0) - 2026-06-21
 
 ### Added
