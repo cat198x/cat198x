@@ -27,6 +27,17 @@ const MAX_MATCH_ROWS: i64 = 20_000_000;
 /// of small collections and pays its cost only for the few large ones.
 const GUARD_ROM_THRESHOLD: i64 = 50_000;
 
+/// When a collection's uncapped expansion blows past `MAX_MATCH_ROWS`, the
+/// planner retries it keeping at most this many holder-locations per distinct
+/// content instead of giving up. It tames the one pathology that reaches the
+/// cap — a byte-identical default file (e.g. a blank MAME icon) shipped for
+/// thousands of machines and held in thousands of places — by dropping its
+/// redundant copies. It is deliberately far above any legitimate fan-out: across
+/// a real library only ~138 contents are held in more than this many places, so
+/// the rare, unique ROMs that drive build-from and completeness decisions are
+/// never affected. Engaged only on the oversized fallback path.
+const PER_CONTENT_LOCATION_CAP: i64 = 64;
+
 /// A matched ROM ready for planning
 #[derive(Debug, Clone)]
 pub struct MatchedRom {
@@ -459,20 +470,43 @@ pub fn generate_plan_filtered(conn: &Connection, opts: &PlanOptions) -> Result<P
 
         // Guard against pathological collections before materialising any
         // matches: a MAME-style meta-aggregate expands to tens of millions of
-        // match-rows and would exhaust memory. Skip-and-report instead of OOM.
-        let match_rows = count_match_rows_capped(conn, version.id, MAX_MATCH_ROWS)?;
-        if match_rows > MAX_MATCH_ROWS {
+        // match-rows and would exhaust memory. When the uncapped expansion blows
+        // the budget, retry with a per-content holder cap — that tames the one
+        // pathology that reaches it (a byte-identical default file, e.g. a blank
+        // MAME icon, shipped for thousands of machines and held in thousands of
+        // places) by not enumerating its redundant copies. Only if it is *still*
+        // over budget once bounded do we skip-and-report; otherwise we plan it
+        // with the cap engaged. `None` for a normal collection leaves its plan
+        // byte-identical.
+        let match_rows = count_match_rows_capped(conn, version.id, MAX_MATCH_ROWS, None)?;
+        let location_cap = if match_rows > MAX_MATCH_ROWS {
+            let capped = count_match_rows_capped(
+                conn,
+                version.id,
+                MAX_MATCH_ROWS,
+                Some(PER_CONTENT_LOCATION_CAP),
+            )?;
+            if capped > MAX_MATCH_ROWS {
+                println!(
+                    "Skipping {} — expansion exceeds the {}-row cap even bounded to \
+                     {} holders per content (a meta-aggregate, not a placeable romset).",
+                    collection.name, MAX_MATCH_ROWS, PER_CONTENT_LOCATION_CAP
+                );
+                plan.skipped_oversized.push(format!(
+                    "{} (>{} match-rows even capped)",
+                    collection.name, MAX_MATCH_ROWS
+                ));
+                continue;
+            }
             println!(
-                "Skipping {} — match expansion exceeds the {}-row memory cap \
-                 (a meta-aggregate, not a placeable romset).",
-                collection.name, MAX_MATCH_ROWS
+                "  {} expands past the row budget uncapped; planning with at most \
+                 {} holders per content (bounds duplicated default content).",
+                collection.name, PER_CONTENT_LOCATION_CAP
             );
-            plan.skipped_oversized.push(format!(
-                "{} (>{} match-rows)",
-                collection.name, MAX_MATCH_ROWS
-            ));
-            continue;
-        }
+            Some(PER_CONTENT_LOCATION_CAP)
+        } else {
+            None
+        };
 
         planned_any = true;
         println!("Planning for: {} (v{})", collection.name, version.version);
@@ -499,6 +533,7 @@ pub fn generate_plan_filtered(conn: &Connection, opts: &PlanOptions) -> Result<P
             version.id,
             &collection.name,
             merge_mode == MergeMode::Split,
+            location_cap,
         )?;
 
         // Apply 1G1R filtering if enabled for this collection.
@@ -993,7 +1028,12 @@ pub fn generate_plan_filtered(conn: &Connection, opts: &PlanOptions) -> Result<P
 /// pathological collection is detected in bounded time without ever producing
 /// (or holding) its full expansion. A version with too few ROMs to plausibly
 /// reach the cap returns its ROM count directly, skipping the join entirely.
-fn count_match_rows_capped(conn: &Connection, version_id: i64, cap: i64) -> Result<i64> {
+fn count_match_rows_capped(
+    conn: &Connection,
+    version_id: i64,
+    cap: i64,
+    location_cap: Option<i64>,
+) -> Result<i64> {
     let rom_count: i64 = conn.query_row(
         "SELECT COUNT(*) FROM dat_roms r
          JOIN dat_games g ON r.game_id = g.id
@@ -1004,19 +1044,45 @@ fn count_match_rows_capped(conn: &Connection, version_id: i64, cap: i64) -> Resu
     )?;
     if rom_count < GUARD_ROM_THRESHOLD {
         // A lower bound well under the cap — cheap proof the collection is safe.
+        // The per-content cap only ever *reduces* the expansion, so a collection
+        // safe uncapped is safe capped; no need to run the windowed count.
         return Ok(rom_count.min(cap));
     }
-    count_expansion_capped(conn, version_id, cap)
+    count_expansion_capped(conn, version_id, cap, location_cap)
 }
 
 /// The exact match expansion, counted only up to `cap + 1` (the inner `LIMIT`
 /// halts the join there). Split out from the ROM-count gate so the bounded count
 /// is testable without a fixture large enough to pass the gate.
-fn count_expansion_capped(conn: &Connection, version_id: i64, cap: i64) -> Result<i64> {
+///
+/// `location_cap` mirrors [`find_matched_roms`]: `None` counts every
+/// (ROM × held-location) pair; `Some(n)` counts at most `n` holder-locations per
+/// content, so the count agrees with what a capped materialisation would produce.
+/// The caller re-counts with the cap to decide whether an over-budget collection
+/// becomes plannable once its duplicated content is bounded.
+fn count_expansion_capped(
+    conn: &Connection,
+    version_id: i64,
+    cap: i64,
+    location_cap: Option<i64>,
+) -> Result<i64> {
+    let fl_join = match location_cap {
+        None => "JOIN file_locations fl ON fl.sha1 = m.msha1".to_string(),
+        Some(_) => "JOIN (
+                SELECT sha1 FROM (
+                    SELECT fl.sha1,
+                           ROW_NUMBER() OVER (PARTITION BY fl.sha1
+                                              ORDER BY fl.source_id, fl.path) AS rn
+                    FROM file_locations fl
+                    WHERE fl.sha1 IN (SELECT msha1 FROM matched)
+                ) WHERE rn <= ?3
+             ) fl ON fl.sha1 = m.msha1"
+            .to_string(),
+    };
     // The expansion is one row per (matched ROM × held location), exactly what
     // the planner materialises; keep `rom_id` so a SHA1 matching several ROMs
     // counts once per ROM, matching `find_matched_roms`'s UNION cardinality.
-    let count: i64 = conn.query_row(
+    let sql = format!(
         "WITH vroms AS (
             SELECT r.id, r.sha1, r.crc32, r.size
             FROM dat_roms r
@@ -1036,11 +1102,17 @@ fn count_expansion_capped(conn: &Connection, version_id: i64, cap: i64) -> Resul
             WHERE vr.sha1 IS NULL AND vr.crc32 IS NOT NULL
          )
          SELECT COUNT(*) FROM (
-            SELECT 1 FROM matched m JOIN file_locations fl ON fl.sha1 = m.msha1 LIMIT ?2
-         )",
-        rusqlite::params![version_id, cap + 1],
-        |row| row.get(0),
-    )?;
+            SELECT 1 FROM matched m {fl_join} LIMIT ?2
+         )"
+    );
+    let count: i64 = match location_cap {
+        None => conn.query_row(&sql, rusqlite::params![version_id, cap + 1], |row| {
+            row.get(0)
+        })?,
+        Some(lc) => conn.query_row(&sql, rusqlite::params![version_id, cap + 1, lc], |row| {
+            row.get(0)
+        })?,
+    };
     Ok(count)
 }
 
@@ -1065,14 +1137,49 @@ fn find_matched_roms(
     version_id: i64,
     collection_name: &str,
     split: bool,
+    location_cap: Option<i64>,
 ) -> Result<Vec<MatchedRom>> {
-    let mut stmt = conn.prepare(
-        // The split filter (`?2`) drops a clone's inherited ROMs: when split is
-        // on, keep a ROM only if its game is a parent (`parent_name IS NULL`) or
-        // the ROM carries no merge tag (a clone's own unique ROM). This mirrors
-        // the split rule in `calculate_rom_requirements` so placement and
-        // completeness agree. When split is off, `?2` is 0 and the term is true
-        // for every ROM, leaving non-merged behaviour unchanged.
+    // The file-locations join fans each matched ROM out across every physical
+    // holder of its content — the precise picture placement needs. For a normal
+    // collection that fan-out is small and we keep every location (no cap).
+    //
+    // A pathological meta-aggregate breaks that: MAME's `all_non-zipped_content`
+    // ships one byte-identical default *icon* for thousands of machines, each
+    // copy held in thousands of places, so the (ROM × location) product explodes
+    // to tens of millions of rows and would exhaust memory. When `location_cap`
+    // is set we keep only the first N locations per content. This only ever drops
+    // *redundant* copies of massively-duplicated content — the rare, unique ROMs
+    // that actually drive placement (build-from / completeness) live in far fewer
+    // than N places, so they are untouched and the plan for them is unchanged.
+    // The cap is engaged solely on the oversized fallback path (see the caller),
+    // never for a collection that fits the row budget on its own.
+    let fl_join = match location_cap {
+        None => "JOIN file_locations fl ON fl.sha1 = m.sha1".to_string(),
+        Some(_) =>
+        // Keep at most ?3 holder rows per content. Scoped to matched SHA1s so the
+        // window runs over the relevant slice, not the whole locations table.
+        {
+            "JOIN (
+                SELECT path, sha1, archive_path, source_id FROM (
+                    SELECT fl.path, fl.sha1, fl.archive_path, fl.source_id,
+                           ROW_NUMBER() OVER (PARTITION BY fl.sha1
+                                              ORDER BY fl.source_id, fl.path) AS rn
+                    FROM file_locations fl
+                    WHERE fl.sha1 IN (SELECT sha1 FROM matched)
+                ) WHERE rn <= ?3
+             ) fl ON fl.sha1 = m.sha1"
+                .to_string()
+        }
+    };
+
+    // The split filter (`?2`) drops a clone's inherited ROMs: when split is on,
+    // keep a ROM only if its game is a parent (`parent_name IS NULL`) or the ROM
+    // carries no merge tag (a clone's own unique ROM). This mirrors the split rule
+    // in `calculate_rom_requirements` so placement and completeness agree. When
+    // split is off, `?2` is 0 and the term is true for every ROM, leaving
+    // non-merged behaviour unchanged. With no cap the `{fl_join}` slot is exactly
+    // the original `JOIN file_locations` — the uncapped query is unchanged.
+    let sql = format!(
         "WITH vroms AS (
             SELECT r.id, r.game_id, r.name, r.sha1, r.crc32, r.size, r.is_disk
             FROM dat_roms r
@@ -1098,26 +1205,33 @@ fn find_matched_roms(
          FROM matched m
          JOIN vroms vr ON vr.id = m.rom_id
          JOIN dat_games g ON vr.game_id = g.id
-         JOIN file_locations fl ON fl.sha1 = m.sha1
+         {fl_join}
          JOIN sources s ON fl.source_id = s.id
-         ORDER BY g.name, vr.name",
-    )?;
+         ORDER BY g.name, vr.name"
+    );
 
-    let matches = stmt
-        .query_map(rusqlite::params![version_id, split], |row| {
-            Ok(MatchedRom {
-                collection: collection_name.to_string(),
-                game_name: row.get(0)?,
-                rom_name: row.get(1)?,
-                sha1: row.get(2)?,
-                size: row.get(3)?,
-                source_path: row.get(4)?,
-                source_root: row.get(5)?,
-                archive_path: row.get(6)?,
-                is_disk: row.get(7)?,
-            })
-        })?
-        .collect::<Result<Vec<_>, _>>()?;
+    let mut stmt = conn.prepare(&sql)?;
+    let map_row = |row: &rusqlite::Row| {
+        Ok(MatchedRom {
+            collection: collection_name.to_string(),
+            game_name: row.get(0)?,
+            rom_name: row.get(1)?,
+            sha1: row.get(2)?,
+            size: row.get(3)?,
+            source_path: row.get(4)?,
+            source_root: row.get(5)?,
+            archive_path: row.get(6)?,
+            is_disk: row.get(7)?,
+        })
+    };
+    let matches = match location_cap {
+        None => stmt
+            .query_map(rusqlite::params![version_id, split], map_row)?
+            .collect::<Result<Vec<_>, _>>()?,
+        Some(cap) => stmt
+            .query_map(rusqlite::params![version_id, split, cap], map_row)?
+            .collect::<Result<Vec<_>, _>>()?,
+    };
 
     Ok(matches)
 }
@@ -1552,11 +1666,24 @@ pub fn compute_desired_state(
             None => continue,
         };
 
-        // A meta-aggregate places nothing real, so it contributes no desired
-        // state — skip it on the same cap the planner uses.
-        if count_match_rows_capped(conn, version.id, MAX_MATCH_ROWS)? > MAX_MATCH_ROWS {
-            continue;
-        }
+        // Mirror the planner's oversized handling exactly, so desired state and
+        // the plan agree: bound holders-per-content when a collection blows the
+        // row budget, and only skip if it is still over even bounded.
+        let location_cap =
+            if count_match_rows_capped(conn, version.id, MAX_MATCH_ROWS, None)? > MAX_MATCH_ROWS {
+                if count_match_rows_capped(
+                    conn,
+                    version.id,
+                    MAX_MATCH_ROWS,
+                    Some(PER_CONTENT_LOCATION_CAP),
+                )? > MAX_MATCH_ROWS
+                {
+                    continue;
+                }
+                Some(PER_CONTENT_LOCATION_CAP)
+            } else {
+                None
+            };
 
         let merge_mode = effective_merge_mode(conn, opts, cfg.as_ref(), &hierarchy)?;
         let matches = find_matched_roms(
@@ -1564,6 +1691,7 @@ pub fn compute_desired_state(
             version.id,
             &collection.name,
             merge_mode == MergeMode::Split,
+            location_cap,
         )?;
         // Mirror the planner's 1G1R filter, so a variant it would not place is
         // not recorded as a desired placement here either.
@@ -1856,11 +1984,128 @@ mod tests {
         }
 
         // A generous cap returns the true expansion (6).
-        assert_eq!(count_expansion_capped(conn, vid, 100).unwrap(), 6);
+        assert_eq!(count_expansion_capped(conn, vid, 100, None).unwrap(), 6);
         // A cap below the expansion is detected without counting past cap + 1.
-        let capped = count_expansion_capped(conn, vid, 4).unwrap();
+        let capped = count_expansion_capped(conn, vid, 4, None).unwrap();
         assert_eq!(capped, 5, "the inner LIMIT halts at cap + 1");
         assert!(capped > 4, "over-cap is reported as exceeding the cap");
+    }
+
+    /// Build the icons pathology in miniature: one content (a "blank icon")
+    /// referenced by `roms` DAT entries and physically held in `holders` places,
+    /// so the uncapped expansion is `roms × holders` — plus one *rare* content
+    /// (a unique icon) held once. Returns the version id.
+    fn setup_blank_icon_blowup(conn: &rusqlite::Connection, roms: usize, holders: usize) -> i64 {
+        let coll = collections::create_collection(conn, "Icons", "mame").unwrap();
+        let vid = collections::add_version(conn, coll, "v1", "/dats/i.dat", true).unwrap();
+        let node = dats::create_node(conn, vid, None, "Icons", "dat", "MAME").unwrap();
+        let g = dats::create_game(conn, node, "icons", None, None, false, false, false).unwrap();
+        // `roms` machines all ship the identical blank icon (content BLANK)...
+        for i in 0..roms {
+            dats::create_rom(
+                conn,
+                g,
+                &format!("m{i}.ico"),
+                6,
+                Some("BLANK"),
+                None,
+                None,
+                "good",
+                None,
+            )
+            .unwrap();
+        }
+        // ...plus one machine with a genuinely unique icon (content RARE).
+        dats::create_rom(
+            conn,
+            g,
+            "unique.ico",
+            6,
+            Some("RARE"),
+            None,
+            None,
+            "good",
+            None,
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO files (sha1, size) VALUES ('BLANK', 6), ('RARE', 6)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO sources (id, path, case_sensitive) VALUES (700, '/lib', 0)",
+            [],
+        )
+        .unwrap();
+        // The blank icon sits in `holders` places; the rare icon in exactly one.
+        for i in 0..holders {
+            conn.execute(
+                &format!(
+                    "INSERT INTO file_locations (sha1, source_id, path) VALUES ('BLANK', 700, 'b{i}.ico')"
+                ),
+                [],
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "INSERT INTO file_locations (sha1, source_id, path) VALUES ('RARE', 700, 'unique.ico')",
+            [],
+        )
+        .unwrap();
+        vid
+    }
+
+    #[test]
+    fn location_cap_bounds_the_cross_product_so_an_over_budget_set_becomes_plannable() {
+        let db = setup_db();
+        let conn = db.conn();
+        // 8 machines share the blank icon, held in 8 places: 8 × 8 = 64 uncapped
+        // rows from one content (the real pathology in miniature), + 1 rare row.
+        let vid = setup_blank_icon_blowup(conn, 8, 8);
+
+        // Uncapped, the expansion is the full cross-product (64 blank + 1 rare).
+        assert_eq!(count_expansion_capped(conn, vid, 1000, None).unwrap(), 65);
+
+        // Bounded to 2 holders per content, the blank icon contributes only
+        // 8 roms × 2 = 16, plus the untouched rare row: 17.
+        assert_eq!(
+            count_expansion_capped(conn, vid, 1000, Some(2)).unwrap(),
+            17,
+            "the per-content cap collapses the duplicate cross-product"
+        );
+
+        // The planner's decision in miniature: with a row budget of 40, the set
+        // is over budget uncapped (65 > 40) but fits once bounded (17 <= 40) —
+        // exactly the path that turns a skipped collection into a planned one.
+        assert!(count_expansion_capped(conn, vid, 40, None).unwrap() > 40);
+        assert!(count_expansion_capped(conn, vid, 40, Some(2)).unwrap() <= 40);
+    }
+
+    #[test]
+    fn location_cap_bounds_duplicated_content_but_leaves_rare_content_whole() {
+        let db = setup_db();
+        let conn = db.conn();
+        // Blank icon held in 10 places; rare icon in 1.
+        let vid = setup_blank_icon_blowup(conn, 3, 10);
+
+        // Uncapped: 3 roms × 10 holders of BLANK + 1 RARE = 31 rows.
+        let uncapped = find_matched_roms(conn, vid, "Icons", false, None).unwrap();
+        assert_eq!(uncapped.len(), 31);
+
+        // Capped at 4 holders/content: BLANK gives 3 × 4 = 12, RARE still 1 = 13.
+        let capped = find_matched_roms(conn, vid, "Icons", false, Some(4)).unwrap();
+        assert_eq!(capped.len(), 13);
+
+        // The rare content is never bounded — every reference to it survives, so
+        // build-from / completeness decisions that key off rare ROMs are intact.
+        assert_eq!(
+            capped.iter().filter(|m| m.sha1 == "RARE").count(),
+            1,
+            "rare content (held once) is untouched by the cap"
+        );
+        // The blank content is bounded to the cap per the ROMs referencing it.
+        assert_eq!(capped.iter().filter(|m| m.sha1 == "BLANK").count(), 12);
     }
 
     #[test]
