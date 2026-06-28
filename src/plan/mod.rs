@@ -1,6 +1,7 @@
 //! Plan generation and management
 
 pub mod apply;
+pub(crate) mod collisions;
 pub(crate) mod desired_state;
 pub(crate) mod destinations;
 pub mod executor;
@@ -11,6 +12,7 @@ pub(crate) mod rules;
 pub mod types;
 
 pub use apply::{ApplyEvent, ApplyOptions, ApplyOutcome, OpView, apply_plan};
+pub use collisions::{CollidingCollection, DestinationCollision, find_destination_collisions};
 pub use desired_state::{DesiredState, compute_desired_state};
 pub use generator::{PlanOptions, compute_state_hash, generate_plan, generate_plan_filtered};
 pub use log::{LogEntry, LogStatus, LoggedOperation, OperationLog};

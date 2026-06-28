@@ -7,8 +7,7 @@ use crate::config::Config;
 use crate::db::collections::{list_collections, list_versions};
 use crate::db::dats;
 use crate::db::files::list_sources;
-use crate::plan::PlanOptions;
-use crate::plan::generator::find_destination_collisions;
+use crate::plan::{PlanOptions, find_destination_collisions};
 
 use super::{get_data_dir, open_database};
 
