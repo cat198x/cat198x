@@ -3,7 +3,7 @@
 use anyhow::Result;
 use std::path::PathBuf;
 
-use crate::ConfigCommands;
+use crate::cli::args::ConfigCommands;
 use crate::config::{Config, MergeMode, OutputFormat};
 use crate::db::config as db_config;
 

@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
 
-use crate::DatCommands;
+use crate::cli::args::DatCommands;
 use crate::dat::{DatSourceType, parse_dat_file_auto};
 use crate::db::{Database, collections, dats};
 

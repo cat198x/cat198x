@@ -8,7 +8,7 @@ use std::fs;
 use std::io::{self, Write};
 use std::path::PathBuf;
 
-use crate::QuarantineCommands;
+use crate::cli::args::QuarantineCommands;
 use crate::db::quarantine as db_quarantine;
 
 use super::open_database;

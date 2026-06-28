@@ -120,7 +120,9 @@ pub struct ApplyOutcome {
 impl OpView {
     fn of(kind: &OperationKind) -> Self {
         match kind {
-            OperationKind::Copy { source, dest, size } => OpView {
+            OperationKind::Copy {
+                source, dest, size, ..
+            } => OpView {
                 verb: "COPY",
                 from: source.path.clone(),
                 to: Some(dest.clone()),
@@ -128,7 +130,9 @@ impl OpView {
                 bytes: *size,
                 reason: None,
             },
-            OperationKind::Move { source, dest, size } => OpView {
+            OperationKind::Move {
+                source, dest, size, ..
+            } => OpView {
                 verb: "MOVE",
                 from: source.path.clone(),
                 to: Some(dest.clone()),
@@ -254,24 +258,36 @@ pub fn apply_plan(
                         });
                         continue;
                     }
-                    OperationKind::Copy { source, dest, .. } => {
+                    OperationKind::Copy {
+                        source,
+                        dest,
+                        placement,
+                        ..
+                    } => {
                         placement_batch.push(PlacementJob {
                             plan_index: i,
                             operation_id: op.id,
                             kind: PlacementKind::Copy {
                                 source: source.clone(),
                                 dest: dest.clone(),
+                                placement: placement.clone(),
                             },
                         });
                         continue;
                     }
-                    OperationKind::Move { source, dest, .. } => {
+                    OperationKind::Move {
+                        source,
+                        dest,
+                        placement,
+                        ..
+                    } => {
                         placement_batch.push(PlacementJob {
                             plan_index: i,
                             operation_id: op.id,
                             kind: PlacementKind::Move {
                                 source: source.clone(),
                                 dest: dest.clone(),
+                                placement: placement.clone(),
                             },
                         });
                         continue;
@@ -352,12 +368,18 @@ pub fn apply_plan(
         match &op.kind {
             // Copy/Move/Relocate/Repack run in their concurrent batches and never
             // reach here in a real run; these arms are a defensive fallback.
-            OperationKind::Copy { source, dest, .. } => {
+            OperationKind::Copy {
+                source,
+                dest,
+                placement,
+                ..
+            } => {
                 let result = execute_copy(
                     &source.path,
                     source.archive_path.as_deref(),
                     dest,
                     &source.sha1,
+                    placement,
                 );
                 if let Some(ref mut log) = op_log {
                     log.log_copy(op.id, &source.path, dest, &source.sha1, result.is_ok());
@@ -379,12 +401,18 @@ pub fn apply_plan(
                     }
                 }
             }
-            OperationKind::Move { source, dest, .. } => {
+            OperationKind::Move {
+                source,
+                dest,
+                placement,
+                ..
+            } => {
                 let result = execute_move(
                     &source.path,
                     source.archive_path.as_deref(),
                     dest,
                     &source.sha1,
+                    placement,
                 );
                 if let Some(ref mut log) = op_log {
                     log.log_move(op.id, &source.path, dest, &source.sha1, result.is_ok());
@@ -665,10 +693,10 @@ fn flush_placement_batch(
             if let Some(log) = op_log {
                 let success = result.is_ok();
                 match &job.kind {
-                    PlacementKind::Copy { source, dest } => {
+                    PlacementKind::Copy { source, dest, .. } => {
                         log.log_copy(job.operation_id, &source.path, dest, &source.sha1, success)
                     }
-                    PlacementKind::Move { source, dest } => {
+                    PlacementKind::Move { source, dest, .. } => {
                         log.log_move(job.operation_id, &source.path, dest, &source.sha1, success)
                     }
                     PlacementKind::Relocate { source, dest } => {

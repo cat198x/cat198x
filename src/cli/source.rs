@@ -4,7 +4,7 @@ use anyhow::{Context, Result};
 use rusqlite::Connection;
 use std::path::{Path, PathBuf};
 
-use crate::SourceCommands;
+use crate::cli::args::SourceCommands;
 use crate::config::Config;
 use crate::db::files::{self, Disposition};
 

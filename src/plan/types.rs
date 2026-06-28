@@ -96,6 +96,21 @@ impl OperationStatus {
     }
 }
 
+/// Where a copy-like operation writes its payload.
+///
+/// The default is a byte-for-byte loose file. Archive writes are explicit so a
+/// DAT ROM whose canonical filename happens to end in `.zip` is still written as
+/// that loose file, not silently wrapped inside a new ZIP archive.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum CopyPlacement {
+    #[default]
+    LooseFile,
+    ZipEntry {
+        entry_name: String,
+    },
+}
+
 /// The type of operation to perform
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
@@ -105,12 +120,16 @@ pub enum OperationKind {
         source: SourceRef,
         dest: String,
         size: u64,
+        #[serde(default)]
+        placement: CopyPlacement,
     },
     /// Move a file (copy + delete source)
     Move {
         source: SourceRef,
         dest: String,
         size: u64,
+        #[serde(default)]
+        placement: CopyPlacement,
     },
     /// Relocate a whole file unchanged — e.g. a complete archive that is already
     /// in its final form and only needs to sit at its canonical path. Unlike
@@ -241,7 +260,35 @@ impl Plan {
         self.operations.push(Operation {
             id,
             status: OperationStatus::Pending,
-            kind: OperationKind::Copy { source, dest, size },
+            kind: OperationKind::Copy {
+                source,
+                dest,
+                size,
+                placement: CopyPlacement::LooseFile,
+            },
+        });
+        self.summary.copy_count += 1;
+        self.summary.total_bytes += size;
+    }
+
+    /// Add an explicit copy-into-ZIP operation.
+    pub fn add_copy_to_zip(
+        &mut self,
+        source: SourceRef,
+        dest: String,
+        entry_name: String,
+        size: u64,
+    ) {
+        let id = self.operations.len() as u64;
+        self.operations.push(Operation {
+            id,
+            status: OperationStatus::Pending,
+            kind: OperationKind::Copy {
+                source,
+                dest,
+                size,
+                placement: CopyPlacement::ZipEntry { entry_name },
+            },
         });
         self.summary.copy_count += 1;
         self.summary.total_bytes += size;
@@ -253,7 +300,12 @@ impl Plan {
         self.operations.push(Operation {
             id,
             status: OperationStatus::Pending,
-            kind: OperationKind::Move { source, dest, size },
+            kind: OperationKind::Move {
+                source,
+                dest,
+                size,
+                placement: CopyPlacement::LooseFile,
+            },
         });
         self.summary.move_count += 1;
         self.summary.total_bytes += size;
@@ -488,6 +540,7 @@ mod tests {
             },
             dest: "/dest".to_string(),
             size: 100,
+            placement: CopyPlacement::LooseFile,
         };
 
         let json = serde_json::to_string(&kind).unwrap();

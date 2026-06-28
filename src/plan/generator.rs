@@ -1,10 +1,20 @@
 //! Plan generation logic
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use rusqlite::Connection;
 use sha2::{Digest as Sha2Digest, Sha256};
 use std::collections::{BTreeMap, HashMap, HashSet};
 
+use super::destinations::{
+    build_archive_dest_path, build_dest_path, build_disk_dest_path, resolve_dest_root,
+    validate_relative_path,
+};
+#[cfg(test)]
+use super::matching::count_expansion_capped;
+use super::matching::{
+    MatchedRom, compute_shared_containers, compute_shared_content, count_match_rows_capped,
+    find_matched_roms,
+};
 use super::{CollectionPlanStat, ContainerRebuild, Plan, RebuildEntry, SourceRef};
 use crate::config::{MergeMode, OutputFormat};
 use crate::db::files::Disposition;
@@ -20,36 +30,6 @@ use crate::filter::{RomCandidate, parse_game_name, select_preferred};
 /// legitimate set seen, FinalBurn Neo - Arcade Games, expands to ~7.9M rows,
 /// comfortably under the cap.
 const MAX_MATCH_ROWS: i64 = 20_000_000;
-
-/// A version with fewer ROMs than this cannot plausibly reach `MAX_MATCH_ROWS`
-/// (it would take an implausible average per-ROM fan-out), so the expansion
-/// guard's query is skipped for it. This keeps the guard free for the hundreds
-/// of small collections and pays its cost only for the few large ones.
-const GUARD_ROM_THRESHOLD: i64 = 50_000;
-
-/// A matched ROM ready for planning
-#[derive(Debug, Clone)]
-pub struct MatchedRom {
-    /// Collection name
-    pub collection: String,
-    /// Game name
-    pub game_name: String,
-    /// ROM name (filename within game folder)
-    pub rom_name: String,
-    /// SHA1 hash
-    pub sha1: String,
-    /// File size
-    pub size: i64,
-    /// Source file location
-    pub source_path: String,
-    /// Source directory root
-    pub source_root: String,
-    /// Archive path (None for loose files)
-    pub archive_path: Option<String>,
-    /// True for a `<disk>` (CHD): stored loose in a machine folder as
-    /// `<game>/<rom_name>.chd`, never packed into an archive.
-    pub is_disk: bool,
-}
 
 /// Options controlling plan generation.
 #[derive(Debug, Clone, Default)]
@@ -76,122 +56,6 @@ pub struct PlanOptions {
 /// Generate a plan for all configured collections with default options.
 pub fn generate_plan(conn: &Connection) -> Result<Plan> {
     generate_plan_filtered(conn, &PlanOptions::default())
-}
-
-/// The held-content SHA1s whose content satisfies more than one distinct DAT game
-/// across all active versions — genuinely distinct catalogue entries that happen
-/// to be byte-identical (multi-disk sets sharing a data disk, re-releases, common
-/// loaders, a parent/clone romset). Such content must be *copied* to each
-/// destination and never moved or deleted: a single physical file can be the
-/// matched source for many destinations, and consuming it to satisfy one strands
-/// the rest.
-///
-/// The key is the **held file's** SHA1 (what `MatchedRom.sha1` carries), and the
-/// match mirrors `find_matched_roms` exactly — direct SHA1, headerless SHA1, or
-/// CRC32 + size for SHA1-less DAT entries. The CRC32 arm is load-bearing for
-/// arcade: MAME/FinalBurn Neo DATs are CRC-only (NULL `sha1`), so a SHA1-only
-/// match silently classed their shared romsets as *not* shared, letting the
-/// planner relocate or delete a container several games depend on.
-fn compute_shared_content(conn: &Connection) -> Result<HashSet<String>> {
-    let mut stmt = conn.prepare(
-        "WITH active_roms AS (
-             SELECT r.sha1 AS rom_sha1, r.crc32 AS rom_crc32, r.size AS rom_size,
-                    g.id AS game_id
-               FROM dat_roms r
-               JOIN dat_games g ON g.id = r.game_id
-               JOIN dat_nodes dn ON dn.id = g.node_id
-               JOIN collection_versions cv ON cv.id = dn.version_id
-              WHERE cv.is_active = 1
-         ),
-         matched AS (
-             SELECT f.sha1 AS file_sha1, ar.game_id
-               FROM files f JOIN active_roms ar ON f.sha1 = ar.rom_sha1
-              WHERE ar.rom_sha1 IS NOT NULL AND ar.rom_sha1 <> ''
-             UNION
-             SELECT f.sha1, ar.game_id
-               FROM files f JOIN active_roms ar ON f.sha1_no_header = ar.rom_sha1
-              WHERE ar.rom_sha1 IS NOT NULL AND ar.rom_sha1 <> ''
-             UNION
-             SELECT f.sha1, ar.game_id
-               FROM files f JOIN active_roms ar
-                    ON f.crc32 = ar.rom_crc32 AND f.size = ar.rom_size
-              WHERE ar.rom_sha1 IS NULL AND ar.rom_crc32 IS NOT NULL
-         )
-         SELECT file_sha1
-           FROM matched
-          WHERE file_sha1 IN (SELECT sha1 FROM file_locations)
-          GROUP BY file_sha1
-         HAVING COUNT(DISTINCT game_id) > 1",
-    )?;
-    let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
-    let mut set = HashSet::new();
-    for r in rows {
-        set.insert(r?);
-    }
-    Ok(set)
-}
-
-/// The source archive files whose inner entries satisfy more than one distinct
-/// DAT game — a single physical container holding ROMs for several games (a
-/// multi-program bundle, a romset shared across parent/clone, etc.). Such a
-/// container must never be *relocated* whole or deleted to satisfy one game, or
-/// the others it also sources are stranded; each game is repacked from it
-/// instead (which extracts only its own entries and leaves the container in
-/// place). The key is the full source path (`source_root/source_path`), matching
-/// the container key used during planning.
-///
-/// Entries match DAT ROMs the same three ways as `find_matched_roms` — direct
-/// SHA1, headerless SHA1, or CRC32 + size for SHA1-less entries — joining through
-/// `files` to reach the CRC32/size of each held entry. The CRC32 arm is what
-/// makes this correct for CRC-only arcade DATs (MAME/FinalBurn Neo): without it a
-/// merged container sourcing a parent and its clones reads as serving one game,
-/// so the planner relocates it to the parent and the clones' relocations then
-/// race on a vanished source.
-fn compute_shared_containers(conn: &Connection) -> Result<HashSet<String>> {
-    let mut stmt = conn.prepare(
-        "WITH container_games AS (
-             SELECT fl.source_id, fl.path, g.id AS game_id
-               FROM file_locations fl
-               JOIN files f ON f.sha1 = fl.sha1
-               JOIN dat_roms r ON r.sha1 = f.sha1
-               JOIN dat_games g ON g.id = r.game_id
-               JOIN dat_nodes dn ON dn.id = g.node_id
-               JOIN collection_versions cv ON cv.id = dn.version_id
-              WHERE cv.is_active = 1 AND fl.archive_path IS NOT NULL
-                AND r.sha1 IS NOT NULL AND r.sha1 <> ''
-             UNION
-             SELECT fl.source_id, fl.path, g.id
-               FROM file_locations fl
-               JOIN files f ON f.sha1 = fl.sha1
-               JOIN dat_roms r ON r.sha1 = f.sha1_no_header
-               JOIN dat_games g ON g.id = r.game_id
-               JOIN dat_nodes dn ON dn.id = g.node_id
-               JOIN collection_versions cv ON cv.id = dn.version_id
-              WHERE cv.is_active = 1 AND fl.archive_path IS NOT NULL
-                AND r.sha1 IS NOT NULL AND r.sha1 <> ''
-             UNION
-             SELECT fl.source_id, fl.path, g.id
-               FROM file_locations fl
-               JOIN files f ON f.sha1 = fl.sha1
-               JOIN dat_roms r ON r.crc32 = f.crc32 AND r.size = f.size
-               JOIN dat_games g ON g.id = r.game_id
-               JOIN dat_nodes dn ON dn.id = g.node_id
-               JOIN collection_versions cv ON cv.id = dn.version_id
-              WHERE cv.is_active = 1 AND fl.archive_path IS NOT NULL
-                AND r.sha1 IS NULL AND r.crc32 IS NOT NULL
-         )
-         SELECT s.path || '/' || cg.path
-           FROM container_games cg
-           JOIN sources s ON s.id = cg.source_id
-          GROUP BY cg.source_id, cg.path
-         HAVING COUNT(DISTINCT cg.game_id) > 1",
-    )?;
-    let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
-    let mut set = HashSet::new();
-    for r in rows {
-        set.insert(r?);
-    }
-    Ok(set)
 }
 
 /// Whether a version is disk-only: it has at least one `<disk>` and no `<rom>`.
@@ -294,7 +158,7 @@ pub fn find_destination_collisions(
         }
         let cfg = db_config::get_collection_config(conn, &collection.name)?;
         let explicit = cfg.as_ref().and_then(|c| c.dest_path.as_deref());
-        if let Some(root) = resolve_dest_root(explicit, opts.default_dest.as_deref(), &hierarchy) {
+        if let Some(root) = resolve_dest_root(explicit, opts.default_dest.as_deref(), &hierarchy)? {
             let disk_only = version_is_disk_only(conn, version.id)?;
             owners
                 .entry((root, disk_only))
@@ -448,7 +312,7 @@ pub fn generate_plan_filtered(conn: &Connection, opts: &PlanOptions) -> Result<P
 
         let explicit = cfg.as_ref().and_then(|c| c.dest_path.as_deref());
 
-        let dest_root = match resolve_dest_root(explicit, default_dest, &hierarchy) {
+        let dest_root = match resolve_dest_root(explicit, default_dest, &hierarchy)? {
             Some(root) => root,
             None => {
                 // No destination resolved — recorded and reported, never silent.
@@ -568,7 +432,7 @@ pub fn generate_plan_filtered(conn: &Connection, opts: &PlanOptions) -> Result<P
                         .map(|s| s.len())
                         .unwrap_or(1)
                         > 1;
-                    let dest = build_dest_path(&dest_root, &m.game_name, &m.rom_name, multi_rom);
+                    let dest = build_dest_path(&dest_root, &m.game_name, &m.rom_name, multi_rom)?;
                     by_dest.entry(dest).or_default().push(m);
                 }
 
@@ -655,7 +519,7 @@ pub fn generate_plan_filtered(conn: &Connection, opts: &PlanOptions) -> Result<P
                 }
 
                 for (game_name, gmatches) in games {
-                    let dest = format!("{}/{}.{}", dest_root.trim_end_matches('/'), game_name, ext);
+                    let dest = build_archive_dest_path(&dest_root, &game_name, ext)?;
 
                     // Distinct expected entries (canonical name + SHA1) and the
                     // source containers that hold them.
@@ -772,11 +636,17 @@ pub fn generate_plan_filtered(conn: &Connection, opts: &PlanOptions) -> Result<P
                         // hold (scattered across containers). Used for copy-out, for
                         // torrentzip, or when no single container is complete.
                         let sources: Vec<SourceRef> = match &build_from {
-                            Some(p) => containers[p].iter().map(source_ref_for).collect(),
+                            Some(p) => containers[p]
+                                .iter()
+                                .map(source_ref_for)
+                                .collect::<Result<Vec<_>>>()
+                                .with_context(|| format!("invalid DAT path in {game_name}"))?,
                             None => containers
                                 .values()
-                                .flat_map(|e| e.iter().map(source_ref_for))
-                                .collect(),
+                                .flatten()
+                                .map(source_ref_for)
+                                .collect::<Result<Vec<_>>>()
+                                .with_context(|| format!("invalid DAT path in {game_name}"))?,
                         };
                         let size: u64 = expected
                             .iter()
@@ -849,6 +719,8 @@ pub fn generate_plan_filtered(conn: &Connection, opts: &PlanOptions) -> Result<P
                                     });
                             for m in &containers[container] {
                                 if let Some(archive_entry) = &m.archive_path {
+                                    validate_relative_path("archive entry name", archive_entry)?;
+                                    validate_relative_path("ROM entry name", &m.rom_name)?;
                                     drain.entries.push(RebuildEntry {
                                         dest: dest.clone(),
                                         dest_entry: m.rom_name.clone(),
@@ -905,7 +777,7 @@ pub fn generate_plan_filtered(conn: &Connection, opts: &PlanOptions) -> Result<P
                 &shared,
                 &dispositions,
                 &mut plan,
-            );
+            )?;
             already_correct += d.already_correct;
             to_write += d.to_write;
             bytes += d.bytes;
@@ -986,143 +858,6 @@ pub fn generate_plan_filtered(conn: &Connection, opts: &PlanOptions) -> Result<P
     Ok(plan)
 }
 
-/// Count the match-rows a version's plan would materialise, bounded to `cap + 1`.
-///
-/// Mirrors the joins of [`find_matched_roms`] but only counts rows, and the
-/// inner `LIMIT cap + 1` stops the join the moment the cap is reached — so a
-/// pathological collection is detected in bounded time without ever producing
-/// (or holding) its full expansion. A version with too few ROMs to plausibly
-/// reach the cap returns its ROM count directly, skipping the join entirely.
-fn count_match_rows_capped(conn: &Connection, version_id: i64, cap: i64) -> Result<i64> {
-    let rom_count: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM dat_roms r
-         JOIN dat_games g ON r.game_id = g.id
-         JOIN dat_nodes n ON g.node_id = n.id
-         WHERE n.version_id = ?1 AND r.status != 'nodump'",
-        [version_id],
-        |row| row.get(0),
-    )?;
-    if rom_count < GUARD_ROM_THRESHOLD {
-        // A lower bound well under the cap — cheap proof the collection is safe.
-        return Ok(rom_count.min(cap));
-    }
-    count_expansion_capped(conn, version_id, cap)
-}
-
-/// The exact match expansion, counted only up to `cap + 1` (the inner `LIMIT`
-/// halts the join there). Split out from the ROM-count gate so the bounded count
-/// is testable without a fixture large enough to pass the gate.
-fn count_expansion_capped(conn: &Connection, version_id: i64, cap: i64) -> Result<i64> {
-    // The expansion is one row per (matched ROM × held location), exactly what
-    // the planner materialises; keep `rom_id` so a SHA1 matching several ROMs
-    // counts once per ROM, matching `find_matched_roms`'s UNION cardinality.
-    let count: i64 = conn.query_row(
-        "WITH vroms AS (
-            SELECT r.id, r.sha1, r.crc32, r.size
-            FROM dat_roms r
-            JOIN dat_games g ON r.game_id = g.id
-            JOIN dat_nodes n ON g.node_id = n.id
-            WHERE n.version_id = ?1 AND r.status != 'nodump'
-         ),
-         matched AS (
-            SELECT vr.id AS rom_id, f.sha1 AS msha1
-            FROM vroms vr JOIN files f ON f.sha1 = vr.sha1 WHERE vr.sha1 IS NOT NULL
-            UNION
-            SELECT vr.id, f.sha1
-            FROM vroms vr JOIN files f ON f.sha1_no_header = vr.sha1 WHERE vr.sha1 IS NOT NULL
-            UNION
-            SELECT vr.id, f.sha1
-            FROM vroms vr JOIN files f ON f.crc32 = vr.crc32 AND f.size = vr.size
-            WHERE vr.sha1 IS NULL AND vr.crc32 IS NOT NULL
-         )
-         SELECT COUNT(*) FROM (
-            SELECT 1 FROM matched m JOIN file_locations fl ON fl.sha1 = m.msha1 LIMIT ?2
-         )",
-        rusqlite::params![version_id, cap + 1],
-        |row| row.get(0),
-    )?;
-    Ok(count)
-}
-
-/// Find all ROMs in one collection version that have a matching held file.
-///
-/// Performance is critical here — this runs once per collection, and a full
-/// library is thousands of collections. The match has three modes: a DAT SHA1
-/// may be the file's headered or headerless hash, and a SHA1-less DAT entry
-/// matches on CRC + size. Expressed as a single `OR` join, SQLite can't drive
-/// from this version's ROMs into the file index and instead scans the whole
-/// `files` table per call (~13s each on a real library). Splitting the modes
-/// into a `UNION` lets each branch use an index (files PK on `sha1`,
-/// `idx_files_sha1_no_header`, and `idx_files_crc32_size` for the CRC-only
-/// branch that CRC-only DATs like MAME/FinalBurn Neo rely on), so the query
-/// starts from the version's ROMs and runs in milliseconds rather than
-/// full-scanning the files table per ROM. We select the *file's* sha1 and size
-/// (not the DAT's) —
-/// that's the true content placed at the destination, which
-/// `is_file_correct_at_dest` verifies.
-fn find_matched_roms(
-    conn: &Connection,
-    version_id: i64,
-    collection_name: &str,
-    split: bool,
-) -> Result<Vec<MatchedRom>> {
-    let mut stmt = conn.prepare(
-        // The split filter (`?2`) drops a clone's inherited ROMs: when split is
-        // on, keep a ROM only if its game is a parent (`parent_name IS NULL`) or
-        // the ROM carries no merge tag (a clone's own unique ROM). This mirrors
-        // the split rule in `calculate_rom_requirements` so placement and
-        // completeness agree. When split is off, `?2` is 0 and the term is true
-        // for every ROM, leaving non-merged behaviour unchanged.
-        "WITH vroms AS (
-            SELECT r.id, r.game_id, r.name, r.sha1, r.crc32, r.size, r.is_disk
-            FROM dat_roms r
-            JOIN dat_games g ON r.game_id = g.id
-            JOIN dat_nodes n ON g.node_id = n.id
-            WHERE n.version_id = ?1 AND r.status != 'nodump'
-              AND (?2 = 0 OR g.parent_name IS NULL OR r.merge_tag IS NULL)
-         ),
-         matched AS (
-            SELECT vr.id AS rom_id, f.sha1, f.size
-            FROM vroms vr JOIN files f ON f.sha1 = vr.sha1
-            WHERE vr.sha1 IS NOT NULL
-            UNION
-            SELECT vr.id, f.sha1, f.size
-            FROM vroms vr JOIN files f ON f.sha1_no_header = vr.sha1
-            WHERE vr.sha1 IS NOT NULL
-            UNION
-            SELECT vr.id, f.sha1, f.size
-            FROM vroms vr JOIN files f ON f.crc32 = vr.crc32 AND f.size = vr.size
-            WHERE vr.sha1 IS NULL AND vr.crc32 IS NOT NULL
-         )
-         SELECT g.name, vr.name, m.sha1, m.size, fl.path, s.path, fl.archive_path, vr.is_disk
-         FROM matched m
-         JOIN vroms vr ON vr.id = m.rom_id
-         JOIN dat_games g ON vr.game_id = g.id
-         JOIN file_locations fl ON fl.sha1 = m.sha1
-         JOIN sources s ON fl.source_id = s.id
-         ORDER BY g.name, vr.name",
-    )?;
-
-    let matches = stmt
-        .query_map(rusqlite::params![version_id, split], |row| {
-            Ok(MatchedRom {
-                collection: collection_name.to_string(),
-                game_name: row.get(0)?,
-                rom_name: row.get(1)?,
-                sha1: row.get(2)?,
-                size: row.get(3)?,
-                source_path: row.get(4)?,
-                source_root: row.get(5)?,
-                archive_path: row.get(6)?,
-                is_disk: row.get(7)?,
-            })
-        })?
-        .collect::<Result<Vec<_>, _>>()?;
-
-    Ok(matches)
-}
-
-/// Build destination path for a ROM
 /// The effective output format: an explicit per-collection setting wins,
 /// otherwise the library-wide default. An unrecognised string falls back to the
 /// default rather than failing the whole plan.
@@ -1206,45 +941,14 @@ fn container_archive_format(path: &str) -> String {
     }
 }
 
-fn source_ref_for(m: &MatchedRom) -> SourceRef {
-    SourceRef {
+fn source_ref_for(m: &MatchedRom) -> Result<SourceRef> {
+    validate_relative_path("ROM entry name", &m.rom_name)?;
+    Ok(SourceRef {
         path: format!("{}/{}", m.source_root, m.source_path),
         archive_path: m.archive_path.clone(),
         sha1: m.sha1.clone(),
         entry_name: Some(m.rom_name.clone()),
-    }
-}
-
-/// Resolve a collection's destination root, in order of precedence:
-///   1. an explicit per-collection `dest_path`, used as-is;
-///   2. otherwise the library-wide `default_dest` joined with the collection's
-///      library path (`hierarchy`), so a whole set is tidied from one setting;
-///   3. otherwise `None` — no destination, and the caller skips the collection.
-fn resolve_dest_root(
-    explicit: Option<&str>,
-    default_dest: Option<&str>,
-    hierarchy: &str,
-) -> Option<String> {
-    match explicit {
-        Some(p) => Some(p.to_string()),
-        None => default_dest.map(|base| format!("{}/{}", base.trim_end_matches('/'), hierarchy)),
-    }
-}
-
-/// Build the on-disk destination for one ROM under its collection's root.
-///
-/// Loose layout: a single-ROM game is placed flat as `dest_root/rom_name` — the
-/// common TOSEC case, where one "game" is one file and a wrapping folder would
-/// just be noise. A multi-ROM game gets its own folder,
-/// `dest_root/game_name/rom_name`, so its parts stay together and don't collide
-/// with other games' files.
-fn build_dest_path(dest_root: &str, game_name: &str, rom_name: &str, multi_rom: bool) -> String {
-    let root = dest_root.trim_end_matches('/');
-    if multi_rom {
-        format!("{}/{}/{}", root, game_name, rom_name)
-    } else {
-        format!("{}/{}", root, rom_name)
-    }
+    })
 }
 
 /// Counts from planning a batch of CHD (disk) matches.
@@ -1352,14 +1056,13 @@ fn plan_disk_matches(
     shared: &HashSet<String>,
     dispositions: &HashMap<String, Disposition>,
     plan: &mut Plan,
-) -> DiskPlanCounts {
+) -> Result<DiskPlanCounts> {
     let mut counts = DiskPlanCounts::default();
-    let root = dest_root.trim_end_matches('/');
 
     // Group every held copy by its canonical destination.
     let mut by_dest: BTreeMap<String, Vec<MatchedRom>> = BTreeMap::new();
     for m in matches {
-        let dest = format!("{}/{}/{}.chd", root, m.game_name, m.rom_name);
+        let dest = build_disk_dest_path(dest_root, &m.game_name, &m.rom_name)?;
         by_dest.entry(dest).or_default().push(m);
     }
 
@@ -1421,7 +1124,7 @@ fn plan_disk_matches(
         counts.already_correct, counts.to_write, counts.deduped
     );
 
-    counts
+    Ok(counts)
 }
 
 /// The effective merge mode for a collection, in precedence order: an explicit
@@ -1546,7 +1249,7 @@ pub fn compute_desired_state(
         }
 
         let explicit = cfg.as_ref().and_then(|c| c.dest_path.as_deref());
-        let dest_root = match resolve_dest_root(explicit, opts.default_dest.as_deref(), &hierarchy)
+        let dest_root = match resolve_dest_root(explicit, opts.default_dest.as_deref(), &hierarchy)?
         {
             Some(root) => root,
             None => continue,
@@ -1574,15 +1277,13 @@ pub fn compute_desired_state(
             _ => matches,
         };
         let format = effective_format(conn, opts, cfg.as_ref(), &hierarchy)?;
-        let root = dest_root.trim_end_matches('/').to_string();
-
         // CHDs are placed loose as `<game>/<name>.chd`, whatever the format.
         let (disk_matches, rom_matches): (Vec<MatchedRom>, Vec<MatchedRom>) =
             matches.into_iter().partition(|m| m.is_disk);
         for m in &disk_matches {
             state
                 .dest_paths
-                .insert(format!("{}/{}/{}.chd", root, m.game_name, m.rom_name));
+                .insert(build_disk_dest_path(&dest_root, &m.game_name, &m.rom_name)?);
         }
 
         match archive_format_tag(format) {
@@ -1595,7 +1296,7 @@ pub fn compute_desired_state(
                     by_game.entry(m.game_name.as_str()).or_default().push(m);
                 }
                 for (game_name, gmatches) in by_game {
-                    let dest = format!("{}/{}.{}", root, game_name, ext);
+                    let dest = build_archive_dest_path(&dest_root, game_name, ext)?;
                     let mut seen = HashSet::new();
                     for m in gmatches {
                         if seen.insert((m.rom_name.as_str(), m.sha1.as_str()))
@@ -1628,11 +1329,11 @@ pub fn compute_desired_state(
                         .unwrap_or(1)
                         > 1;
                     state.dest_paths.insert(build_dest_path(
-                        &root,
+                        &dest_root,
                         &m.game_name,
                         &m.rom_name,
                         multi,
-                    ));
+                    )?);
                 }
             }
         }
@@ -1867,12 +1568,12 @@ mod tests {
     fn test_build_dest_path_single_rom_is_flat() {
         // A single-ROM game is placed flat, with no redundant game folder.
         assert_eq!(
-            build_dest_path("/roms/nes", "Super Mario Bros", "mario.nes", false),
+            build_dest_path("/roms/nes", "Super Mario Bros", "mario.nes", false).unwrap(),
             "/roms/nes/mario.nes"
         );
         // A trailing slash on the root is normalised away.
         assert_eq!(
-            build_dest_path("/roms/nes/", "Game", "game.rom", false),
+            build_dest_path("/roms/nes/", "Game", "game.rom", false).unwrap(),
             "/roms/nes/game.rom"
         );
     }
@@ -1880,12 +1581,35 @@ mod tests {
     #[test]
     fn test_build_dest_path_multi_rom_gets_game_folder() {
         assert_eq!(
-            build_dest_path("/roms/nes", "Multi Disk Game", "disk1.img", true),
+            build_dest_path("/roms/nes", "Multi Disk Game", "disk1.img", true).unwrap(),
             "/roms/nes/Multi Disk Game/disk1.img"
         );
         assert_eq!(
-            build_dest_path("/roms/nes", "Multi Disk Game", "disk2.img", true),
+            build_dest_path("/roms/nes", "Multi Disk Game", "disk2.img", true).unwrap(),
             "/roms/nes/Multi Disk Game/disk2.img"
+        );
+    }
+
+    #[test]
+    fn destination_building_rejects_unsafe_dat_names() {
+        for unsafe_name in [
+            "../escape.rom",
+            "dir/../../escape.rom",
+            "/tmp/escape.rom",
+            r"dir\escape.rom",
+        ] {
+            assert!(
+                build_dest_path("/roms/nes", "Game", unsafe_name, false).is_err(),
+                "unsafe ROM name should be rejected: {unsafe_name}"
+            );
+            assert!(
+                build_dest_path("/roms/nes", unsafe_name, "disk1.img", true).is_err(),
+                "unsafe game name should be rejected: {unsafe_name}"
+            );
+        }
+        assert!(
+            resolve_dest_root(None, Some("/roms"), "../Collection").is_err(),
+            "unsafe hierarchy should be rejected"
         );
     }
 
@@ -2064,7 +1788,7 @@ mod tests {
         // An explicit per-collection dest_path wins and is used verbatim,
         // ignoring both the default and the hierarchy.
         assert_eq!(
-            resolve_dest_root(Some("/explicit/here"), Some("/lib"), "Acorn/BBC"),
+            resolve_dest_root(Some("/explicit/here"), Some("/lib"), "Acorn/BBC").unwrap(),
             Some("/explicit/here".to_string())
         );
     }
@@ -2173,12 +1897,12 @@ mod tests {
     #[test]
     fn resolve_dest_root_falls_back_to_default_plus_hierarchy() {
         assert_eq!(
-            resolve_dest_root(None, Some("/Volumes/Data"), "TOSEC-PIX/Acorn/BBC"),
+            resolve_dest_root(None, Some("/Volumes/Data"), "TOSEC-PIX/Acorn/BBC").unwrap(),
             Some("/Volumes/Data/TOSEC-PIX/Acorn/BBC".to_string())
         );
         // A trailing slash on the default base is normalised away.
         assert_eq!(
-            resolve_dest_root(None, Some("/Volumes/Data/"), "TOSEC/Sinclair"),
+            resolve_dest_root(None, Some("/Volumes/Data/"), "TOSEC/Sinclair").unwrap(),
             Some("/Volumes/Data/TOSEC/Sinclair".to_string())
         );
     }
@@ -2186,7 +1910,7 @@ mod tests {
     #[test]
     fn resolve_dest_root_is_none_without_explicit_or_default() {
         // Neither an explicit path nor a default: no destination, caller skips.
-        assert_eq!(resolve_dest_root(None, None, "Acorn/BBC"), None);
+        assert_eq!(resolve_dest_root(None, None, "Acorn/BBC").unwrap(), None);
     }
 
     #[test]
@@ -3375,7 +3099,6 @@ mod tests {
     #[test]
     fn is_relocatable_archive_requires_matching_archive_format() {
         let archived = |path: &str| MatchedRom {
-            collection: "C".into(),
             game_name: "G".into(),
             rom_name: "r".into(),
             sha1: "AAA".into(),
@@ -3458,7 +3181,6 @@ mod tests {
 
     fn make_test_rom(game_name: &str) -> MatchedRom {
         MatchedRom {
-            collection: "Test".to_string(),
             game_name: game_name.to_string(),
             rom_name: format!("{}.rom", game_name),
             sha1: "abc123".to_string(),
