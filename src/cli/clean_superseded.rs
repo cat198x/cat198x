@@ -32,8 +32,8 @@ use std::path::PathBuf;
 use crate::config::Config;
 use crate::db::files::{self, Source};
 use crate::plan::PlanOptions;
+use crate::plan::compute_desired_state;
 use crate::plan::executor::delete_has_surviving_copy;
-use crate::plan::generator::compute_desired_state;
 use crate::util::format_bytes;
 
 use super::{get_data_dir, open_database};

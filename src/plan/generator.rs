@@ -5,6 +5,8 @@ use rusqlite::Connection;
 use sha2::{Digest as Sha2Digest, Sha256};
 use std::collections::{BTreeMap, HashMap, HashSet};
 
+#[cfg(test)]
+use super::desired_state::compute_desired_state;
 use super::destinations::{
     build_archive_dest_path, build_dest_path, build_disk_dest_path, resolve_dest_root,
     validate_relative_path,
@@ -15,21 +17,16 @@ use super::matching::{
     MatchedRom, compute_shared_containers, compute_shared_content, count_match_rows_capped,
     find_matched_roms,
 };
+use super::rules::{
+    MAX_MATCH_ROWS, apply_one_g_one_r_filter, archive_extension, archive_format_tag,
+    effective_format, effective_merge_mode, glob_match,
+};
+#[cfg(test)]
+use super::rules::{resolve_merge_mode, resolve_output_format};
 use super::{CollectionPlanStat, ContainerRebuild, Plan, RebuildEntry, SourceRef};
 use crate::config::{MergeMode, OutputFormat};
 use crate::db::files::Disposition;
 use crate::db::{collections, config as db_config, dats, files};
-use crate::filter::{RomCandidate, parse_game_name, select_preferred};
-
-/// Above this many match-rows, a collection is skipped rather than planned.
-/// `find_matched_roms` materialises every (ROM × held-location) pair, at
-/// roughly half a kilobyte each, so tens of millions of rows would need many
-/// gigabytes and risk OOM. The only collections that reach this are MAME-style
-/// meta-aggregates (e.g. `all_non-zipped_content`) whose "games" list content
-/// held across hundreds of files — not real romsets to place. The largest
-/// legitimate set seen, FinalBurn Neo - Arcade Games, expands to ~7.9M rows,
-/// comfortably under the cap.
-const MAX_MATCH_ROWS: i64 = 20_000_000;
 
 /// Options controlling plan generation.
 #[derive(Debug, Clone, Default)]
@@ -858,48 +855,6 @@ pub fn generate_plan_filtered(conn: &Connection, opts: &PlanOptions) -> Result<P
     Ok(plan)
 }
 
-/// The effective output format: an explicit per-collection setting wins,
-/// otherwise the library-wide default. An unrecognised string falls back to the
-/// default rather than failing the whole plan.
-fn resolve_output_format(explicit: Option<&str>, default: OutputFormat) -> OutputFormat {
-    match explicit.map(str::to_ascii_lowercase).as_deref() {
-        Some("loose") => OutputFormat::Loose,
-        Some("zip") => OutputFormat::Zip,
-        Some("torrentzip") => OutputFormat::TorrentZip,
-        Some("7z") => OutputFormat::SevenZip,
-        _ => default,
-    }
-}
-
-/// The effective merge mode for a collection: an explicit setting (per-collection
-/// or per-set) wins, otherwise the library-wide default. An unrecognised string
-/// falls back to the default rather than failing the whole plan. The kebab-case
-/// strings match the `MergeMode` serde representation in `config::types`.
-fn resolve_merge_mode(explicit: Option<&str>, default: MergeMode) -> MergeMode {
-    match explicit.map(str::to_ascii_lowercase).as_deref() {
-        Some("non-merged") => MergeMode::NonMerged,
-        Some("merged") => MergeMode::Merged,
-        Some("split") => MergeMode::Split,
-        _ => default,
-    }
-}
-
-/// The repack format tag for an archive format, or `None` for loose (which is
-/// copied, not repacked).
-fn archive_format_tag(format: OutputFormat) -> Option<&'static str> {
-    match format {
-        OutputFormat::Loose => None,
-        OutputFormat::Zip => Some("zip"),
-        OutputFormat::TorrentZip => Some("torrentzip"),
-        OutputFormat::SevenZip => Some("7z"),
-    }
-}
-
-/// The archive file extension for a repack format tag.
-fn archive_extension(tag: &str) -> &'static str {
-    if tag == "7z" { "7z" } else { "zip" }
-}
-
 /// Whether a complete source container can be relocated whole to its
 /// destination rather than repacked. A relocate is a rename, so it only
 /// preserves the set's format when the source is *already* an archive in that
@@ -1127,221 +1082,6 @@ fn plan_disk_matches(
     Ok(counts)
 }
 
-/// The effective merge mode for a collection, in precedence order: an explicit
-/// per-collection setting, then a per-set rule (a config row keyed on the set —
-/// the top segment of the library path), then the library-wide default. Shared
-/// by the planner and [`compute_desired_state`] so the two never disagree on
-/// which ROMs a game places — a disagreement would let the cleanup mis-identify a
-/// canonical archive.
-fn effective_merge_mode(
-    conn: &Connection,
-    opts: &PlanOptions,
-    cfg: Option<&db_config::CollectionConfig>,
-    hierarchy: &str,
-) -> Result<MergeMode> {
-    let explicit_merge = cfg.and_then(|c| c.merge_mode.clone());
-    let set_merge = match explicit_merge {
-        Some(_) => None,
-        None => {
-            let set = hierarchy.split('/').next().unwrap_or(hierarchy);
-            if set != hierarchy {
-                db_config::get_collection_config(conn, set)?.and_then(|c| c.merge_mode)
-            } else {
-                None
-            }
-        }
-    };
-    Ok(resolve_merge_mode(
-        explicit_merge.as_deref().or(set_merge.as_deref()),
-        opts.default_merge_mode,
-    ))
-}
-
-/// The effective output format for a collection, in the same precedence order as
-/// [`effective_merge_mode`]: explicit per-collection, then per-set rule, then the
-/// library-wide default. Shared by the planner and [`compute_desired_state`].
-fn effective_format(
-    conn: &Connection,
-    opts: &PlanOptions,
-    cfg: Option<&db_config::CollectionConfig>,
-    hierarchy: &str,
-) -> Result<OutputFormat> {
-    let explicit_format = cfg.and_then(|c| c.output_format.clone());
-    let set_format = match explicit_format {
-        Some(_) => None,
-        None => {
-            let set = hierarchy.split('/').next().unwrap_or(hierarchy);
-            if set != hierarchy {
-                db_config::get_collection_config(conn, set)?.and_then(|c| c.output_format)
-            } else {
-                None
-            }
-        }
-    };
-    Ok(resolve_output_format(
-        explicit_format.as_deref().or(set_format.as_deref()),
-        opts.default_format,
-    ))
-}
-
-/// The library's desired state, derived from the active DATs exactly as the
-/// planner derives placement.
-///
-/// Used by `clean-superseded` to decide which loose files under the library are
-/// safe to remove: a loose file may go only when its content is preserved in the
-/// canonical archive the active DAT assigns it to, and the file is not itself a
-/// desired placement of any collection. This captures both facts without running
-/// (and saving) a whole plan.
-pub struct DesiredState {
-    /// Content SHA1 → the canonical archive destination paths the active DATs
-    /// assign that content to (absolute). Populated only for the SHA1s the caller
-    /// passes in `interesting_sha1s`, so the index stays small on a large library.
-    pub archive_homes: HashMap<String, HashSet<String>>,
-    /// Every canonical destination path the active DATs designate — archive,
-    /// loose, or disk (absolute). A file sitting at one of these is itself a
-    /// desired-state member and must never be removed.
-    pub dest_paths: HashSet<String>,
-}
-
-/// Compute the desired state across every active collection in scope.
-///
-/// Mirrors [`generate_plan_filtered`]'s per-collection resolution (active
-/// version, library path, destination root, merge mode, 1G1R filter, output
-/// format, matched ROMs) but records *placements* rather than operations:
-///
-/// - for an archive-format collection, each game's canonical archive
-///   `<dest_root>/<game>.<ext>` and — for the content the caller cares about —
-///   the archive it belongs in;
-/// - for a loose-format collection, each ROM's canonical loose path;
-/// - for any `<disk>`, the loose `<dest_root>/<game>/<name>.chd` path.
-///
-/// Oversized meta-aggregate collections are skipped exactly as the planner skips
-/// them — they place nothing real.
-pub fn compute_desired_state(
-    conn: &Connection,
-    opts: &PlanOptions,
-    interesting_sha1s: &HashSet<String>,
-) -> Result<DesiredState> {
-    let mut state = DesiredState {
-        archive_homes: HashMap::new(),
-        dest_paths: HashSet::new(),
-    };
-
-    for collection in collections::list_collections(conn)? {
-        if let Some(pattern) = opts.dat_filter.as_deref()
-            && !glob_match(pattern, &collection.name)
-        {
-            continue;
-        }
-        let version = match collections::get_active_version(conn, collection.id)? {
-            Some(v) => v,
-            None => continue,
-        };
-        let cfg = db_config::get_collection_config(conn, &collection.name)?;
-        let hierarchy =
-            dats::primary_node_path(conn, version.id)?.unwrap_or_else(|| collection.name.clone());
-
-        if let Some(sets) = opts.set_filter.as_ref() {
-            let set = hierarchy.split('/').next().unwrap_or(hierarchy.as_str());
-            if !sets.iter().any(|s| s == set) {
-                continue;
-            }
-        }
-
-        let explicit = cfg.as_ref().and_then(|c| c.dest_path.as_deref());
-        let dest_root = match resolve_dest_root(explicit, opts.default_dest.as_deref(), &hierarchy)?
-        {
-            Some(root) => root,
-            None => continue,
-        };
-
-        // A meta-aggregate places nothing real, so it contributes no desired
-        // state — skip it on the same cap the planner uses.
-        if count_match_rows_capped(conn, version.id, MAX_MATCH_ROWS)? > MAX_MATCH_ROWS {
-            continue;
-        }
-
-        let merge_mode = effective_merge_mode(conn, opts, cfg.as_ref(), &hierarchy)?;
-        let matches = find_matched_roms(
-            conn,
-            version.id,
-            &collection.name,
-            merge_mode == MergeMode::Split,
-        )?;
-        // Mirror the planner's 1G1R filter, so a variant it would not place is
-        // not recorded as a desired placement here either.
-        let matches = match cfg.as_ref().and_then(|c| c.extra_config.as_ref()) {
-            Some(extra) if extra.one_g_one_r => {
-                apply_one_g_one_r_filter(&matches, &extra.to_filter_preferences())
-            }
-            _ => matches,
-        };
-        let format = effective_format(conn, opts, cfg.as_ref(), &hierarchy)?;
-        // CHDs are placed loose as `<game>/<name>.chd`, whatever the format.
-        let (disk_matches, rom_matches): (Vec<MatchedRom>, Vec<MatchedRom>) =
-            matches.into_iter().partition(|m| m.is_disk);
-        for m in &disk_matches {
-            state
-                .dest_paths
-                .insert(build_disk_dest_path(&dest_root, &m.game_name, &m.rom_name)?);
-        }
-
-        match archive_format_tag(format) {
-            Some(tag) => {
-                // One canonical archive per game; record it and, for the content
-                // the caller cares about, which archive it belongs in.
-                let ext = archive_extension(tag);
-                let mut by_game: BTreeMap<&str, Vec<&MatchedRom>> = BTreeMap::new();
-                for m in &rom_matches {
-                    by_game.entry(m.game_name.as_str()).or_default().push(m);
-                }
-                for (game_name, gmatches) in by_game {
-                    let dest = build_archive_dest_path(&dest_root, game_name, ext)?;
-                    let mut seen = HashSet::new();
-                    for m in gmatches {
-                        if seen.insert((m.rom_name.as_str(), m.sha1.as_str()))
-                            && interesting_sha1s.contains(&m.sha1)
-                        {
-                            state
-                                .archive_homes
-                                .entry(m.sha1.clone())
-                                .or_default()
-                                .insert(dest.clone());
-                        }
-                    }
-                    state.dest_paths.insert(dest);
-                }
-            }
-            None => {
-                // Loose layout: a single-ROM game is placed flat, a multi-ROM game
-                // in its own folder — so count distinct ROMs per game first.
-                let mut roms_per_game: HashMap<&str, HashSet<&str>> = HashMap::new();
-                for m in &rom_matches {
-                    roms_per_game
-                        .entry(m.game_name.as_str())
-                        .or_default()
-                        .insert(m.rom_name.as_str());
-                }
-                for m in &rom_matches {
-                    let multi = roms_per_game
-                        .get(m.game_name.as_str())
-                        .map(|s| s.len())
-                        .unwrap_or(1)
-                        > 1;
-                    state.dest_paths.insert(build_dest_path(
-                        &dest_root,
-                        &m.game_name,
-                        &m.rom_name,
-                        multi,
-                    )?);
-                }
-            }
-        }
-    }
-
-    Ok(state)
-}
-
 /// Compute state hash for plan validation
 pub fn compute_state_hash(conn: &Connection) -> Result<String> {
     let mut hasher = Sha256::new();
@@ -1383,52 +1123,6 @@ pub fn compute_state_hash(conn: &Connection) -> Result<String> {
     Ok(crate::util::hex_lower(result))
 }
 
-/// Simple glob pattern matching (case-insensitive)
-///
-/// Supports:
-/// - `*` matches any sequence of characters (including empty)
-/// - `?` matches exactly one character
-fn glob_match(pattern: &str, text: &str) -> bool {
-    glob_match_impl(
-        pattern.to_lowercase().as_bytes(),
-        text.to_lowercase().as_bytes(),
-    )
-}
-
-fn glob_match_impl(pattern: &[u8], text: &[u8]) -> bool {
-    let mut p = 0;
-    let mut t = 0;
-    let mut star_p = None;
-    let mut star_t = 0;
-
-    while t < text.len() {
-        if p < pattern.len() && (pattern[p] == b'?' || pattern[p] == text[t]) {
-            // Match single character or ?
-            p += 1;
-            t += 1;
-        } else if p < pattern.len() && pattern[p] == b'*' {
-            // Match * - remember position for backtracking
-            star_p = Some(p);
-            star_t = t;
-            p += 1;
-        } else if let Some(sp) = star_p {
-            // Backtrack: * matches one more character
-            p = sp + 1;
-            star_t += 1;
-            t = star_t;
-        } else {
-            return false;
-        }
-    }
-
-    // Check remaining pattern is all *
-    while p < pattern.len() && pattern[p] == b'*' {
-        p += 1;
-    }
-
-    p == pattern.len()
-}
-
 /// Count missing ROMs (ROMs in DAT but not in file catalog)
 pub fn count_missing_roms(conn: &Connection, version_id: i64) -> Result<i64> {
     let count: i64 = conn.query_row(
@@ -1447,52 +1141,6 @@ pub fn count_missing_roms(conn: &Connection, version_id: i64) -> Result<i64> {
         |row| row.get(0),
     )?;
     Ok(count)
-}
-
-/// Apply 1G1R filtering to a list of matched ROMs
-///
-/// Groups ROMs by their base title (extracted from game_name) and selects
-/// the preferred variant based on region priority and dump quality.
-fn apply_one_g_one_r_filter(
-    matches: &[MatchedRom],
-    prefs: &crate::filter::FilterPreferences,
-) -> Vec<MatchedRom> {
-    // Group matches by parsed title
-    let mut groups: HashMap<String, Vec<&MatchedRom>> = HashMap::new();
-
-    for m in matches {
-        let parsed = parse_game_name(&m.game_name);
-        groups.entry(parsed.title).or_default().push(m);
-    }
-
-    // Select best from each group
-    let mut result = Vec::new();
-
-    for (_title, group) in groups {
-        if group.len() == 1 {
-            // Only one variant, keep it (if not excluded)
-            let m = group[0];
-            let parsed = parse_game_name(&m.game_name);
-            if !prefs.should_exclude(&parsed) {
-                result.push(m.clone());
-            }
-        } else {
-            // Multiple variants - select the preferred one
-            let candidates: Vec<_> = group
-                .iter()
-                .map(|m| RomCandidate::new(&m.game_name))
-                .collect();
-
-            if let Some(preferred_name) = select_preferred(&candidates, prefs) {
-                // Find and clone the matching ROM
-                if let Some(m) = group.iter().find(|m| m.game_name == preferred_name) {
-                    result.push((*m).clone());
-                }
-            }
-        }
-    }
-
-    result
 }
 
 #[cfg(test)]
