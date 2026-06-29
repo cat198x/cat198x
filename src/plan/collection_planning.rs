@@ -2,7 +2,9 @@ use anyhow::Result;
 use rusqlite::Connection;
 use std::collections::{HashMap, HashSet};
 
-use super::archive_planning::{ContainerDrains, plan_archive_matches};
+use super::archive_planning::{
+    ArchivePlanInputs, ArchivePlanSinks, ContainerDrains, plan_archive_matches,
+};
 use super::destinations::resolve_dest_root;
 use super::matching::{MatchedRom, count_match_rows_capped, find_matched_roms};
 use super::options::PlanOptions;
@@ -164,15 +166,19 @@ pub(crate) fn plan_collection(
             let ext = archive_extension(tag);
             let c = plan_archive_matches(
                 matches,
-                tag,
-                ext,
-                &dest_root,
-                ctx.default_dest,
-                ctx.shared,
-                ctx.shared_containers,
-                ctx.dispositions,
-                plan,
-                container_drains.pending_mut(),
+                ArchivePlanInputs {
+                    tag,
+                    ext,
+                    dest_root: &dest_root,
+                    default_dest: ctx.default_dest,
+                    shared: ctx.shared,
+                    shared_containers: ctx.shared_containers,
+                    dispositions: ctx.dispositions,
+                },
+                ArchivePlanSinks {
+                    plan,
+                    drain_after_repack: container_drains.pending_mut(),
+                },
             )?;
             already_correct += c.already_correct;
             relocated += c.relocated;

@@ -52,6 +52,21 @@ pub(crate) fn is_relocatable_archive(entries: &[MatchedRom], src: &str, ext: &st
             .is_some_and(|e| e.eq_ignore_ascii_case(ext))
 }
 
+pub(crate) struct ArchivePlanInputs<'a> {
+    pub(crate) tag: &'a str,
+    pub(crate) ext: &'a str,
+    pub(crate) dest_root: &'a str,
+    pub(crate) default_dest: Option<&'a str>,
+    pub(crate) shared: &'a HashSet<String>,
+    pub(crate) shared_containers: &'a HashSet<String>,
+    pub(crate) dispositions: &'a HashMap<String, Disposition>,
+}
+
+pub(crate) struct ArchivePlanSinks<'a> {
+    pub(crate) plan: &'a mut Plan,
+    pub(crate) drain_after_repack: &'a mut BTreeMap<String, ContainerDrain>,
+}
+
 fn container_archive_format(path: &str) -> String {
     if path.to_ascii_lowercase().ends_with(".7z") {
         "7z".to_string()
@@ -74,15 +89,8 @@ fn source_ref_for(m: &MatchedRom) -> Result<SourceRef> {
 /// `<dest_root>/<game>.<ext>`.
 pub(crate) fn plan_archive_matches(
     matches: Vec<MatchedRom>,
-    tag: &str,
-    ext: &str,
-    dest_root: &str,
-    default_dest: Option<&str>,
-    shared: &HashSet<String>,
-    shared_containers: &HashSet<String>,
-    dispositions: &HashMap<String, Disposition>,
-    plan: &mut Plan,
-    drain_after_repack: &mut BTreeMap<String, ContainerDrain>,
+    inputs: ArchivePlanInputs<'_>,
+    sinks: ArchivePlanSinks<'_>,
 ) -> Result<PlacementPlanCounts> {
     let mut counts = PlacementPlanCounts::default();
 
@@ -92,7 +100,7 @@ pub(crate) fn plan_archive_matches(
     }
 
     for (game_name, gmatches) in games {
-        let dest = build_archive_dest_path(dest_root, &game_name, ext)?;
+        let dest = build_archive_dest_path(inputs.dest_root, &game_name, inputs.ext)?;
 
         let mut expected: Vec<(String, String)> = Vec::new();
         let mut seen = HashSet::new();
@@ -129,7 +137,9 @@ pub(crate) fn plan_archive_matches(
                 .is_some_and(|set| expected_keys.iter().all(|k| set.contains(k)))
         };
 
-        let game_shared = expected.iter().any(|(_, sha1)| shared.contains(sha1));
+        let game_shared = expected
+            .iter()
+            .any(|(_, sha1)| inputs.shared.contains(sha1));
         let complete_at_dest = is_complete(&dest);
         let build_from = if complete_at_dest {
             Some(dest.clone())
@@ -152,18 +162,18 @@ pub(crate) fn plan_archive_matches(
             _ => None,
         };
 
-        if complete_at_dest && tag != "torrentzip" {
+        if complete_at_dest && inputs.tag != "torrentzip" {
             counts.already_correct += expected.len();
         } else if let Some(ref src) = staged_complete
-            && may_move(dispositions, &containers[src][0].source_root, &dest)
+            && may_move(inputs.dispositions, &containers[src][0].source_root, &dest)
             && !game_shared
-            && !shared_containers.contains(src)
-            && tag != "torrentzip"
-            && is_relocatable_archive(&containers[src], src, ext)
+            && !inputs.shared_containers.contains(src)
+            && inputs.tag != "torrentzip"
+            && is_relocatable_archive(&containers[src], src, inputs.ext)
         {
             let size: u64 = containers[src].iter().map(|m| m.size as u64).sum();
             counts.bytes += size;
-            plan.add_relocate(src.clone(), dest.clone(), size);
+            sinks.plan.add_relocate(src.clone(), dest.clone(), size);
             counts.relocated += 1;
         } else {
             let sources: Vec<SourceRef> = match &build_from {
@@ -196,12 +206,14 @@ pub(crate) fn plan_archive_matches(
                     .map(|m| m.source_root.as_str())
                     .collect(),
             };
-            let consume_feeders =
-                !feeders.is_empty() && feeders.iter().all(|r| may_delete(dispositions, r, &dest));
-            plan.add_repack(
+            let consume_feeders = !feeders.is_empty()
+                && feeders
+                    .iter()
+                    .all(|r| may_delete(inputs.dispositions, r, &dest));
+            sinks.plan.add_repack(
                 sources,
                 dest.clone(),
-                tag.to_string(),
+                inputs.tag.to_string(),
                 size,
                 consume_feeders && !game_shared,
             );
@@ -214,10 +226,11 @@ pub(crate) fn plan_archive_matches(
                         .and_then(|e| e.first())
                         .is_some_and(|m| {
                             m.archive_path.is_some()
-                                && may_delete(dispositions, &m.source_root, &dest)
+                                && may_delete(inputs.dispositions, &m.source_root, &dest)
                         })
             }) {
-                let drain = drain_after_repack
+                let drain = sinks
+                    .drain_after_repack
                     .entry(container.clone())
                     .or_insert_with(|| ContainerDrain {
                         format: container_archive_format(container),
@@ -243,15 +256,15 @@ pub(crate) fn plan_archive_matches(
             for (path, entries) in &containers {
                 if *path == dest
                     || build_from.as_deref() == Some(path.as_str())
-                    || shared_containers.contains(path)
-                    || is_in_library(path, default_dest, dest_root)
+                    || inputs.shared_containers.contains(path)
+                    || is_in_library(path, inputs.default_dest, inputs.dest_root)
                 {
                     continue;
                 }
-                if !may_delete(dispositions, &entries[0].source_root, &dest) {
+                if !may_delete(inputs.dispositions, &entries[0].source_root, &dest) {
                     continue;
                 }
-                plan.add_delete(path.clone(), dedup_reason(&dest));
+                sinks.plan.add_delete(path.clone(), dedup_reason(&dest));
                 counts.deduped += 1;
             }
         }
