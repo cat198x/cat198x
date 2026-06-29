@@ -179,9 +179,95 @@ mod tests {
     use super::*;
     use crate::db::Database;
     use crate::plan::OperationKind;
+    use rusqlite::params;
 
     fn setup_db() -> Database {
         Database::open_in_memory().unwrap()
+    }
+
+    fn add_collection_node(
+        conn: &Connection,
+        collection_name: &str,
+        source_type: &str,
+        dat_path: &str,
+        hierarchy: &str,
+    ) -> i64 {
+        let coll = collections::create_collection(conn, collection_name, source_type).unwrap();
+        let version = collections::add_version(conn, coll, "v1", dat_path, true).unwrap();
+        dats::create_node(conn, version, None, collection_name, "dat", hierarchy).unwrap()
+    }
+
+    fn add_game(conn: &Connection, node: i64, game_name: &str) -> i64 {
+        dats::create_game(conn, node, game_name, None, None, false, false, false).unwrap()
+    }
+
+    fn add_rom_to_game(conn: &Connection, game: i64, rom_name: &str, sha1: &str) {
+        dats::create_rom(
+            conn,
+            game,
+            rom_name,
+            10,
+            Some(sha1),
+            None,
+            None,
+            "good",
+            None,
+        )
+        .unwrap();
+    }
+
+    fn add_rom(conn: &Connection, node: i64, game_name: &str, rom_name: &str, sha1: &str) {
+        let game = add_game(conn, node, game_name);
+        add_rom_to_game(conn, game, rom_name, sha1);
+    }
+
+    fn add_file(conn: &Connection, sha1: &str, size: i64) {
+        conn.execute(
+            "INSERT INTO files (sha1, size) VALUES (?1, ?2)",
+            params![sha1, size],
+        )
+        .unwrap();
+    }
+
+    fn add_source(conn: &Connection, id: i64, path: &str, disposition: Option<Disposition>) {
+        match disposition {
+            Some(disposition) => conn.execute(
+                "INSERT INTO sources (id, path, case_sensitive, disposition) VALUES (?1, ?2, 0, ?3)",
+                params![id, path, disposition.as_str()],
+            ),
+            None => conn.execute(
+                "INSERT INTO sources (id, path, case_sensitive) VALUES (?1, ?2, 0)",
+                params![id, path],
+            ),
+        }
+        .unwrap();
+    }
+
+    fn add_location(
+        conn: &Connection,
+        sha1: &str,
+        source_id: i64,
+        path: &str,
+        archive_path: Option<&str>,
+    ) {
+        conn.execute(
+            "INSERT INTO file_locations (sha1, source_id, path, archive_path)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![sha1, source_id, path, archive_path],
+        )
+        .unwrap();
+    }
+
+    fn plan_with_default_dest(conn: &Connection, default_format: OutputFormat) -> Plan {
+        generate_plan_filtered(
+            conn,
+            &PlanOptions {
+                default_dest: Some("/lib/ROMs".to_string()),
+                default_format,
+                ..Default::default()
+            },
+        )
+        .unwrap()
     }
 
     #[test]
@@ -306,50 +392,22 @@ mod tests {
         // destination (already correct), a *second* library path — a sibling
         // placement, as a merged-set clone would have (one DAT game, so not
         // flagged as shared content) — and a stray copy under ToSort.
-        let coll = collections::create_collection(conn, "Merge Coll", "mame").unwrap();
-        let vid = collections::add_version(conn, coll, "v1", "/dats/m.dat", true).unwrap();
-        let node = dats::create_node(conn, vid, None, "Merge Coll", "dat", "SET/Sys").unwrap();
-        let g = dats::create_game(conn, node, "Game", None, None, false, false, false).unwrap();
-        dats::create_rom(
+        let node = add_collection_node(conn, "Merge Coll", "mame", "/dats/m.dat", "SET/Sys");
+        add_rom(conn, node, "Game", "shared.bin", "SSS");
+        add_file(conn, "SSS", 10);
+        add_source(conn, 1, "/lib/ROMs/SET/Sys", Some(Disposition::Preserve));
+        add_source(
             conn,
-            g,
-            "shared.bin",
-            10,
-            Some("SSS"),
-            None,
-            None,
-            "good",
-            None,
-        )
-        .unwrap();
-        conn.execute("INSERT INTO files (sha1, size) VALUES ('SSS', 10)", [])
-            .unwrap();
-        conn.execute(
-            "INSERT INTO sources (id, path, case_sensitive, disposition) VALUES
-                (1, '/lib/ROMs/SET/Sys', 0, 'preserve'),
-                (2, '/lib/ROMs/SET/Sys/clone', 0, 'preserve'),
-                (3, '/lib/ToSort/SET', 0, 'consume')",
-            [],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO file_locations (sha1, source_id, path, archive_path) VALUES
-                ('SSS', 1, 'shared.bin', NULL),
-                ('SSS', 2, 'shared.bin', NULL),
-                ('SSS', 3, 'shared.bin', NULL)",
-            [],
-        )
-        .unwrap();
+            2,
+            "/lib/ROMs/SET/Sys/clone",
+            Some(Disposition::Preserve),
+        );
+        add_source(conn, 3, "/lib/ToSort/SET", Some(Disposition::Consume));
+        add_location(conn, "SSS", 1, "shared.bin", None);
+        add_location(conn, "SSS", 2, "shared.bin", None);
+        add_location(conn, "SSS", 3, "shared.bin", None);
 
-        let plan = generate_plan_filtered(
-            conn,
-            &PlanOptions {
-                default_dest: Some("/lib/ROMs".to_string()),
-                default_format: OutputFormat::Loose,
-                ..Default::default()
-            },
-        )
-        .unwrap();
+        let plan = plan_with_default_dest(conn, OutputFormat::Loose);
 
         // Only the ToSort stray is deleted; both library copies are left in place.
         let deleted: Vec<_> = plan
@@ -372,52 +430,21 @@ mod tests {
     /// elsewhere. `archived` controls whether the file is a loose file or an
     /// inner entry of a `.zip` (and sets the per-set format accordingly).
     fn setup_dup_fixture(conn: &Connection, archived: bool) {
-        let coll = collections::create_collection(conn, "Test Coll", "tosec").unwrap();
-        let vid = collections::add_version(conn, coll, "v1", "/dats/test.dat", true).unwrap();
-        // Node path "SET/Sys" → set is "SET"; library default + path is the root.
-        let node = dats::create_node(conn, vid, None, "Test Coll", "dat", "SET/Sys").unwrap();
-        let game = dats::create_game(conn, node, "Game", None, None, false, false, false).unwrap();
-        dats::create_rom(
-            conn,
-            game,
-            "game.rom",
-            10,
-            Some("AAA"),
-            None,
-            None,
-            "good",
-            None,
-        )
-        .unwrap();
-        conn.execute("INSERT INTO files (sha1, size) VALUES ('AAA', 10)", [])
-            .unwrap();
+        let node = add_collection_node(conn, "Test Coll", "tosec", "/dats/test.dat", "SET/Sys");
+        add_rom(conn, node, "Game", "game.rom", "AAA");
+        add_file(conn, "AAA", 10);
 
         // Library copy (already at the canonical destination) and a ToSort dup.
-        conn.execute(
-            "INSERT INTO sources (id, path, case_sensitive, disposition) VALUES
-                (101, '/lib/ROMs/SET/Sys', 0, 'preserve'),
-                (102, '/lib/ToSort/SET', 0, 'consume')",
-            [],
-        )
-        .unwrap();
+        add_source(conn, 101, "/lib/ROMs/SET/Sys", Some(Disposition::Preserve));
+        add_source(conn, 102, "/lib/ToSort/SET", Some(Disposition::Consume));
         if archived {
             // Each copy is a .zip holding the ROM as an inner entry.
-            conn.execute(
-                "INSERT INTO file_locations (sha1, source_id, path, archive_path) VALUES
-                    ('AAA', 101, 'Game.zip', 'game.rom'),
-                    ('AAA', 102, 'Sys/Game.zip', 'game.rom')",
-                [],
-            )
-            .unwrap();
+            add_location(conn, "AAA", 101, "Game.zip", Some("game.rom"));
+            add_location(conn, "AAA", 102, "Sys/Game.zip", Some("game.rom"));
             db_config::set_output_format(conn, "SET", "zip").unwrap();
         } else {
-            conn.execute(
-                "INSERT INTO file_locations (sha1, source_id, path, archive_path) VALUES
-                    ('AAA', 101, 'game.rom', NULL),
-                    ('AAA', 102, 'Sys/game.rom', NULL)",
-                [],
-            )
-            .unwrap();
+            add_location(conn, "AAA", 101, "game.rom", None);
+            add_location(conn, "AAA", 102, "Sys/game.rom", None);
         }
     }
 
@@ -427,15 +454,7 @@ mod tests {
         let conn = db.conn();
         setup_dup_fixture(conn, false);
 
-        let plan = generate_plan_filtered(
-            conn,
-            &PlanOptions {
-                default_dest: Some("/lib/ROMs".to_string()),
-                default_format: OutputFormat::Loose,
-                ..Default::default()
-            },
-        )
-        .unwrap();
+        let plan = plan_with_default_dest(conn, OutputFormat::Loose);
 
         // The library copy at /lib/ROMs/SET/Sys/game.rom is already correct, so
         // no move; the ToSort copy is an exact-content duplicate and is deleted
@@ -479,15 +498,7 @@ mod tests {
         // is left in place rather than deleted.
         files::set_source_disposition(conn, "/lib/ToSort/SET", Disposition::Preserve).unwrap();
 
-        let plan = generate_plan_filtered(
-            conn,
-            &PlanOptions {
-                default_dest: Some("/lib/ROMs".to_string()),
-                default_format: OutputFormat::Loose,
-                ..Default::default()
-            },
-        )
-        .unwrap();
+        let plan = plan_with_default_dest(conn, OutputFormat::Loose);
         assert_eq!(plan.summary.delete_count, 0, "copy mode deletes nothing");
         assert_eq!(plan.summary.quarantine_count, 0);
     }
@@ -498,15 +509,7 @@ mod tests {
         let conn = db.conn();
         setup_dup_fixture(conn, true);
 
-        let plan = generate_plan_filtered(
-            conn,
-            &PlanOptions {
-                default_dest: Some("/lib/ROMs".to_string()),
-                default_format: OutputFormat::Loose, // overridden to zip per-set
-                ..Default::default()
-            },
-        )
-        .unwrap();
+        let plan = plan_with_default_dest(conn, OutputFormat::Loose);
 
         // The complete archive already sits at /lib/ROMs/SET/Sys/Game.zip, so
         // nothing is built; the ToSort .zip is a duplicate container and deleted.
@@ -953,38 +956,15 @@ mod tests {
         let conn = db.conn();
         // Content CCC belongs to two distinct games in a zip-format set, held once
         // as a loose file in ToSort.
-        let coll = collections::create_collection(conn, "Shared Zip", "tosec").unwrap();
-        let vid = collections::add_version(conn, coll, "v1", "/dats/z.dat", true).unwrap();
-        let node = dats::create_node(conn, vid, None, "Shared Zip", "dat", "SET/Sys").unwrap();
-        let g1 = dats::create_game(conn, node, "GA", None, None, false, false, false).unwrap();
-        dats::create_rom(conn, g1, "r.rom", 10, Some("CCC"), None, None, "good", None).unwrap();
-        let g2 = dats::create_game(conn, node, "GB", None, None, false, false, false).unwrap();
-        dats::create_rom(conn, g2, "r.rom", 10, Some("CCC"), None, None, "good", None).unwrap();
-        conn.execute("INSERT INTO files (sha1, size) VALUES ('CCC', 10)", [])
-            .unwrap();
-        conn.execute(
-            "INSERT INTO sources (id, path, case_sensitive, disposition)
-             VALUES (201, '/lib/ToSort/SET', 0, 'consume')",
-            [],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO file_locations (sha1, source_id, path, archive_path)
-             VALUES ('CCC', 201, 'Sys/shared.rom', NULL)",
-            [],
-        )
-        .unwrap();
+        let node = add_collection_node(conn, "Shared Zip", "tosec", "/dats/z.dat", "SET/Sys");
+        add_rom(conn, node, "GA", "r.rom", "CCC");
+        add_rom(conn, node, "GB", "r.rom", "CCC");
+        add_file(conn, "CCC", 10);
+        add_source(conn, 201, "/lib/ToSort/SET", Some(Disposition::Consume));
+        add_location(conn, "CCC", 201, "Sys/shared.rom", None);
         db_config::set_output_format(conn, "SET", "zip").unwrap();
 
-        let plan = generate_plan_filtered(
-            conn,
-            &PlanOptions {
-                default_dest: Some("/lib/ROMs".to_string()),
-                default_format: OutputFormat::Loose,
-                ..Default::default()
-            },
-        )
-        .unwrap();
+        let plan = plan_with_default_dest(conn, OutputFormat::Loose);
 
         // Each game's archive is built by copying; the shared loose source is
         // neither consumed by a repack nor removed as a duplicate container.
@@ -1009,43 +989,18 @@ mod tests {
         let conn = db.conn();
         // One archive (bundle.zip) holds ROMs for two distinct games — a
         // multi-game container. Each game's ROM is a different entry/SHA1.
-        let coll = collections::create_collection(conn, "Bundle Coll", "tosec").unwrap();
-        let vid = collections::add_version(conn, coll, "v1", "/dats/b.dat", true).unwrap();
-        let node = dats::create_node(conn, vid, None, "Bundle Coll", "dat", "SET/Sys").unwrap();
-        let g1 = dats::create_game(conn, node, "GameOne", None, None, false, false, false).unwrap();
-        dats::create_rom(conn, g1, "a.rom", 10, Some("AAA"), None, None, "good", None).unwrap();
-        let g2 = dats::create_game(conn, node, "GameTwo", None, None, false, false, false).unwrap();
-        dats::create_rom(conn, g2, "b.rom", 10, Some("BBB"), None, None, "good", None).unwrap();
-        conn.execute(
-            "INSERT INTO files (sha1, size) VALUES ('AAA', 10), ('BBB', 10)",
-            [],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO sources (id, path, case_sensitive, disposition)
-             VALUES (210, '/lib/ToSort/SET', 0, 'consume')",
-            [],
-        )
-        .unwrap();
+        let node = add_collection_node(conn, "Bundle Coll", "tosec", "/dats/b.dat", "SET/Sys");
+        add_rom(conn, node, "GameOne", "a.rom", "AAA");
+        add_rom(conn, node, "GameTwo", "b.rom", "BBB");
+        add_file(conn, "AAA", 10);
+        add_file(conn, "BBB", 10);
+        add_source(conn, 210, "/lib/ToSort/SET", Some(Disposition::Consume));
         // Both ROMs live as entries inside the SAME archive file.
-        conn.execute(
-            "INSERT INTO file_locations (sha1, source_id, path, archive_path) VALUES
-                ('AAA', 210, 'bundle.zip', 'a.rom'),
-                ('BBB', 210, 'bundle.zip', 'b.rom')",
-            [],
-        )
-        .unwrap();
+        add_location(conn, "AAA", 210, "bundle.zip", Some("a.rom"));
+        add_location(conn, "BBB", 210, "bundle.zip", Some("b.rom"));
         db_config::set_output_format(conn, "SET", "zip").unwrap();
 
-        let plan = generate_plan_filtered(
-            conn,
-            &PlanOptions {
-                default_dest: Some("/lib/ROMs".to_string()),
-                default_format: OutputFormat::Loose,
-                ..Default::default()
-            },
-        )
-        .unwrap();
+        let plan = plan_with_default_dest(conn, OutputFormat::Loose);
 
         // The shared container is repacked per game (extracting each game's own
         // entry), never relocated whole (which would strand the other game).
@@ -1098,90 +1053,24 @@ mod tests {
         // with GameTwo (a common .cue/.sub). The shared entry makes GameOne
         // `game_shared`, which blocks a whole-file relocate and forces a rebuild.
         // The container is then drained — earlier this was the stranded case.
-        let coll = collections::create_collection(conn, "ISO Coll", "tosec").unwrap();
-        let vid = collections::add_version(conn, coll, "v1", "/dats/i.dat", true).unwrap();
-        let node = dats::create_node(conn, vid, None, "ISO Coll", "dat", "SET/Sys").unwrap();
-        let g1 = dats::create_game(conn, node, "GameOne", None, None, false, false, false).unwrap();
-        dats::create_rom(
-            conn,
-            g1,
-            "own.rom",
-            10,
-            Some("AAA"),
-            None,
-            None,
-            "good",
-            None,
-        )
-        .unwrap();
-        dats::create_rom(
-            conn,
-            g1,
-            "common.rom",
-            10,
-            Some("CCC"),
-            None,
-            None,
-            "good",
-            None,
-        )
-        .unwrap();
-        let g2 = dats::create_game(conn, node, "GameTwo", None, None, false, false, false).unwrap();
-        dats::create_rom(
-            conn,
-            g2,
-            "other.rom",
-            10,
-            Some("BBB"),
-            None,
-            None,
-            "good",
-            None,
-        )
-        .unwrap();
-        dats::create_rom(
-            conn,
-            g2,
-            "common.rom",
-            10,
-            Some("CCC"),
-            None,
-            None,
-            "good",
-            None,
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO files (sha1, size) VALUES ('AAA',10),('BBB',10),('CCC',10)",
-            [],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO sources (id, path, case_sensitive, disposition)
-             VALUES (220, '/lib/ToSort/SET', 0, 'consume')",
-            [],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO file_locations (sha1, source_id, path, archive_path) VALUES
-                ('AAA', 220, 'g1.zip', 'own.rom'),
-                ('CCC', 220, 'g1.zip', 'common.rom'),
-                ('BBB', 220, 'g2.zip', 'other.rom'),
-                ('CCC', 220, 'g2.zip', 'common.rom')",
-            [],
-        )
-        .unwrap();
+        let node = add_collection_node(conn, "ISO Coll", "tosec", "/dats/i.dat", "SET/Sys");
+        let g1 = add_game(conn, node, "GameOne");
+        add_rom_to_game(conn, g1, "own.rom", "AAA");
+        add_rom_to_game(conn, g1, "common.rom", "CCC");
+        let g2 = add_game(conn, node, "GameTwo");
+        add_rom_to_game(conn, g2, "other.rom", "BBB");
+        add_rom_to_game(conn, g2, "common.rom", "CCC");
+        add_file(conn, "AAA", 10);
+        add_file(conn, "BBB", 10);
+        add_file(conn, "CCC", 10);
+        add_source(conn, 220, "/lib/ToSort/SET", Some(Disposition::Consume));
+        add_location(conn, "AAA", 220, "g1.zip", Some("own.rom"));
+        add_location(conn, "CCC", 220, "g1.zip", Some("common.rom"));
+        add_location(conn, "BBB", 220, "g2.zip", Some("other.rom"));
+        add_location(conn, "CCC", 220, "g2.zip", Some("common.rom"));
         db_config::set_output_format(conn, "SET", "zip").unwrap();
 
-        let plan = generate_plan_filtered(
-            conn,
-            &PlanOptions {
-                default_dest: Some("/lib/ROMs".to_string()),
-                default_format: OutputFormat::Loose,
-                ..Default::default()
-            },
-        )
-        .unwrap();
+        let plan = plan_with_default_dest(conn, OutputFormat::Loose);
 
         // GameOne's source container is drained (its content is now in GameOne's
         // archive). The shared CCC entry — which earlier flagged the container as
@@ -1334,47 +1223,14 @@ mod tests {
         let db = setup_db();
         let conn = db.conn();
         // Only a staged ToSort copy exists; the library does not hold this game.
-        let coll = collections::create_collection(conn, "Test Coll", "tosec").unwrap();
-        let vid = collections::add_version(conn, coll, "v1", "/dats/test.dat", true).unwrap();
-        let node = dats::create_node(conn, vid, None, "Test Coll", "dat", "SET/Sys").unwrap();
-        let game = dats::create_game(conn, node, "Game", None, None, false, false, false).unwrap();
-        dats::create_rom(
-            conn,
-            game,
-            "game.rom",
-            10,
-            Some("AAA"),
-            None,
-            None,
-            "good",
-            None,
-        )
-        .unwrap();
-        conn.execute("INSERT INTO files (sha1, size) VALUES ('AAA', 10)", [])
-            .unwrap();
-        conn.execute(
-            "INSERT INTO sources (id, path, case_sensitive, disposition)
-             VALUES (102, '/lib/ToSort/SET', 0, 'consume')",
-            [],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO file_locations (sha1, source_id, path, archive_path)
-             VALUES ('AAA', 102, 'Sys/Game.zip', 'game.rom')",
-            [],
-        )
-        .unwrap();
+        let node = add_collection_node(conn, "Test Coll", "tosec", "/dats/test.dat", "SET/Sys");
+        add_rom(conn, node, "Game", "game.rom", "AAA");
+        add_file(conn, "AAA", 10);
+        add_source(conn, 102, "/lib/ToSort/SET", Some(Disposition::Consume));
+        add_location(conn, "AAA", 102, "Sys/Game.zip", Some("game.rom"));
         db_config::set_output_format(conn, "SET", "zip").unwrap();
 
-        let plan = generate_plan_filtered(
-            conn,
-            &PlanOptions {
-                default_dest: Some("/lib/ROMs".to_string()),
-                default_format: OutputFormat::Loose,
-                ..Default::default()
-            },
-        )
-        .unwrap();
+        let plan = plan_with_default_dest(conn, OutputFormat::Loose);
 
         // A complete staged archive is relocated whole to its canonical path —
         // an instant rename — rather than rebuilt by repacking its entries.
@@ -1406,48 +1262,15 @@ mod tests {
         let db = setup_db();
         let conn = db.conn();
         // A complete game held only as a loose .tap under ToSort, in a zip set.
-        let coll = collections::create_collection(conn, "Test Coll", "tosec").unwrap();
-        let vid = collections::add_version(conn, coll, "v1", "/dats/test.dat", true).unwrap();
-        let node = dats::create_node(conn, vid, None, "Test Coll", "dat", "SET/Sys").unwrap();
-        let game = dats::create_game(conn, node, "Game", None, None, false, false, false).unwrap();
-        dats::create_rom(
-            conn,
-            game,
-            "game.tap",
-            10,
-            Some("AAA"),
-            None,
-            None,
-            "good",
-            None,
-        )
-        .unwrap();
-        conn.execute("INSERT INTO files (sha1, size) VALUES ('AAA', 10)", [])
-            .unwrap();
-        conn.execute(
-            "INSERT INTO sources (id, path, case_sensitive, disposition)
-             VALUES (102, '/lib/ToSort/SET', 0, 'consume')",
-            [],
-        )
-        .unwrap();
+        let node = add_collection_node(conn, "Test Coll", "tosec", "/dats/test.dat", "SET/Sys");
+        add_rom(conn, node, "Game", "game.tap", "AAA");
+        add_file(conn, "AAA", 10);
+        add_source(conn, 102, "/lib/ToSort/SET", Some(Disposition::Consume));
         // Loose file (archive_path NULL): NOT an archive in the target format.
-        conn.execute(
-            "INSERT INTO file_locations (sha1, source_id, path, archive_path)
-             VALUES ('AAA', 102, 'Sys/game.tap', NULL)",
-            [],
-        )
-        .unwrap();
+        add_location(conn, "AAA", 102, "Sys/game.tap", None);
         db_config::set_output_format(conn, "SET", "zip").unwrap();
 
-        let plan = generate_plan_filtered(
-            conn,
-            &PlanOptions {
-                default_dest: Some("/lib/ROMs".to_string()),
-                default_format: OutputFormat::Loose,
-                ..Default::default()
-            },
-        )
-        .unwrap();
+        let plan = plan_with_default_dest(conn, OutputFormat::Loose);
 
         // Renaming a loose .tap to .zip would mint a file whose extension lies
         // about its contents — the loose ROM must be repacked into a real zip.
