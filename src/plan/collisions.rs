@@ -149,3 +149,69 @@ pub(crate) fn check_unique_destinations(
     }
     anyhow::bail!(msg);
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::Database;
+
+    fn setup_db() -> Database {
+        Database::open_in_memory().unwrap()
+    }
+
+    #[test]
+    fn find_destination_collisions_groups_colliders_and_flags_explicit_dest() {
+        let db = setup_db();
+        let conn = db.conn();
+        // Two collections share the flat root "FBN"; neither has an explicit dest.
+        for name in ["Arcade Games", "Game Gear Games"] {
+            let c = collections::create_collection(conn, name, "mame").unwrap();
+            let vid =
+                collections::add_version(conn, c, "v1", &format!("/d/{name}.dat"), true).unwrap();
+            dats::create_node(conn, vid, None, name, "dat", "FBN").unwrap();
+        }
+        let all = collections::list_collections(conn).unwrap();
+        let opts = PlanOptions {
+            default_dest: Some("/lib".to_string()),
+            ..Default::default()
+        };
+        let collisions = find_destination_collisions(conn, &opts, &all).unwrap();
+        assert_eq!(collisions.len(), 1, "one shared root");
+        let c = &collisions[0];
+        assert_eq!(c.root, "/lib/FBN");
+        assert!(!c.disk_only, "ROM-output namespace");
+        assert_eq!(c.collections.len(), 2);
+        assert!(
+            c.collections.iter().all(|m| !m.has_explicit_dest),
+            "neither has an explicit dest"
+        );
+    }
+
+    #[test]
+    fn nesting_colliders_under_their_name_clears_the_collision() {
+        let db = setup_db();
+        let conn = db.conn();
+        for name in ["Arcade Games", "Game Gear Games"] {
+            let c = collections::create_collection(conn, name, "mame").unwrap();
+            let vid =
+                collections::add_version(conn, c, "v1", &format!("/d/{name}.dat"), true).unwrap();
+            dats::create_node(conn, vid, None, name, "dat", "FBN").unwrap();
+        }
+        let all = collections::list_collections(conn).unwrap();
+        let opts = PlanOptions {
+            default_dest: Some("/lib".to_string()),
+            ..Default::default()
+        };
+        let before = find_destination_collisions(conn, &opts, &all).unwrap();
+        assert_eq!(before.len(), 1);
+        // The doctor --fix action: nest each non-explicit collider under its name.
+        for member in &before[0].collections {
+            let new_path = dats::nest_primary_node_under_name(conn, member.version_id)
+                .unwrap()
+                .expect("a primary node");
+            assert!(new_path.starts_with("FBN/"), "nested under FBN: {new_path}");
+        }
+        let after = find_destination_collisions(conn, &opts, &all).unwrap();
+        assert!(after.is_empty(), "each now resolves to a distinct root");
+    }
+}

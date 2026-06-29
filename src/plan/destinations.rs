@@ -93,3 +93,86 @@ fn join_under_root(root: &str, parts: &[(&str, &str)]) -> Result<String> {
     }
     Ok(out.to_string_lossy().into_owned())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn build_dest_path_single_rom_is_flat() {
+        // A single-ROM game is placed flat, with no redundant game folder.
+        assert_eq!(
+            build_dest_path("/roms/nes", "Super Mario Bros", "mario.nes", false).unwrap(),
+            "/roms/nes/mario.nes"
+        );
+        // A trailing slash on the root is normalised away.
+        assert_eq!(
+            build_dest_path("/roms/nes/", "Game", "game.rom", false).unwrap(),
+            "/roms/nes/game.rom"
+        );
+    }
+
+    #[test]
+    fn build_dest_path_multi_rom_gets_game_folder() {
+        assert_eq!(
+            build_dest_path("/roms/nes", "Multi Disk Game", "disk1.img", true).unwrap(),
+            "/roms/nes/Multi Disk Game/disk1.img"
+        );
+        assert_eq!(
+            build_dest_path("/roms/nes", "Multi Disk Game", "disk2.img", true).unwrap(),
+            "/roms/nes/Multi Disk Game/disk2.img"
+        );
+    }
+
+    #[test]
+    fn destination_building_rejects_unsafe_dat_names() {
+        for unsafe_name in [
+            "../escape.rom",
+            "dir/../../escape.rom",
+            "/tmp/escape.rom",
+            r"dir\escape.rom",
+        ] {
+            assert!(
+                build_dest_path("/roms/nes", "Game", unsafe_name, false).is_err(),
+                "unsafe ROM name should be rejected: {unsafe_name}"
+            );
+            assert!(
+                build_dest_path("/roms/nes", unsafe_name, "disk1.img", true).is_err(),
+                "unsafe game name should be rejected: {unsafe_name}"
+            );
+        }
+        assert!(
+            resolve_dest_root(None, Some("/roms"), "../Collection").is_err(),
+            "unsafe hierarchy should be rejected"
+        );
+    }
+
+    #[test]
+    fn resolve_dest_root_prefers_explicit_path() {
+        // An explicit per-collection dest_path wins and is used verbatim,
+        // ignoring both the default and the hierarchy.
+        assert_eq!(
+            resolve_dest_root(Some("/explicit/here"), Some("/lib"), "Acorn/BBC").unwrap(),
+            Some("/explicit/here".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_dest_root_falls_back_to_default_plus_hierarchy() {
+        assert_eq!(
+            resolve_dest_root(None, Some("/Volumes/Data"), "TOSEC-PIX/Acorn/BBC").unwrap(),
+            Some("/Volumes/Data/TOSEC-PIX/Acorn/BBC".to_string())
+        );
+        // A trailing slash on the default base is normalised away.
+        assert_eq!(
+            resolve_dest_root(None, Some("/Volumes/Data/"), "TOSEC/Sinclair").unwrap(),
+            Some("/Volumes/Data/TOSEC/Sinclair".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_dest_root_is_none_without_explicit_or_default() {
+        // Neither an explicit path nor a default: no destination, caller skips.
+        assert_eq!(resolve_dest_root(None, None, "Acorn/BBC").unwrap(), None);
+    }
+}
