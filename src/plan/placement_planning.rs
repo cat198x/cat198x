@@ -12,6 +12,7 @@ use crate::db::files::Disposition;
 pub(crate) struct PlacementPlanCounts {
     pub(crate) already_correct: usize,
     pub(crate) to_write: usize,
+    pub(crate) relocated: usize,
     pub(crate) deduped: usize,
     pub(crate) bytes: u64,
 }

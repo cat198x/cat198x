@@ -1,6 +1,7 @@
 //! Plan generation and management
 
 pub mod apply;
+pub(crate) mod archive_planning;
 pub(crate) mod collisions;
 pub(crate) mod desired_state;
 pub(crate) mod destinations;

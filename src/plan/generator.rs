@@ -1,10 +1,13 @@
 //! Plan generation logic
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use rusqlite::Connection;
 use sha2::{Digest as Sha2Digest, Sha256};
 use std::collections::{BTreeMap, HashMap, HashSet};
 
+#[cfg(test)]
+use super::archive_planning::is_relocatable_archive;
+use super::archive_planning::{ContainerDrain, plan_archive_matches};
 use super::collisions::check_unique_destinations;
 #[cfg(test)]
 use super::collisions::find_destination_collisions;
@@ -12,23 +15,23 @@ use super::collisions::find_destination_collisions;
 use super::desired_state::compute_desired_state;
 #[cfg(test)]
 use super::destinations::build_dest_path;
-use super::destinations::{build_archive_dest_path, resolve_dest_root, validate_relative_path};
+use super::destinations::resolve_dest_root;
 #[cfg(test)]
 use super::matching::count_expansion_capped;
 use super::matching::{
     MatchedRom, compute_shared_containers, compute_shared_content, count_match_rows_capped,
     find_matched_roms,
 };
-use super::placement_planning::{
-    dedup_reason, is_in_library, may_delete, may_move, plan_disk_matches, plan_loose_matches,
-};
+#[cfg(test)]
+use super::placement_planning::is_in_library;
+use super::placement_planning::{plan_disk_matches, plan_loose_matches};
 use super::rules::{
     MAX_MATCH_ROWS, apply_one_g_one_r_filter, archive_extension, archive_format_tag,
     effective_format, effective_merge_mode, glob_match,
 };
 #[cfg(test)]
 use super::rules::{resolve_merge_mode, resolve_output_format};
-use super::{CollectionPlanStat, ContainerRebuild, Plan, RebuildEntry, SourceRef};
+use super::{CollectionPlanStat, ContainerRebuild, Plan, RebuildEntry};
 use crate::config::{MergeMode, OutputFormat};
 use crate::db::files::Disposition;
 use crate::db::{collections, config as db_config, dats, files};
@@ -272,259 +275,24 @@ pub fn generate_plan_filtered(conn: &Connection, opts: &PlanOptions) -> Result<P
                 );
             }
             Some(tag) => {
-                // ARCHIVE: one archive per game at <dest_root>/<game>.<ext>. A
-                // game's ROMs may be held in several physical archives (the
-                // library copy plus staged ToSort copies); one canonical archive
-                // belongs at dest, and duplicate whole-archive copies elsewhere
-                // are quarantined.
                 let ext = archive_extension(tag);
-                let mut games: BTreeMap<String, Vec<MatchedRom>> = BTreeMap::new();
-                for m in matches {
-                    games.entry(m.game_name.clone()).or_default().push(m);
-                }
-
-                for (game_name, gmatches) in games {
-                    let dest = build_archive_dest_path(&dest_root, &game_name, ext)?;
-
-                    // Distinct expected entries (canonical name + SHA1) and the
-                    // source containers that hold them.
-                    let mut expected: Vec<(String, String)> = Vec::new();
-                    let mut seen = HashSet::new();
-                    let mut containers: BTreeMap<String, Vec<MatchedRom>> = BTreeMap::new();
-                    for m in gmatches {
-                        if seen.insert((m.rom_name.clone(), m.sha1.clone())) {
-                            expected.push((m.rom_name.clone(), m.sha1.clone()));
-                        }
-                        let container = format!("{}/{}", m.source_root, m.source_path);
-                        containers.entry(container).or_default().push(m);
-                    }
-                    // Completeness is a set-membership test, not a scan. Merged
-                    // arcade sets share ROMs across thousands of containers (a
-                    // Neo-Geo BIOS ROM can sit in 5,000+ files), so a single
-                    // game's `containers` map is huge; the old per-container
-                    // `expected × entries` scan went quadratic and hung on
-                    // FinalBurn Neo. Build, once per game: a per-container set of
-                    // the (name, sha1) pairs it holds, the size of each ROM by
-                    // name, and an index from each expected entry to the
-                    // containers holding it. SHA1s compare case-insensitively, so
-                    // normalise to lower-case in the keys.
-                    let key =
-                        |name: &str, sha1: &str| (name.to_string(), sha1.to_ascii_lowercase());
-                    let expected_keys: Vec<(String, String)> =
-                        expected.iter().map(|(n, s)| key(n, s)).collect();
-                    let mut container_keys: HashMap<&str, HashSet<(String, String)>> =
-                        HashMap::new();
-                    let mut holders: HashMap<(String, String), Vec<&str>> = HashMap::new();
-                    let mut name_size: HashMap<&str, u64> = HashMap::new();
-                    for (path, entries) in &containers {
-                        let set = container_keys.entry(path.as_str()).or_default();
-                        for m in entries {
-                            name_size
-                                .entry(m.rom_name.as_str())
-                                .or_insert(m.size as u64);
-                            let k = key(&m.rom_name, &m.sha1);
-                            if set.insert(k.clone()) {
-                                holders.entry(k).or_default().push(path.as_str());
-                            }
-                        }
-                    }
-                    // A container is complete iff it holds every expected entry —
-                    // now O(expected) hash lookups, not a nested scan.
-                    let is_complete = |path: &str| {
-                        container_keys
-                            .get(path)
-                            .is_some_and(|set| expected_keys.iter().all(|k| set.contains(k)))
-                    };
-
-                    // If any of this game's content is shared with another entry,
-                    // never consume a source for it — build the archive by copying
-                    // (repack without deleting sources) and don't relocate or delete
-                    // any container, since those bytes may be needed elsewhere.
-                    let game_shared = expected.iter().any(|(_, sha1)| shared.contains(sha1));
-
-                    // The canonical container is the complete one at dest if it
-                    // exists, otherwise a complete one elsewhere we build from. A
-                    // complete container must hold the *rarest* expected entry, so
-                    // only the containers holding it can qualify: in a merged set
-                    // the game's own ROM sits in one or two files while shared ROMs
-                    // sit in thousands, turning a full scan into a few checks.
-                    let complete_at_dest = is_complete(&dest);
-                    let build_from = if complete_at_dest {
-                        Some(dest.clone())
-                    } else {
-                        expected_keys
-                            .iter()
-                            .map(|k| holders.get(k).map(Vec::as_slice).unwrap_or(&[]))
-                            .min_by_key(|paths| paths.len())
-                            .and_then(|candidates| {
-                                candidates
-                                    .iter()
-                                    .copied()
-                                    .find(|&p| is_complete(p))
-                                    .map(str::to_string)
-                            })
-                    };
-
-                    // A complete archive already staged somewhere other than the
-                    // destination — relocate the whole file there rather than
-                    // rebuilding it (the staged ToSort case: an instant rename
-                    // instead of reading and recompressing every entry).
-                    let staged_complete: Option<String> = match &build_from {
-                        Some(p) if *p != dest => Some(p.clone()),
-                        _ => None,
-                    };
-
-                    // A content-correct `torrentzip` still needs its deterministic
-                    // stamp, which the catalogue doesn't record, so it is rebuilt
-                    // rather than read off the network to check — `zip` is correct
-                    // on content alone.
-                    if complete_at_dest && tag != "torrentzip" {
-                        already_correct += expected.len();
-                    } else if let Some(ref src) = staged_complete
-                        && may_move(&dispositions, &containers[src][0].source_root, &dest)
-                        && !game_shared
-                        && !shared_containers.contains(src)
-                        && tag != "torrentzip"
-                        && is_relocatable_archive(&containers[src], src, ext)
-                    {
-                        // Relocate the complete staged archive to its destination —
-                        // a whole-file move, so only when its source allows moving
-                        // out (consume, or a preserve source relocating within its
-                        // own tree).
-                        let size: u64 = containers[src].iter().map(|m| m.size as u64).sum();
-                        bytes += size;
-                        plan.add_relocate(src.clone(), dest.clone(), size);
-                        relocated += 1;
-                    } else {
-                        // Build the canonical archive at dest: from one complete
-                        // container if there is one, else from whatever entries we
-                        // hold (scattered across containers). Used for copy-out, for
-                        // torrentzip, or when no single container is complete.
-                        let sources: Vec<SourceRef> = match &build_from {
-                            Some(p) => containers[p]
-                                .iter()
-                                .map(source_ref_for)
-                                .collect::<Result<Vec<_>>>()
-                                .with_context(|| format!("invalid DAT path in {game_name}"))?,
-                            None => containers
-                                .values()
-                                .flatten()
-                                .map(source_ref_for)
-                                .collect::<Result<Vec<_>>>()
-                                .with_context(|| format!("invalid DAT path in {game_name}"))?,
-                        };
-                        let size: u64 = expected
-                            .iter()
-                            .filter_map(|(name, _)| name_size.get(name.as_str()).copied())
-                            .sum();
-                        bytes += size;
-                        // Delete the loose sources the repack consumes only when
-                        // every feeder allows losing its loose copy given the
-                        // archive at `dest` survives: a consume feeder always, a
-                        // preserve feeder only when `dest` is in its own tree
-                        // (loose→archive consolidation within the tree). The
-                        // content must not be shared (a shared source may feed
-                        // another game's archive too).
-                        let feeders: Vec<&str> = match &build_from {
-                            Some(p) => containers[p]
-                                .iter()
-                                .map(|m| m.source_root.as_str())
-                                .collect(),
-                            None => containers
-                                .values()
-                                .flatten()
-                                .map(|m| m.source_root.as_str())
-                                .collect(),
-                        };
-                        let consume_feeders = !feeders.is_empty()
-                            && feeders.iter().all(|r| may_delete(&dispositions, r, &dest));
-                        plan.add_repack(
-                            sources,
-                            dest.clone(),
-                            tag.to_string(),
-                            size,
-                            consume_feeders && !game_shared,
-                        );
-                        to_write += 1;
-
-                        // We rebuilt from a single source container rather than
-                        // relocating it whole (a shared .cue/.sub forced the
-                        // rebuild). Once this archive is built, the container is a
-                        // redundant copy whose loss its source permits — record it
-                        // to drain after all repacks. The verify-before-delete net
-                        // is the safety check: it removes the container only once
-                        // every entry it held is confirmed surviving (here, at
-                        // `dest`), so a container another game still needs is
-                        // refused rather than lost.
-                        if let Some(container) = build_from.as_ref().filter(|c| {
-                            **c != dest
-                                && containers
-                                    .get(c.as_str())
-                                    .and_then(|e| e.first())
-                                    .is_some_and(|m| {
-                                        // Only a real archive container is drained as
-                                        // a unit; a loose build-from is already
-                                        // handled by `move_sources` above.
-                                        m.archive_path.is_some()
-                                            && may_delete(&dispositions, &m.source_root, &dest)
-                                    })
-                        }) {
-                            // Record where each of this container's entries was
-                            // repacked to. `containers` is per-game, so a container
-                            // feeding several games contributes each game's entries
-                            // across the games' iterations — together they cover
-                            // every entry the container held, the full rebuild spec.
-                            let drain =
-                                drain_after_repack
-                                    .entry(container.clone())
-                                    .or_insert_with(|| ContainerDrain {
-                                        format: container_archive_format(container),
-                                        reason_dest: dest.clone(),
-                                        entries: Vec::new(),
-                                    });
-                            for m in &containers[container] {
-                                if let Some(archive_entry) = &m.archive_path {
-                                    validate_relative_path("archive entry name", archive_entry)?;
-                                    validate_relative_path("ROM entry name", &m.rom_name)?;
-                                    drain.entries.push(RebuildEntry {
-                                        dest: dest.clone(),
-                                        dest_entry: m.rom_name.clone(),
-                                        container_entry: archive_entry.clone(),
-                                        sha1: m.sha1.clone(),
-                                    });
-                                }
-                            }
-                        }
-                    }
-
-                    // Delete duplicate whole-archive copies: any container that is
-                    // neither the destination nor the one we build from holds an
-                    // exact-content copy already preserved at the destination. In
-                    // move mode remove it; in copy mode, or when the content is
-                    // shared with another entry, leave sources untouched. A
-                    // container that also sources other games is never deleted —
-                    // those games still need to repack from it.
-                    if !game_shared {
-                        for (path, entries) in &containers {
-                            if *path == dest
-                                || build_from.as_deref() == Some(path.as_str())
-                                || shared_containers.contains(path)
-                                || is_in_library(path, default_dest, &dest_root)
-                            {
-                                continue;
-                            }
-                            // Delete a duplicate container when its source allows
-                            // losing it given the canonical at `dest` survives: a
-                            // consume source always, a preserve source only when
-                            // `dest` is within its own tree.
-                            if !may_delete(&dispositions, &entries[0].source_root, &dest) {
-                                continue;
-                            }
-                            plan.add_delete(path.clone(), dedup_reason(&dest));
-                            deduped += 1;
-                        }
-                    }
-                }
+                let c = plan_archive_matches(
+                    matches,
+                    tag,
+                    ext,
+                    &dest_root,
+                    default_dest,
+                    &shared,
+                    &shared_containers,
+                    &dispositions,
+                    &mut plan,
+                    &mut drain_after_repack,
+                )?;
+                already_correct += c.already_correct;
+                relocated += c.relocated;
+                to_write += c.to_write;
+                bytes += c.bytes;
+                deduped += c.deduped;
                 println!(
                     "  {} ROMs already archived, {} to relocate, {} archive(s) to build, {} duplicate(s) to delete",
                     already_correct, relocated, to_write, deduped
@@ -621,57 +389,6 @@ pub fn generate_plan_filtered(conn: &Connection, opts: &PlanOptions) -> Result<P
 
     plan.skipped_no_dest = skipped_no_dest;
     Ok(plan)
-}
-
-/// Whether a complete source container can be relocated whole to its
-/// destination rather than repacked. A relocate is a rename, so it only
-/// preserves the set's format when the source is *already* an archive in that
-/// exact format: every entry must live inside an archive (not be a loose ROM),
-/// and the source file's extension must match the target's. Renaming a loose
-/// `.tap`/`.cue`/`.z80`, or a `.7z` into a zip set, would mint a file whose
-/// extension lies about its contents — those must be repacked instead.
-fn is_relocatable_archive(entries: &[MatchedRom], src: &str, ext: &str) -> bool {
-    !entries.is_empty()
-        && entries.iter().all(|m| m.archive_path.is_some())
-        && src
-            .rsplit('.')
-            .next()
-            .is_some_and(|e| e.eq_ignore_ascii_case(ext))
-}
-
-/// Build a repack source reference from a matched ROM, carrying its canonical
-/// ROM name as the archive entry name.
-/// Accumulates, across the games that repack from one staging container, the
-/// spec to rebuild that container on rollback. See `drain_after_repack`.
-struct ContainerDrain {
-    /// Archive format to rebuild the container in (`zip` or `7z`).
-    format: String,
-    /// A representative destination, for the human-readable drain reason.
-    reason_dest: String,
-    /// Where each of the container's entries was repacked to.
-    entries: Vec<RebuildEntry>,
-}
-
-/// The archive format to rebuild a drained container in, inferred from its path.
-/// A `.7z` container rebuilds as 7z; everything else (including `.zip` sources
-/// originally written by any tool) rebuilds as a plain content-faithful zip —
-/// the catalogue keys on inner-entry SHA1s, not the archive's own bytes.
-fn container_archive_format(path: &str) -> String {
-    if path.to_ascii_lowercase().ends_with(".7z") {
-        "7z".to_string()
-    } else {
-        "zip".to_string()
-    }
-}
-
-fn source_ref_for(m: &MatchedRom) -> Result<SourceRef> {
-    validate_relative_path("ROM entry name", &m.rom_name)?;
-    Ok(SourceRef {
-        path: format!("{}/{}", m.source_root, m.source_path),
-        archive_path: m.archive_path.clone(),
-        sha1: m.sha1.clone(),
-        entry_name: Some(m.rom_name.clone()),
-    })
 }
 
 /// Every source's disposition, keyed by its root path (which is what a matched
