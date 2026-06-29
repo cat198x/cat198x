@@ -41,6 +41,13 @@ pub struct PlanOptions {
     pub default_merge_mode: MergeMode,
 }
 
+#[derive(Default)]
+struct PlanningRun {
+    planned_any: bool,
+    filter_matched_any: bool,
+    skipped_no_dest: Vec<String>,
+}
+
 /// Generate a plan for all configured collections with default options.
 pub fn generate_plan(conn: &Connection) -> Result<Plan> {
     generate_plan_filtered(conn, &PlanOptions::default())
@@ -51,7 +58,6 @@ pub fn generate_plan(conn: &Connection) -> Result<Plan> {
 /// `dat_filter` supports glob patterns (`*`, `?`, case-insensitive) over
 /// collection names.
 pub fn generate_plan_filtered(conn: &Connection, opts: &PlanOptions) -> Result<Plan> {
-    let dat_filter = opts.dat_filter.as_deref();
     let default_dest = opts.default_dest.as_deref();
 
     // Calculate state hash
@@ -86,10 +92,6 @@ pub fn generate_plan_filtered(conn: &Connection, opts: &PlanOptions) -> Result<P
     // silently overwrite each other's same-named games.
     check_unique_destinations(conn, opts, &all_collections)?;
 
-    let mut planned_any = false;
-    let mut filter_matched_any = false;
-    let mut skipped_no_dest: Vec<String> = Vec::new();
-
     // Source containers a repack rebuilt from and that are safe to lose afterwards
     // — recorded here and emitted as deletes *after* every repack, so the apply
     // runs the rebuilds first and the verify-before-delete net sees each entry
@@ -114,60 +116,62 @@ pub fn generate_plan_filtered(conn: &Connection, opts: &PlanOptions) -> Result<P
         dispositions: &dispositions,
     };
 
-    for collection in &all_collections {
-        if let Some(pattern) = dat_filter
+    let PlanningRun {
+        planned_any,
+        filter_matched_any,
+        skipped_no_dest,
+    } = plan_collections(
+        &collection_context,
+        &all_collections,
+        &mut plan,
+        &mut drain_after_repack,
+    )?;
+
+    emit_container_drains(&mut plan, drain_after_repack);
+
+    reporting::plan_completion(
+        opts.dat_filter.as_deref(),
+        planned_any,
+        filter_matched_any,
+        skipped_no_dest.len(),
+        plan.skipped_oversized.len(),
+    );
+    plan.skipped_no_dest = skipped_no_dest;
+    Ok(plan)
+}
+
+fn plan_collections(
+    ctx: &CollectionPlanningContext<'_>,
+    all_collections: &[collections::Collection],
+    plan: &mut Plan,
+    drain_after_repack: &mut BTreeMap<String, ContainerDrain>,
+) -> Result<PlanningRun> {
+    let mut run = PlanningRun::default();
+
+    for collection in all_collections {
+        if let Some(pattern) = ctx.opts.dat_filter.as_deref()
             && !glob_match(pattern, &collection.name)
         {
             continue;
         }
-        filter_matched_any = true;
+        run.filter_matched_any = true;
 
-        match plan_collection(
-            &collection_context,
-            collection,
-            &mut plan,
-            &mut drain_after_repack,
-        )? {
+        match plan_collection(ctx, collection, plan, drain_after_repack)? {
             CollectionPlanningOutcome::NoActiveVersion
             | CollectionPlanningOutcome::ExcludedBySet => {}
             CollectionPlanningOutcome::SkippedNoDest(collection_name) => {
-                skipped_no_dest.push(collection_name);
+                run.skipped_no_dest.push(collection_name);
             }
             CollectionPlanningOutcome::SkippedOversized(collection_name) => {
                 plan.skipped_oversized.push(collection_name);
             }
             CollectionPlanningOutcome::Planned => {
-                planned_any = true;
+                run.planned_any = true;
             }
         }
     }
 
-    emit_container_drains(&mut plan, drain_after_repack);
-
-    // Never skip silently: report collections left out because no destination
-    // could be resolved, and how to include them. The full list rides on the
-    // plan so the caller can write it out for review.
-    if !skipped_no_dest.is_empty() {
-        reporting::skipped_no_dest(skipped_no_dest.len());
-    }
-
-    // Report collections left out because their match expansion is too large to
-    // plan safely (a meta-aggregate, not a romset). Already named individually
-    // above as they were hit; this is the rollup.
-    if !plan.skipped_oversized.is_empty() {
-        reporting::skipped_oversized_rollup(plan.skipped_oversized.len());
-    }
-
-    if let Some(pattern) = dat_filter
-        && !filter_matched_any
-    {
-        reporting::no_matching_filter(pattern);
-    } else if !planned_any && skipped_no_dest.is_empty() && plan.skipped_oversized.is_empty() {
-        reporting::no_active_collections();
-    }
-
-    plan.skipped_no_dest = skipped_no_dest;
-    Ok(plan)
+    Ok(run)
 }
 
 #[cfg(test)]

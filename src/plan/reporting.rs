@@ -72,10 +72,34 @@ pub(crate) fn skipped_oversized_rollup(count: usize) {
     );
 }
 
-pub(crate) fn no_matching_filter(pattern: &str) {
+fn no_matching_filter(pattern: &str) {
     println!("No collections match the filter: {pattern}");
 }
 
-pub(crate) fn no_active_collections() {
+fn no_active_collections() {
     println!("No collections with an active version to plan.");
+}
+
+pub(crate) fn plan_completion(
+    dat_filter: Option<&str>,
+    planned_any: bool,
+    filter_matched_any: bool,
+    skipped_no_dest_count: usize,
+    skipped_oversized_count: usize,
+) {
+    if skipped_no_dest_count > 0 {
+        skipped_no_dest(skipped_no_dest_count);
+    }
+
+    if skipped_oversized_count > 0 {
+        skipped_oversized_rollup(skipped_oversized_count);
+    }
+
+    if let Some(pattern) = dat_filter
+        && !filter_matched_any
+    {
+        no_matching_filter(pattern);
+    } else if !planned_any && skipped_no_dest_count == 0 && skipped_oversized_count == 0 {
+        no_active_collections();
+    }
 }
