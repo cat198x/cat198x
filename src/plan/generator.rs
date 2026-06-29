@@ -10,15 +10,17 @@ use super::collisions::check_unique_destinations;
 use super::collisions::find_destination_collisions;
 #[cfg(test)]
 use super::desired_state::compute_desired_state;
-use super::destinations::{
-    build_archive_dest_path, build_dest_path, build_disk_dest_path, resolve_dest_root,
-    validate_relative_path,
-};
+#[cfg(test)]
+use super::destinations::build_dest_path;
+use super::destinations::{build_archive_dest_path, resolve_dest_root, validate_relative_path};
 #[cfg(test)]
 use super::matching::count_expansion_capped;
 use super::matching::{
     MatchedRom, compute_shared_containers, compute_shared_content, count_match_rows_capped,
     find_matched_roms,
+};
+use super::placement_planning::{
+    dedup_reason, is_in_library, may_delete, may_move, plan_disk_matches, plan_loose_matches,
 };
 use super::rules::{
     MAX_MATCH_ROWS, apply_one_g_one_r_filter, archive_extension, archive_format_tag,
@@ -252,100 +254,18 @@ pub fn generate_plan_filtered(conn: &Connection, opts: &PlanOptions) -> Result<P
 
         match archive_format_tag(format) {
             None => {
-                // LOOSE: one file per ROM. A single-ROM game stays flat
-                // (dest/rom); a multi-ROM game gets a folder (dest/game/rom), so
-                // count the *distinct* ROMs per game up front — counting match
-                // rows would mistake a ROM held in several locations for a
-                // multi-ROM game and wrongly add a folder level.
-                let mut roms_per_game: HashMap<String, HashSet<String>> = HashMap::new();
-                for m in &matches {
-                    roms_per_game
-                        .entry(m.game_name.clone())
-                        .or_default()
-                        .insert(m.rom_name.clone());
-                }
-
-                // Group every held copy by its canonical destination. Copies of
-                // one ROM (same content from different locations — e.g. a file
-                // already placed in the library plus a staged copy under ToSort)
-                // share a destination: we keep exactly one canonical copy there
-                // and quarantine the rest as duplicates.
-                let mut by_dest: BTreeMap<String, Vec<MatchedRom>> = BTreeMap::new();
-                for m in matches {
-                    let multi_rom = roms_per_game
-                        .get(&m.game_name)
-                        .map(|s| s.len())
-                        .unwrap_or(1)
-                        > 1;
-                    let dest = build_dest_path(&dest_root, &m.game_name, &m.rom_name, multi_rom)?;
-                    by_dest.entry(dest).or_default().push(m);
-                }
-
-                for (dest, copies) in by_dest {
-                    // Shared content (the same bytes also belong to another entry)
-                    // must never consume its source: a "duplicate" copy here may be
-                    // the matched source for a different destination. So copy it
-                    // into place even in move mode, and skip the redundancy delete.
-                    let shared_here = copies.iter().any(|m| shared.contains(&m.sha1));
-
-                    // A loose copy already sitting at the destination is the
-                    // canonical one — an in-memory comparison (the match carries
-                    // its location), so no per-file disk stat or catalogue scan.
-                    let at_dest = copies.iter().position(|m| {
-                        m.archive_path.is_none()
-                            && format!("{}/{}", m.source_root, m.source_path) == dest
-                    });
-                    let keep = match at_dest {
-                        Some(i) => {
-                            already_correct += 1;
-                            Some(i)
-                        }
-                        None => {
-                            // Nothing at dest yet: place the first copy there.
-                            let m = &copies[0];
-                            bytes += m.size as u64;
-                            let source = SourceRef {
-                                path: format!("{}/{}", m.source_root, m.source_path),
-                                archive_path: m.archive_path.clone(),
-                                sha1: m.sha1.clone(),
-                                entry_name: None,
-                            };
-                            if may_move(&dispositions, &m.source_root, &dest) && !shared_here {
-                                plan.add_move(source, dest.clone(), m.size as u64);
-                            } else {
-                                plan.add_copy(source, dest.clone(), m.size as u64);
-                            }
-                            to_write += 1;
-                            Some(0)
-                        }
-                    };
-                    // Every other loose copy is an exact-content duplicate of the
-                    // one kept at the destination. In move mode (an in-place tidy)
-                    // delete the redundant copy — nothing unique is lost, since the
-                    // kept copy preserves the bytes. In copy mode, or for shared
-                    // content, leave it be: a copy run must not remove source files,
-                    // and a shared copy may be needed by another destination.
-                    // Delete a redundant loose copy when its source allows losing
-                    // it given the kept canonical survives at `dest`: a consume
-                    // source always, a preserve source only when `dest` is within
-                    // its own tree (intra-tree dedup — content stays in the tree).
-                    if !shared_here {
-                        for (i, m) in copies.iter().enumerate() {
-                            if Some(i) == keep || m.archive_path.is_some() {
-                                continue;
-                            }
-                            if !may_delete(&dispositions, &m.source_root, &dest) {
-                                continue;
-                            }
-                            let path = format!("{}/{}", m.source_root, m.source_path);
-                            if path == dest || is_in_library(&path, default_dest, &dest_root) {
-                                continue;
-                            }
-                            plan.add_delete(path, dedup_reason(&dest));
-                            deduped += 1;
-                        }
-                    }
-                }
+                let c = plan_loose_matches(
+                    matches,
+                    &dest_root,
+                    default_dest,
+                    &shared,
+                    &dispositions,
+                    &mut plan,
+                )?;
+                already_correct += c.already_correct;
+                to_write += c.to_write;
+                bytes += c.bytes;
+                deduped += c.deduped;
                 println!(
                     "  {} already correct, {} to place, {} duplicate(s) to delete",
                     already_correct, to_write, deduped
@@ -754,39 +674,6 @@ fn source_ref_for(m: &MatchedRom) -> Result<SourceRef> {
     })
 }
 
-/// Counts from planning a batch of CHD (disk) matches.
-#[derive(Default)]
-struct DiskPlanCounts {
-    already_correct: usize,
-    to_write: usize,
-    deduped: usize,
-    bytes: u64,
-}
-
-/// Plan CHD (`<disk>`) matches as loose files in a machine folder
-/// (`<dest_root>/<game>/<name>.chd`) — the MAME on-disk convention — never
-/// packed, whatever the set's format. Mirrors loose-ROM planning: one canonical
-/// copy per destination, the rest treated as exact-content duplicates (deleted
-/// only in move mode, and never when the content is shared with another entry).
-///
-/// The DAT disk name has no extension; `.chd` is appended here so the
-/// destination matches the on-disk file.
-/// Whether `path` is a file already placed under a destination library root, so
-/// it must never be removed as a "duplicate". A file in the library is the
-/// canonical copy for its own game, not a stray staging copy. Without this guard
-/// the move-mode dedup would delete one game's placement while deduping another's
-/// — notably a merged-set ROM shared across a parent and its clones, which is a
-/// single DAT game (so [`compute_shared_content`] does not flag it as shared) yet
-/// is legitimately placed at every clone's destination. Staging copies (under
-/// `ToSort/`, outside any destination root) are still removed as before.
-fn is_in_library(path: &str, default_dest: Option<&str>, dest_root: &str) -> bool {
-    let under = |root: &str| {
-        let root = root.trim_end_matches('/');
-        path == root || path.starts_with(&format!("{root}/"))
-    };
-    under(dest_root) || default_dest.is_some_and(under)
-}
-
 /// Every source's disposition, keyed by its root path (which is what a matched
 /// ROM's `source_root` carries). Drives the move-vs-copy and delete decisions.
 fn source_dispositions(conn: &Connection) -> Result<HashMap<String, Disposition>> {
@@ -794,140 +681,6 @@ fn source_dispositions(conn: &Connection) -> Result<HashMap<String, Disposition>
         .into_iter()
         .map(|s| (s.path, s.disposition))
         .collect())
-}
-
-/// The disposition of the source at `source_root` — unknown roots are treated as
-/// `preserve`, the safe default (never authorise a move-out or delete on a guess).
-fn disposition_of(dispositions: &HashMap<String, Disposition>, source_root: &str) -> Disposition {
-    dispositions
-        .get(source_root)
-        .copied()
-        .unwrap_or(Disposition::Preserve)
-}
-
-/// Whether `dest` sits at or under `root` — the "same tree" test for a preserve
-/// source (a relocation within the tree is allowed; moving out of it is not).
-fn dest_under(root: &str, dest: &str) -> bool {
-    let root = root.trim_end_matches('/');
-    dest == root || dest.starts_with(&format!("{root}/"))
-}
-
-/// May content read from `source_root` be *moved* to `dest` (rather than copied)?
-/// A `consume` source may always be moved out; a `preserve` source may only be
-/// moved when `dest` stays within its tree. See `decisions/source-disposition.md`.
-fn may_move(dispositions: &HashMap<String, Disposition>, source_root: &str, dest: &str) -> bool {
-    match disposition_of(dispositions, source_root) {
-        Disposition::Consume => true,
-        Disposition::Preserve => dest_under(source_root, dest),
-    }
-}
-
-/// May a file read from `source_root` be *deleted* as redundant, given a copy of
-/// its content survives at `survivor_dest`? A `consume` source may always be
-/// emptied — content is allowed to leave the tree. A `preserve` source may drop
-/// the file only when the survivor stays **within its own tree**: that covers
-/// intra-tree dedup and loose→archive consolidation (the archive at `dest` holds
-/// the content in-tree), while still refusing to lose content to another tree.
-///
-/// This is the same in-tree condition as [`may_move`] — deleting a duplicate
-/// whose survivor lands at `dest` is safe exactly when moving the content there
-/// would be — but it is kept distinct to state the delete intent at each site.
-/// See `decisions/source-disposition.md` (the delete rule).
-/// The reason recorded on a dedup delete: the canonical copy that survives it.
-/// Every delete the planner emits is a redundant exact-content duplicate, so this
-/// names the kept copy — what makes the removal safe — for plan review and the
-/// live log.
-fn dedup_reason(survivor_dest: &str) -> String {
-    format!("exact duplicate — kept {survivor_dest}")
-}
-
-fn may_delete(
-    dispositions: &HashMap<String, Disposition>,
-    source_root: &str,
-    survivor_dest: &str,
-) -> bool {
-    match disposition_of(dispositions, source_root) {
-        Disposition::Consume => true,
-        Disposition::Preserve => dest_under(source_root, survivor_dest),
-    }
-}
-
-fn plan_disk_matches(
-    matches: Vec<MatchedRom>,
-    dest_root: &str,
-    opts: &PlanOptions,
-    shared: &HashSet<String>,
-    dispositions: &HashMap<String, Disposition>,
-    plan: &mut Plan,
-) -> Result<DiskPlanCounts> {
-    let mut counts = DiskPlanCounts::default();
-
-    // Group every held copy by its canonical destination.
-    let mut by_dest: BTreeMap<String, Vec<MatchedRom>> = BTreeMap::new();
-    for m in matches {
-        let dest = build_disk_dest_path(dest_root, &m.game_name, &m.rom_name)?;
-        by_dest.entry(dest).or_default().push(m);
-    }
-
-    for (dest, copies) in by_dest {
-        // Shared content must never consume its source — copy it into place even
-        // in move mode, and skip the redundancy delete.
-        let shared_here = copies.iter().any(|m| shared.contains(&m.sha1));
-
-        let at_dest = copies.iter().position(|m| {
-            m.archive_path.is_none() && format!("{}/{}", m.source_root, m.source_path) == dest
-        });
-        let keep = match at_dest {
-            Some(i) => {
-                counts.already_correct += 1;
-                Some(i)
-            }
-            None => {
-                let m = &copies[0];
-                counts.bytes += m.size as u64;
-                let source = SourceRef {
-                    path: format!("{}/{}", m.source_root, m.source_path),
-                    archive_path: m.archive_path.clone(),
-                    sha1: m.sha1.clone(),
-                    entry_name: None,
-                };
-                if may_move(dispositions, &m.source_root, &dest) && !shared_here {
-                    plan.add_move(source, dest.clone(), m.size as u64);
-                } else {
-                    plan.add_copy(source, dest.clone(), m.size as u64);
-                }
-                counts.to_write += 1;
-                Some(0)
-            }
-        };
-
-        // Delete a redundant loose copy when its source allows losing it given
-        // the kept canonical survives at `dest`: a consume source always, a
-        // preserve source only when `dest` is within its own tree.
-        if !shared_here {
-            for (i, m) in copies.iter().enumerate() {
-                if Some(i) == keep || m.archive_path.is_some() {
-                    continue;
-                }
-                if !may_delete(dispositions, &m.source_root, &dest) {
-                    continue;
-                }
-                let path = format!("{}/{}", m.source_root, m.source_path);
-                if path == dest || is_in_library(&path, opts.default_dest.as_deref(), dest_root) {
-                    continue;
-                }
-                plan.add_delete(path, dedup_reason(&dest));
-                counts.deduped += 1;
-            }
-        }
-    }
-
-    println!(
-        "  {} CHD(s) already correct, {} to place, {} duplicate(s) to delete",
-        counts.already_correct, counts.to_write, counts.deduped
-    );
-
-    Ok(counts)
 }
 
 /// Compute state hash for plan validation

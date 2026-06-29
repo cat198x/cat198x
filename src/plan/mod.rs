@@ -8,6 +8,7 @@ pub mod executor;
 pub mod generator;
 pub mod log;
 pub(crate) mod matching;
+pub(crate) mod placement_planning;
 pub(crate) mod rules;
 pub mod types;
 
