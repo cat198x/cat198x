@@ -3,9 +3,9 @@
 use anyhow::Result;
 use rusqlite::Connection;
 use sha2::{Digest as Sha2Digest, Sha256};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 
-use super::archive_planning::{ContainerDrain, plan_archive_matches};
+use super::archive_planning::{ContainerDrain, emit_container_drains, plan_archive_matches};
 use super::collisions::check_unique_destinations;
 #[cfg(test)]
 use super::collisions::find_destination_collisions;
@@ -27,7 +27,7 @@ use super::rules::{
 };
 #[cfg(test)]
 use super::rules::{resolve_merge_mode, resolve_output_format};
-use super::{CollectionPlanStat, ContainerRebuild, Plan, RebuildEntry};
+use super::{CollectionPlanStat, Plan};
 use crate::config::{MergeMode, OutputFormat};
 use crate::db::files::Disposition;
 use crate::db::{collections, config as db_config, dats, files};
@@ -322,33 +322,7 @@ pub fn generate_plan_filtered(conn: &Connection, opts: &PlanOptions) -> Result<P
         });
     }
 
-    // Drain the source containers the repacks rebuilt from — emitted last, so the
-    // apply runs every rebuild before these deletes and the verify-before-delete
-    // net can see each entry surviving at its destination. Each carries a rebuild
-    // spec (where every entry went) so a rollback restores the container before
-    // those destinations are removed. The reason names a destination its content
-    // went to (for plan review and the live log); the net guarantees safety
-    // regardless.
-    for (container, drain) in drain_after_repack {
-        // One entry per in-container name: a name repeated across the feeding
-        // games is the same content (extractable from either destination), so
-        // keep the first.
-        let mut seen = HashSet::new();
-        let entries: Vec<RebuildEntry> = drain
-            .entries
-            .into_iter()
-            .filter(|e| seen.insert(e.container_entry.clone()))
-            .collect();
-        let reason = format!("consolidated into {}", drain.reason_dest);
-        plan.add_container_drain(
-            container,
-            reason,
-            ContainerRebuild {
-                format: drain.format,
-                entries,
-            },
-        );
-    }
+    emit_container_drains(&mut plan, drain_after_repack);
 
     // Never skip silently: report collections left out because no destination
     // could be resolved, and how to include them. The full list rides on the
@@ -462,6 +436,7 @@ mod tests {
     use super::*;
     use crate::db::Database;
     use crate::plan::OperationKind;
+    use std::collections::HashSet;
 
     fn setup_db() -> Database {
         Database::open_in_memory().unwrap()
