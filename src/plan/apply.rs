@@ -20,7 +20,6 @@ use rusqlite::Connection;
 use crate::db::files::Source;
 use crate::plan::Plan;
 
-mod batches;
 mod catalogue;
 mod persistence;
 mod runner;

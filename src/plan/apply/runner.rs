@@ -3,13 +3,16 @@ use std::path::Path;
 use anyhow::Result;
 use rusqlite::Connection;
 
-use super::batches::{flush_placement_batch, flush_repack_batch};
+use super::catalogue::sync_catalogue_after;
 use super::persistence::persist_apply_run;
 use super::serial::run_serial_operation;
-use super::{ApplyEvent, ApplyOptions, ApplyOutcome};
+use super::{ApplyEvent, ApplyOptions, ApplyOutcome, OpView};
 use crate::db::files::Source;
-use crate::plan::executor::{PlacementJob, PlacementKind, RepackJob};
-use crate::plan::{OperationKind, OperationLog, Plan};
+use crate::plan::executor::{
+    PlacementEvent, PlacementJob, PlacementKind, PlacementOutcome, RepackEvent, RepackJob,
+    RepackOutcome, execute_placements_concurrent, execute_repacks_concurrent,
+};
+use crate::plan::{OperationKind, OperationLog, OperationStatus, Plan};
 
 pub(super) struct ApplyRunner<'a> {
     conn: &'a Connection,
@@ -183,30 +186,191 @@ impl<'a> ApplyRunner<'a> {
     }
 
     fn flush_batches(&mut self) {
-        flush_placement_batch(
-            &mut self.placement_batch,
-            self.opts.jobs,
-            self.plan,
-            &mut self.op_log,
-            self.conn,
-            self.sources,
-            self.total_ops,
-            &mut self.success_count,
-            &mut self.error_count,
-            self.on_event,
-        );
-        flush_repack_batch(
-            &mut self.repack_batch,
-            self.opts.jobs,
-            self.plan,
-            &mut self.op_log,
-            self.conn,
-            self.sources,
-            self.total_ops,
-            &mut self.success_count,
-            &mut self.error_count,
-            self.on_event,
-        );
+        self.flush_placement_batch();
+        self.flush_repack_batch();
+    }
+
+    /// Execute the accumulated placement batch (copy/move/relocate)
+    /// concurrently, then drain it. Workers do the file operations, while
+    /// everything stateful stays on this thread.
+    fn flush_placement_batch(&mut self) {
+        if self.placement_batch.is_empty() {
+            return;
+        }
+        let jobs = std::mem::take(&mut self.placement_batch);
+
+        execute_placements_concurrent(jobs, self.opts.jobs, |event| match event {
+            PlacementEvent::Started { slot, plan_index } => {
+                (self.on_event)(ApplyEvent::OpStarted {
+                    index: plan_index,
+                    total: self.total_ops,
+                    slot: Some(slot),
+                    op: OpView::of(&self.plan.operations[plan_index].kind),
+                });
+            }
+            PlacementEvent::Finished { slot, outcome } => {
+                let PlacementOutcome { job, result } = outcome;
+                let view = OpView::of(&self.plan.operations[job.plan_index].kind);
+
+                if let Some(log) = self.op_log.as_mut() {
+                    let success = result.is_ok();
+                    match &job.kind {
+                        PlacementKind::Copy { source, dest, .. } => log.log_copy(
+                            job.operation_id,
+                            &source.path,
+                            dest,
+                            &source.sha1,
+                            success,
+                        ),
+                        PlacementKind::Move { source, dest, .. } => log.log_move(
+                            job.operation_id,
+                            &source.path,
+                            dest,
+                            &source.sha1,
+                            success,
+                        ),
+                        PlacementKind::Relocate { source, dest } => {
+                            log.log_relocate(job.operation_id, source, dest, success)
+                        }
+                    }
+                }
+
+                let mut detail = None;
+                match result {
+                    Ok(()) => {
+                        let op_id = {
+                            let op = &mut self.plan.operations[job.plan_index];
+                            op.status = OperationStatus::Completed;
+                            op.id
+                        };
+                        self.success_count += 1;
+
+                        if let Err(e) = sync_catalogue_after(
+                            self.conn,
+                            self.sources,
+                            &self.plan.operations[job.plan_index].kind,
+                        ) {
+                            (self.on_event)(ApplyEvent::CatalogueWarning {
+                                op_id,
+                                message: e.to_string(),
+                            });
+                        }
+                    }
+                    Err(e) => {
+                        let message = format!("{e:#}");
+                        (self.on_event)(ApplyEvent::OpFailed {
+                            index: job.plan_index,
+                            message: message.clone(),
+                        });
+                        detail = Some(message);
+                        self.plan.operations[job.plan_index].status = OperationStatus::Failed;
+                        self.error_count += 1;
+                    }
+                }
+
+                (self.on_event)(ApplyEvent::OpFinished {
+                    index: job.plan_index,
+                    slot: Some(slot),
+                    op: view,
+                    status: self.plan.operations[job.plan_index].status,
+                    detail,
+                });
+            }
+        });
+    }
+
+    /// Execute the accumulated repack batch concurrently, then drain it.
+    /// Journal entries, plan status updates, catalogue sync, and progress events
+    /// stay on the runner thread as each worker outcome streams in.
+    fn flush_repack_batch(&mut self) {
+        if self.repack_batch.is_empty() {
+            return;
+        }
+        let jobs = std::mem::take(&mut self.repack_batch);
+        if jobs.len() > 1 && self.opts.jobs > 1 {
+            (self.on_event)(ApplyEvent::RepackBatchStarted {
+                count: jobs.len(),
+                in_flight: self.opts.jobs.min(jobs.len()),
+            });
+        }
+
+        let repack_view = |sources_len: usize, dest: &str, size: u64| OpView {
+            verb: "REPACK",
+            from: dest.to_string(),
+            to: None,
+            file_count: Some(sources_len),
+            bytes: size,
+            reason: None,
+        };
+
+        execute_repacks_concurrent(jobs, self.opts.jobs, |event| match event {
+            RepackEvent::Started { slot, plan_index } => {
+                (self.on_event)(ApplyEvent::OpStarted {
+                    index: plan_index,
+                    total: self.total_ops,
+                    slot: Some(slot),
+                    op: OpView::of(&self.plan.operations[plan_index].kind),
+                });
+            }
+            RepackEvent::Finished { slot, outcome } => {
+                let RepackOutcome { job, result } = outcome;
+                let view = repack_view(job.sources.len(), &job.dest, job.size);
+
+                if let Some(log) = self.op_log.as_mut() {
+                    let source_paths: Vec<String> =
+                        job.sources.iter().map(|s| s.path.clone()).collect();
+                    let consumed = result.as_deref().unwrap_or(&[]);
+                    log.log_repack(
+                        job.operation_id,
+                        &source_paths,
+                        &job.dest,
+                        consumed,
+                        result.is_ok(),
+                    );
+                }
+
+                let mut detail = None;
+                match result {
+                    Ok(_) => {
+                        let op_id = {
+                            let op = &mut self.plan.operations[job.plan_index];
+                            op.status = OperationStatus::Completed;
+                            op.id
+                        };
+                        self.success_count += 1;
+
+                        if let Err(e) = sync_catalogue_after(
+                            self.conn,
+                            self.sources,
+                            &self.plan.operations[job.plan_index].kind,
+                        ) {
+                            (self.on_event)(ApplyEvent::CatalogueWarning {
+                                op_id,
+                                message: e.to_string(),
+                            });
+                        }
+                    }
+                    Err(e) => {
+                        let message = format!("{e:#}");
+                        (self.on_event)(ApplyEvent::OpFailed {
+                            index: job.plan_index,
+                            message: message.clone(),
+                        });
+                        detail = Some(message);
+                        self.plan.operations[job.plan_index].status = OperationStatus::Failed;
+                        self.error_count += 1;
+                    }
+                }
+
+                (self.on_event)(ApplyEvent::OpFinished {
+                    index: job.plan_index,
+                    slot: Some(slot),
+                    op: view,
+                    status: self.plan.operations[job.plan_index].status,
+                    detail,
+                });
+            }
+        });
     }
 
     fn run_serial(&mut self, index: usize) {
