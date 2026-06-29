@@ -8,6 +8,7 @@ use super::archive_planning::{ContainerDrain, emit_container_drains, plan_archiv
 use super::collisions::check_unique_destinations;
 #[cfg(test)]
 use super::collisions::find_destination_collisions;
+pub use super::coverage::count_missing_roms;
 #[cfg(test)]
 use super::desired_state::compute_desired_state;
 #[cfg(test)]
@@ -361,26 +362,6 @@ pub fn generate_plan_filtered(conn: &Connection, opts: &PlanOptions) -> Result<P
 
     plan.skipped_no_dest = skipped_no_dest;
     Ok(plan)
-}
-
-/// Count missing ROMs (ROMs in DAT but not in file catalog)
-pub fn count_missing_roms(conn: &Connection, version_id: i64) -> Result<i64> {
-    let count: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM dat_roms r
-         JOIN dat_games g ON r.game_id = g.id
-         JOIN dat_nodes n ON g.node_id = n.id
-         WHERE n.version_id = ?
-           AND r.status != 'nodump'
-           AND (r.sha1 IS NOT NULL OR r.crc32 IS NOT NULL)
-           AND NOT EXISTS (
-               SELECT 1 FROM files f
-               WHERE (r.sha1 IS NOT NULL AND (f.sha1 = r.sha1 OR f.sha1_no_header = r.sha1))
-                  OR (r.sha1 IS NULL AND f.crc32 = r.crc32 AND f.size = r.size)
-           )",
-        [version_id],
-        |row| row.get(0),
-    )?;
-    Ok(count)
 }
 
 #[cfg(test)]
