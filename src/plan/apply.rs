@@ -18,18 +18,16 @@ use anyhow::Result;
 use rusqlite::Connection;
 
 use crate::db::files::Source;
-use crate::plan::executor::{PlacementJob, PlacementKind, RepackJob};
-use crate::plan::{OperationKind, OperationLog, Plan};
+use crate::plan::Plan;
 
 mod batches;
 mod catalogue;
 mod persistence;
+mod runner;
 mod serial;
 mod types;
 
-use batches::{flush_placement_batch, flush_repack_batch};
-use persistence::persist_apply_run;
-use serial::run_serial_operation;
+use runner::ApplyRunner;
 pub use types::{ApplyEvent, ApplyOptions, ApplyOutcome, OpView};
 
 /// Apply a plan's pending operations, reporting progress through `on_event`.
@@ -46,196 +44,7 @@ pub fn apply_plan(
     opts: &ApplyOptions,
     on_event: &mut dyn FnMut(ApplyEvent),
 ) -> Result<ApplyOutcome> {
-    let total_ops = plan.operations.len();
-
-    // Create operation log (only if not dry run)
-    let mut op_log = if !opts.dry_run {
-        Some(OperationLog::new(plan.state_hash.clone()))
-    } else {
-        None
-    };
-
-    let mut success_count = 0;
-    let mut error_count = 0;
-    let mut refused_count = 0;
-
-    // Placement (copy/move/relocate) and repack operations accumulate here and
-    // run concurrently — both are latency-bound over a network mount, so
-    // overlapping them is the wall-clock win. A serial operation (delete /
-    // quarantine) flushes both batches first, so the one ordering that matters —
-    // a placement that creates a surviving copy lands before the delete that
-    // relies on it — is preserved exactly as serial apply's.
-    let mut placement_batch: Vec<PlacementJob> = Vec::new();
-    let mut repack_batch: Vec<RepackJob> = Vec::new();
-
-    for i in 0..plan.operations.len() {
-        {
-            let op = &plan.operations[i];
-            // Skip completed and (sticky) refused operations. A retryable Failed
-            // op IS re-attempted, so a run interrupted by a dropped mount recovers
-            // by applying again — the whole point of issue #47.
-            if !op.status.is_remaining_work() {
-                continue;
-            }
-
-            // Deferred repacks stay pending for a later pass, in both dry and real
-            // runs, so the cheap operations land first.
-            if opts.skip_repack && matches!(op.kind, OperationKind::Repack { .. }) {
-                continue;
-            }
-
-            // A real run accumulates the parallelisable operations into their
-            // batches and runs them concurrently. (A dry run falls through to the
-            // serial path below, which tallies each op without touching disk.)
-            if !opts.dry_run {
-                match &op.kind {
-                    OperationKind::Repack {
-                        sources: repack_sources,
-                        dest,
-                        format,
-                        move_sources,
-                        size,
-                    } => {
-                        repack_batch.push(RepackJob {
-                            plan_index: i,
-                            operation_id: op.id,
-                            sources: repack_sources.clone(),
-                            dest: dest.clone(),
-                            format: format.clone(),
-                            move_sources: *move_sources,
-                            size: *size,
-                        });
-                        continue;
-                    }
-                    OperationKind::Copy {
-                        source,
-                        dest,
-                        placement,
-                        ..
-                    } => {
-                        placement_batch.push(PlacementJob {
-                            plan_index: i,
-                            operation_id: op.id,
-                            kind: PlacementKind::Copy {
-                                source: source.clone(),
-                                dest: dest.clone(),
-                                placement: placement.clone(),
-                            },
-                        });
-                        continue;
-                    }
-                    OperationKind::Move {
-                        source,
-                        dest,
-                        placement,
-                        ..
-                    } => {
-                        placement_batch.push(PlacementJob {
-                            plan_index: i,
-                            operation_id: op.id,
-                            kind: PlacementKind::Move {
-                                source: source.clone(),
-                                dest: dest.clone(),
-                                placement: placement.clone(),
-                            },
-                        });
-                        continue;
-                    }
-                    OperationKind::Relocate { source, dest, .. } => {
-                        placement_batch.push(PlacementJob {
-                            plan_index: i,
-                            operation_id: op.id,
-                            kind: PlacementKind::Relocate {
-                                source: source.clone(),
-                                dest: dest.clone(),
-                            },
-                        });
-                        continue;
-                    }
-                    // Delete / Quarantine are serial — they fall through.
-                    OperationKind::Delete { .. } | OperationKind::Quarantine { .. } => {}
-                }
-            }
-        }
-
-        // A serial operation (delete/quarantine, or any op on a dry run): complete
-        // both concurrent batches before it runs, so a placement that creates a
-        // surviving copy lands before the delete that depends on it.
-        flush_placement_batch(
-            &mut placement_batch,
-            opts.jobs,
-            plan,
-            &mut op_log,
-            conn,
-            sources,
-            total_ops,
-            &mut success_count,
-            &mut error_count,
-            on_event,
-        );
-        flush_repack_batch(
-            &mut repack_batch,
-            opts.jobs,
-            plan,
-            &mut op_log,
-            conn,
-            sources,
-            total_ops,
-            &mut success_count,
-            &mut error_count,
-            on_event,
-        );
-
-        let counts = run_serial_operation(
-            i,
-            total_ops,
-            &mut plan.operations[i],
-            conn,
-            sources,
-            opts,
-            &mut op_log,
-            on_event,
-        );
-        success_count += counts.success;
-        error_count += counts.error;
-        refused_count += counts.refused;
-    }
-
-    // Placements and repacks at the tail of the plan (the common case) are still
-    // batched — drain both.
-    flush_placement_batch(
-        &mut placement_batch,
-        opts.jobs,
-        plan,
-        &mut op_log,
-        conn,
-        sources,
-        total_ops,
-        &mut success_count,
-        &mut error_count,
-        on_event,
-    );
-    flush_repack_batch(
-        &mut repack_batch,
-        opts.jobs,
-        plan,
-        &mut op_log,
-        conn,
-        sources,
-        total_ops,
-        &mut success_count,
-        &mut error_count,
-        on_event,
-    );
-
-    let log_path = persist_apply_run(plan, plan_path, opts.dry_run, op_log)?;
-
-    Ok(ApplyOutcome {
-        success_count,
-        error_count,
-        refused_count,
-        log_path,
-    })
+    ApplyRunner::new(conn, plan, plan_path, sources, opts, on_event).run()
 }
 
 #[cfg(test)]
