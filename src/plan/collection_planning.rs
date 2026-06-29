@@ -1,8 +1,8 @@
 use anyhow::Result;
 use rusqlite::Connection;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 
-use super::archive_planning::{ContainerDrain, plan_archive_matches};
+use super::archive_planning::{ContainerDrains, plan_archive_matches};
 use super::destinations::resolve_dest_root;
 use super::generator::PlanOptions;
 use super::matching::{MatchedRom, count_match_rows_capped, find_matched_roms};
@@ -38,7 +38,7 @@ pub(crate) fn plan_collection(
     ctx: &CollectionPlanningContext<'_>,
     collection: &collections::Collection,
     plan: &mut Plan,
-    drain_after_repack: &mut BTreeMap<String, ContainerDrain>,
+    container_drains: &mut ContainerDrains,
 ) -> Result<CollectionPlanningOutcome> {
     // Only collections with an active version can be planned.
     let version = match collections::get_active_version(ctx.conn, collection.id)? {
@@ -172,7 +172,7 @@ pub(crate) fn plan_collection(
                 ctx.shared_containers,
                 ctx.dispositions,
                 plan,
-                drain_after_repack,
+                container_drains.pending_mut(),
             )?;
             already_correct += c.already_correct;
             relocated += c.relocated;

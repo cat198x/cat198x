@@ -2,10 +2,10 @@
 
 use anyhow::Result;
 use rusqlite::Connection;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 
 use super::Plan;
-use super::archive_planning::{ContainerDrain, emit_container_drains};
+use super::archive_planning::ContainerDrains;
 use super::collection_planning::{
     CollectionPlanningContext, CollectionPlanningOutcome, plan_collection,
 };
@@ -90,21 +90,7 @@ pub fn generate_plan(conn: &Connection) -> Result<Plan> {
 pub fn generate_plan_filtered(conn: &Connection, opts: &PlanOptions) -> Result<Plan> {
     let PlanningSetup { mut plan, inputs } = prepare_plan_generation(conn, opts)?;
 
-    // Source containers a repack rebuilt from and that are safe to lose afterwards
-    // — recorded here and emitted as deletes *after* every repack, so the apply
-    // runs the rebuilds first and the verify-before-delete net sees each entry
-    // surviving at its destination before removing the container. Draining these
-    // is what lets `consume` staging empty for recompressed archive sets (a shared
-    // .cue/.sub forces a rebuild over a whole-file relocate). Safety rests on the
-    // net, not a plan-time guess: a container still needed elsewhere is refused,
-    // sticky.
-    //
-    // Keyed by container path so a container feeding several games is drained
-    // once; the accumulated `entries` gather, across those games, where each of
-    // the container's entries was repacked to — the rollback spec that rebuilds
-    // the container before those destinations are deleted. `reason_dest` is just a
-    // representative destination for the human-readable reason.
-    let mut drain_after_repack: BTreeMap<String, ContainerDrain> = BTreeMap::new();
+    let mut container_drains = ContainerDrains::default();
     let collection_context = inputs.collection_context(conn, opts);
 
     let PlanningRun {
@@ -115,10 +101,10 @@ pub fn generate_plan_filtered(conn: &Connection, opts: &PlanOptions) -> Result<P
         &collection_context,
         &inputs.all_collections,
         &mut plan,
-        &mut drain_after_repack,
+        &mut container_drains,
     )?;
 
-    emit_container_drains(&mut plan, drain_after_repack);
+    container_drains.emit_into(&mut plan);
 
     reporting::plan_completion(
         opts.dat_filter.as_deref(),
@@ -178,7 +164,7 @@ fn plan_collections(
     ctx: &CollectionPlanningContext<'_>,
     all_collections: &[collections::Collection],
     plan: &mut Plan,
-    drain_after_repack: &mut BTreeMap<String, ContainerDrain>,
+    container_drains: &mut ContainerDrains,
 ) -> Result<PlanningRun> {
     let mut run = PlanningRun::default();
 
@@ -190,7 +176,7 @@ fn plan_collections(
         }
         run.filter_matched_any = true;
 
-        match plan_collection(ctx, collection, plan, drain_after_repack)? {
+        match plan_collection(ctx, collection, plan, container_drains)? {
             CollectionPlanningOutcome::NoActiveVersion
             | CollectionPlanningOutcome::ExcludedBySet => {}
             CollectionPlanningOutcome::SkippedNoDest(collection_name) => {

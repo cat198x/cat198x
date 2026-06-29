@@ -19,6 +19,28 @@ pub(crate) struct ContainerDrain {
     pub(crate) entries: Vec<RebuildEntry>,
 }
 
+/// Source containers a repack rebuilt from and that are safe to lose afterwards.
+///
+/// These are recorded during per-collection archive planning and emitted as
+/// deletes after every repack, so apply rebuilds destinations first and the
+/// verify-before-delete net proves each entry survives before removing the
+/// source container. Keyed by container path so a container feeding several
+/// games is drained once.
+#[derive(Default)]
+pub(crate) struct ContainerDrains {
+    pending: BTreeMap<String, ContainerDrain>,
+}
+
+impl ContainerDrains {
+    pub(crate) fn pending_mut(&mut self) -> &mut BTreeMap<String, ContainerDrain> {
+        &mut self.pending
+    }
+
+    pub(crate) fn emit_into(self, plan: &mut Plan) {
+        emit_container_drains(plan, self.pending);
+    }
+}
+
 /// Whether a complete source container can be relocated whole to its
 /// destination rather than repacked.
 pub(crate) fn is_relocatable_archive(entries: &[MatchedRom], src: &str, ext: &str) -> bool {
@@ -241,10 +263,7 @@ pub(crate) fn plan_archive_matches(
 /// Emit final deletes for source containers that repacks rebuilt from. These are
 /// emitted after all repacks so apply runs the rebuilds first, then relies on
 /// verify-before-delete to prove each entry survives at its destination.
-pub(crate) fn emit_container_drains(
-    plan: &mut Plan,
-    drain_after_repack: BTreeMap<String, ContainerDrain>,
-) {
+fn emit_container_drains(plan: &mut Plan, drain_after_repack: BTreeMap<String, ContainerDrain>) {
     for (container, drain) in drain_after_repack {
         // One entry per in-container name: a name repeated across feeding games
         // is the same content, so either destination can rebuild it on rollback.
