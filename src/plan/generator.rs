@@ -3,7 +3,7 @@
 use anyhow::Result;
 use rusqlite::Connection;
 use sha2::{Digest as Sha2Digest, Sha256};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 
 use super::archive_planning::{ContainerDrain, emit_container_drains, plan_archive_matches};
 use super::collisions::check_unique_destinations;
@@ -27,10 +27,12 @@ use super::rules::{
 };
 #[cfg(test)]
 use super::rules::{resolve_merge_mode, resolve_output_format};
+use super::source_policy::load_source_dispositions;
 use super::{CollectionPlanStat, Plan};
 use crate::config::{MergeMode, OutputFormat};
-use crate::db::files::Disposition;
-use crate::db::{collections, config as db_config, dats, files};
+#[cfg(test)]
+use crate::db::files::{self, Disposition};
+use crate::db::{collections, config as db_config, dats};
 
 /// Options controlling plan generation.
 #[derive(Debug, Clone, Default)]
@@ -93,7 +95,7 @@ pub fn generate_plan_filtered(conn: &Connection, opts: &PlanOptions) -> Result<P
 
     // Each source's disposition decides, per operation, whether content is moved
     // (and its source freed) or copied. Built once; consulted at every placement.
-    let dispositions = source_dispositions(conn)?;
+    let dispositions = load_source_dispositions(conn)?;
 
     // Plan every collection, not only those with an explicit dest_path: a
     // library-wide `default_dest_path` should reach collections that were never
@@ -359,15 +361,6 @@ pub fn generate_plan_filtered(conn: &Connection, opts: &PlanOptions) -> Result<P
 
     plan.skipped_no_dest = skipped_no_dest;
     Ok(plan)
-}
-
-/// Every source's disposition, keyed by its root path (which is what a matched
-/// ROM's `source_root` carries). Drives the move-vs-copy and delete decisions.
-fn source_dispositions(conn: &Connection) -> Result<HashMap<String, Disposition>> {
-    Ok(files::list_sources(conn)?
-        .into_iter()
-        .map(|s| (s.path, s.disposition))
-        .collect())
 }
 
 /// Compute state hash for plan validation

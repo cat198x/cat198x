@@ -3,9 +3,8 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 
 use super::destinations::{build_archive_dest_path, validate_relative_path};
 use super::matching::MatchedRom;
-use super::placement_planning::{
-    PlacementPlanCounts, dedup_reason, is_in_library, may_delete, may_move,
-};
+use super::placement_planning::PlacementPlanCounts;
+use super::source_policy::{dedup_reason, is_in_library, may_delete, may_move};
 use super::{ContainerRebuild, Plan, RebuildEntry, SourceRef};
 use crate::db::files::Disposition;
 

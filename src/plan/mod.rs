@@ -11,6 +11,7 @@ pub mod log;
 pub(crate) mod matching;
 pub(crate) mod placement_planning;
 pub(crate) mod rules;
+pub(crate) mod source_policy;
 pub mod types;
 
 pub use apply::{ApplyEvent, ApplyOptions, ApplyOutcome, OpView, apply_plan};
