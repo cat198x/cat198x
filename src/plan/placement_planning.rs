@@ -2,8 +2,8 @@ use anyhow::Result;
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use super::destinations::{build_dest_path, build_disk_dest_path};
-use super::generator::PlanOptions;
 use super::matching::MatchedRom;
+use super::options::PlanOptions;
 use super::reporting;
 use super::source_policy::{dedup_reason, is_in_library, may_delete, may_move};
 use super::{Plan, SourceRef};

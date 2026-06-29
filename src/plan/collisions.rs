@@ -3,7 +3,7 @@ use rusqlite::Connection;
 use std::collections::BTreeMap;
 
 use super::destinations::resolve_dest_root;
-use super::generator::PlanOptions;
+use super::options::PlanOptions;
 use super::rules::glob_match;
 use crate::db::{collections, config as db_config, dats};
 

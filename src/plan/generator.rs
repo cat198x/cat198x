@@ -12,35 +12,13 @@ use super::collection_planning::{
 use super::collisions::check_unique_destinations;
 pub use super::coverage::count_missing_roms;
 use super::matching::{compute_shared_containers, compute_shared_content};
+use super::options::PlanOptions;
 use super::reporting;
 use super::rules::glob_match;
 use super::source_policy::load_source_dispositions;
 pub use super::state_hash::compute_state_hash;
-use crate::config::{MergeMode, OutputFormat};
 use crate::db::collections;
 use crate::db::files::Disposition;
-
-/// Options controlling plan generation.
-#[derive(Debug, Clone, Default)]
-pub struct PlanOptions {
-    /// Glob over collection names; `None` plans every collection.
-    pub dat_filter: Option<String>,
-    /// Restrict planning to these sets — the top segment of a collection's
-    /// library path (e.g. `TOSEC`, `TOSEC-PIX`, `FinalBurn Neo`). `None` plans
-    /// every set; useful to scope one set's work (e.g. ingest TOSEC without the
-    /// arcade sets) without listing every collection.
-    pub set_filter: Option<Vec<String>>,
-    /// Library-wide destination root for collections without their own dest_path.
-    pub default_dest: Option<String>,
-    /// Output format for collections without their own setting.
-    pub default_format: OutputFormat,
-    /// Merge mode for collections without their own setting. Controls MAME-style
-    /// parent/clone placement: `Split` (the implemented target) drops a clone's
-    /// merge-tagged inherited ROMs from its placement — they live in the parent —
-    /// so the clone's archive/folder holds only its own unique ROMs. `NonMerged`
-    /// (the default) places every ROM a game's DAT entry lists, parent or clone.
-    pub default_merge_mode: MergeMode,
-}
 
 #[derive(Default)]
 struct PlanningRun {

@@ -1,4 +1,5 @@
 use super::*;
+use crate::config::{MergeMode, OutputFormat};
 use crate::db::files::{self, Disposition};
 use crate::db::{Database, config as db_config, dats};
 use crate::plan::OperationKind;

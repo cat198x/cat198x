@@ -5,8 +5,8 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use super::destinations::{
     build_archive_dest_path, build_dest_path, build_disk_dest_path, resolve_dest_root,
 };
-use super::generator::PlanOptions;
 use super::matching::{MatchedRom, count_match_rows_capped, find_matched_roms};
+use super::options::PlanOptions;
 use super::rules::{
     MAX_MATCH_ROWS, apply_one_g_one_r_filter, archive_extension, archive_format_tag,
     effective_format, effective_merge_mode, glob_match,

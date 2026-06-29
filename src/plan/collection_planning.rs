@@ -4,8 +4,8 @@ use std::collections::{HashMap, HashSet};
 
 use super::archive_planning::{ContainerDrains, plan_archive_matches};
 use super::destinations::resolve_dest_root;
-use super::generator::PlanOptions;
 use super::matching::{MatchedRom, count_match_rows_capped, find_matched_roms};
+use super::options::PlanOptions;
 use super::placement_planning::{plan_disk_matches, plan_loose_matches};
 use super::reporting;
 use super::rules::{

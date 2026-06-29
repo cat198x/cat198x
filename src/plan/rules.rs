@@ -2,8 +2,8 @@ use anyhow::Result;
 use rusqlite::Connection;
 use std::collections::HashMap;
 
-use super::generator::PlanOptions;
 use super::matching::MatchedRom;
+use super::options::PlanOptions;
 use crate::config::{MergeMode, OutputFormat};
 use crate::db::config as db_config;
 use crate::filter::{RomCandidate, parse_game_name, select_preferred};
