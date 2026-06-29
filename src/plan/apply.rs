@@ -12,10 +12,9 @@
 //! That keeps this engine drivable from every 198x surface, exactly as the
 //! safety model requires ("the execution engine lives in the library").
 
-use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use rusqlite::Connection;
 
 use crate::db::files::Source;
@@ -24,10 +23,12 @@ use crate::plan::{OperationKind, OperationLog, Plan};
 
 mod batches;
 mod catalogue;
+mod persistence;
 mod serial;
 mod types;
 
 use batches::{flush_placement_batch, flush_repack_batch};
+use persistence::persist_apply_run;
 use serial::run_serial_operation;
 pub use types::{ApplyEvent, ApplyOptions, ApplyOutcome, OpView};
 
@@ -227,22 +228,7 @@ pub fn apply_plan(
         on_event,
     );
 
-    // Save updated plan and operation log
-    let mut log_path = None;
-    if !opts.dry_run {
-        let plan_json = serde_json::to_string_pretty(&plan).context("Failed to serialize plan")?;
-        fs::write(plan_path, &plan_json).context("Failed to update plan file")?;
-
-        if let Some(mut log) = op_log {
-            log.complete();
-            let logs_dir = plan_path
-                .parent()
-                .and_then(|p| p.parent())
-                .map(|p| p.join("logs"))
-                .unwrap_or_else(|| PathBuf::from("objects/logs"));
-            log_path = Some(log.save(&logs_dir)?);
-        }
-    }
+    let log_path = persist_apply_run(plan, plan_path, opts.dry_run, op_log)?;
 
     Ok(ApplyOutcome {
         success_count,
@@ -254,6 +240,8 @@ pub fn apply_plan(
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
     use super::*;
     use crate::db::Database;
     use crate::plan::executor::delete_has_surviving_copy;
