@@ -2,6 +2,7 @@
 
 pub mod apply;
 pub(crate) mod archive_planning;
+pub(crate) mod collection_planning;
 pub(crate) mod collisions;
 pub(crate) mod coverage;
 pub(crate) mod desired_state;

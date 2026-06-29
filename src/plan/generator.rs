@@ -4,7 +4,11 @@ use anyhow::Result;
 use rusqlite::Connection;
 use std::collections::BTreeMap;
 
-use super::archive_planning::{ContainerDrain, emit_container_drains, plan_archive_matches};
+use super::Plan;
+use super::archive_planning::{ContainerDrain, emit_container_drains};
+use super::collection_planning::{
+    CollectionPlanningContext, CollectionPlanningOutcome, plan_collection,
+};
 use super::collisions::check_unique_destinations;
 #[cfg(test)]
 use super::collisions::find_destination_collisions;
@@ -12,29 +16,25 @@ pub use super::coverage::count_missing_roms;
 #[cfg(test)]
 use super::desired_state::compute_desired_state;
 #[cfg(test)]
-use super::destinations::build_dest_path;
-use super::destinations::resolve_dest_root;
+use super::destinations::{build_dest_path, resolve_dest_root};
 #[cfg(test)]
-use super::matching::count_expansion_capped;
-use super::matching::{
-    MatchedRom, compute_shared_containers, compute_shared_content, count_match_rows_capped,
-    find_matched_roms,
-};
-use super::placement_planning::{plan_disk_matches, plan_loose_matches};
+use super::matching::{MatchedRom, count_expansion_capped};
+use super::matching::{compute_shared_containers, compute_shared_content};
 use super::reporting;
-use super::rules::{
-    MAX_MATCH_ROWS, apply_one_g_one_r_filter, archive_extension, archive_format_tag,
-    effective_format, effective_merge_mode, glob_match,
-};
+use super::rules::glob_match;
 #[cfg(test)]
-use super::rules::{resolve_merge_mode, resolve_output_format};
+use super::rules::{
+    apply_one_g_one_r_filter, archive_extension, archive_format_tag, resolve_merge_mode,
+    resolve_output_format,
+};
 use super::source_policy::load_source_dispositions;
 pub use super::state_hash::compute_state_hash;
-use super::{CollectionPlanStat, Plan};
 use crate::config::{MergeMode, OutputFormat};
+use crate::db::collections;
 #[cfg(test)]
 use crate::db::files::{self, Disposition};
-use crate::db::{collections, config as db_config, dats};
+#[cfg(test)]
+use crate::db::{config as db_config, dats};
 
 /// Options controlling plan generation.
 #[derive(Debug, Clone, Default)]
@@ -122,6 +122,14 @@ pub fn generate_plan_filtered(conn: &Connection, opts: &PlanOptions) -> Result<P
     // the container before those destinations are deleted. `reason_dest` is just a
     // representative destination for the human-readable reason.
     let mut drain_after_repack: BTreeMap<String, ContainerDrain> = BTreeMap::new();
+    let collection_context = CollectionPlanningContext {
+        conn,
+        opts,
+        default_dest,
+        shared: &shared,
+        shared_containers: &shared_containers,
+        dispositions: &dispositions,
+    };
 
     for collection in &all_collections {
         if let Some(pattern) = dat_filter
@@ -131,174 +139,24 @@ pub fn generate_plan_filtered(conn: &Connection, opts: &PlanOptions) -> Result<P
         }
         filter_matched_any = true;
 
-        // Only collections with an active version can be planned.
-        let version = match collections::get_active_version(conn, collection.id)? {
-            Some(v) => v,
-            None => continue,
-        };
-
-        let cfg = db_config::get_collection_config(conn, &collection.name)?;
-
-        // The collection's library path (set by recursive `dat add`), used when
-        // falling back to the library-wide default destination.
-        let hierarchy =
-            dats::primary_node_path(conn, version.id)?.unwrap_or_else(|| collection.name.clone());
-
-        // Restrict to requested sets (the top segment of the library path), so a
-        // phase can target e.g. just TOSEC without the arcade sets. Checked
-        // before the match query so excluded collections cost nothing.
-        if let Some(sets) = opts.set_filter.as_ref() {
-            let set = hierarchy.split('/').next().unwrap_or(hierarchy.as_str());
-            if !sets.iter().any(|s| s == set) {
-                continue;
+        match plan_collection(
+            &collection_context,
+            collection,
+            &mut plan,
+            &mut drain_after_repack,
+        )? {
+            CollectionPlanningOutcome::NoActiveVersion
+            | CollectionPlanningOutcome::ExcludedBySet => {}
+            CollectionPlanningOutcome::SkippedNoDest(collection_name) => {
+                skipped_no_dest.push(collection_name);
+            }
+            CollectionPlanningOutcome::SkippedOversized(collection_name) => {
+                plan.skipped_oversized.push(collection_name);
+            }
+            CollectionPlanningOutcome::Planned => {
+                planned_any = true;
             }
         }
-
-        let explicit = cfg.as_ref().and_then(|c| c.dest_path.as_deref());
-
-        let dest_root = match resolve_dest_root(explicit, default_dest, &hierarchy)? {
-            Some(root) => root,
-            None => {
-                // No destination resolved — recorded and reported, never silent.
-                skipped_no_dest.push(collection.name.clone());
-                continue;
-            }
-        };
-
-        // Guard against pathological collections before materialising any
-        // matches: a MAME-style meta-aggregate expands to tens of millions of
-        // match-rows and would exhaust memory. Skip-and-report instead of OOM.
-        let match_rows = count_match_rows_capped(conn, version.id, MAX_MATCH_ROWS)?;
-        if match_rows > MAX_MATCH_ROWS {
-            reporting::oversized_collection(&collection.name);
-            plan.skipped_oversized.push(format!(
-                "{} (>{} match-rows)",
-                collection.name, MAX_MATCH_ROWS
-            ));
-            continue;
-        }
-
-        planned_any = true;
-        reporting::planning_collection(&collection.name, &version.version);
-
-        // Effective merge mode (explicit per-collection → per-set rule →
-        // library-wide default). Split mode drops a clone's inherited
-        // (merge-tagged) ROMs from its placement so they live only in the parent;
-        // non-merged places every ROM the DAT lists per game. Merged is not yet
-        // wired in the planner. Shared with `compute_desired_state`.
-        let merge_mode = effective_merge_mode(conn, opts, cfg.as_ref(), &hierarchy)?;
-        if merge_mode == MergeMode::Merged {
-            reporting::merged_mode_not_implemented(&collection.name);
-        }
-
-        // Find all matched ROMs for this version. In split mode, a clone's
-        // merge-tagged inherited ROMs are excluded here (they belong to the
-        // parent), so the clone is placed with only its own unique ROMs.
-        let matches = find_matched_roms(
-            conn,
-            version.id,
-            &collection.name,
-            merge_mode == MergeMode::Split,
-        )?;
-
-        // Apply 1G1R filtering if enabled for this collection.
-        let matches = match cfg.as_ref().and_then(|c| c.extra_config.as_ref()) {
-            Some(extra) if extra.one_g_one_r => {
-                let prefs = extra.to_filter_preferences();
-                let original_count = matches.len();
-                let filtered = apply_one_g_one_r_filter(&matches, &prefs);
-                if filtered.len() < original_count {
-                    reporting::one_g_one_r(original_count, filtered.len());
-                }
-                filtered
-            }
-            _ => matches,
-        };
-
-        // Effective output format (explicit per-collection → per-set rule →
-        // library-wide default). The per-set tier lets whole sets diverge — TOSEC
-        // kept as zip, TOSEC-PIX left loose for later PDF/collateral extraction —
-        // without configuring every collection. Loose copies each ROM into place;
-        // zip/torrentzip packs each game into one archive. Shared with
-        // `compute_desired_state`.
-        let format = effective_format(conn, opts, cfg.as_ref(), &hierarchy)?;
-
-        let mut already_correct = 0;
-        let mut to_write = 0;
-        let mut relocated = 0;
-        let mut deduped = 0;
-        let mut bytes = 0u64;
-
-        // CHDs (<disk> entries) are always stored loose in a machine folder
-        // (<dest>/<game>/<name>.chd) and never packed, even when the set's
-        // format is an archive — so plan them on their own path and run the
-        // format branch over the remaining <rom> entries only.
-        let (disk_matches, matches): (Vec<MatchedRom>, Vec<MatchedRom>) =
-            matches.into_iter().partition(|m| m.is_disk);
-
-        match archive_format_tag(format) {
-            None => {
-                let c = plan_loose_matches(
-                    matches,
-                    &dest_root,
-                    default_dest,
-                    &shared,
-                    &dispositions,
-                    &mut plan,
-                )?;
-                already_correct += c.already_correct;
-                to_write += c.to_write;
-                bytes += c.bytes;
-                deduped += c.deduped;
-                reporting::loose_summary(already_correct, to_write, deduped);
-            }
-            Some(tag) => {
-                let ext = archive_extension(tag);
-                let c = plan_archive_matches(
-                    matches,
-                    tag,
-                    ext,
-                    &dest_root,
-                    default_dest,
-                    &shared,
-                    &shared_containers,
-                    &dispositions,
-                    &mut plan,
-                    &mut drain_after_repack,
-                )?;
-                already_correct += c.already_correct;
-                relocated += c.relocated;
-                to_write += c.to_write;
-                bytes += c.bytes;
-                deduped += c.deduped;
-                reporting::archive_summary(already_correct, relocated, to_write, deduped);
-            }
-        }
-
-        // Plan any CHDs loose, regardless of the set's format. (Disk dedups are
-        // reported within the helper, like the other branches' own counts.)
-        if !disk_matches.is_empty() {
-            let d = plan_disk_matches(
-                disk_matches,
-                &dest_root,
-                opts,
-                &shared,
-                &dispositions,
-                &mut plan,
-            )?;
-            already_correct += d.already_correct;
-            to_write += d.to_write;
-            bytes += d.bytes;
-        }
-
-        plan.summary.already_correct += already_correct;
-        plan.per_collection.push(CollectionPlanStat {
-            name: collection.name.clone(),
-            node_path: hierarchy,
-            to_write,
-            already_correct,
-            bytes,
-        });
     }
 
     emit_container_drains(&mut plan, drain_after_repack);
