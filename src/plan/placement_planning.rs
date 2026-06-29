@@ -199,3 +199,40 @@ pub(crate) fn plan_disk_matches(
 
     Ok(counts)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn is_in_library_protects_destination_files_not_staging() {
+        let dd = Some("/lib/ROMs");
+        // Any file under the library root is a placement — protected, even one
+        // belonging to a different collection than the one being planned.
+        assert!(is_in_library(
+            "/lib/ROMs/MAME/g/r.bin",
+            dd,
+            "/lib/ROMs/FBNeo"
+        ));
+        assert!(is_in_library(
+            "/lib/ROMs/FBNeo/g/r.bin",
+            dd,
+            "/lib/ROMs/FBNeo"
+        ));
+        // A staging copy outside every destination root is still removable.
+        assert!(!is_in_library(
+            "/Volumes/ToSort/x.zip",
+            dd,
+            "/lib/ROMs/FBNeo"
+        ));
+        // With no library-wide default, the collection's own dest_root still
+        // protects its placements.
+        assert!(is_in_library(
+            "/lib/ROMs/FBNeo/g/r.bin",
+            None,
+            "/lib/ROMs/FBNeo"
+        ));
+        // A sibling path that merely shares a prefix is not "under" the root.
+        assert!(!is_in_library("/lib/ROMs2/x", dd, "/lib/ROMs/FBNeo"));
+    }
+}

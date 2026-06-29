@@ -238,3 +238,46 @@ pub(crate) fn plan_archive_matches(
 
     Ok(counts)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn is_relocatable_archive_requires_matching_archive_format() {
+        let archived = |path: &str| MatchedRom {
+            game_name: "G".into(),
+            rom_name: "r".into(),
+            sha1: "AAA".into(),
+            size: 1,
+            source_root: "/s".into(),
+            source_path: path.into(),
+            archive_path: Some("r".into()),
+            is_disk: false,
+        };
+        let loose = |path: &str| MatchedRom {
+            archive_path: None,
+            ..archived(path)
+        };
+        // A real .zip whose entries are archived -> relocatable.
+        assert!(is_relocatable_archive(
+            &[archived("Game.zip")],
+            "/s/Game.zip",
+            "zip"
+        ));
+        // A loose ROM (no archive_path) -> must be repacked.
+        assert!(!is_relocatable_archive(
+            &[loose("game.tap")],
+            "/s/game.tap",
+            "zip"
+        ));
+        // An archive in a different format (.7z into a zip set) -> repack.
+        assert!(!is_relocatable_archive(
+            &[archived("Game.7z")],
+            "/s/Game.7z",
+            "zip"
+        ));
+        // No entries -> not relocatable.
+        assert!(!is_relocatable_archive(&[], "/s/Game.zip", "zip"));
+    }
+}

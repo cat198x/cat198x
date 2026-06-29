@@ -5,8 +5,6 @@ use rusqlite::Connection;
 use sha2::{Digest as Sha2Digest, Sha256};
 use std::collections::{BTreeMap, HashMap, HashSet};
 
-#[cfg(test)]
-use super::archive_planning::is_relocatable_archive;
 use super::archive_planning::{ContainerDrain, plan_archive_matches};
 use super::collisions::check_unique_destinations;
 #[cfg(test)]
@@ -22,8 +20,6 @@ use super::matching::{
     MatchedRom, compute_shared_containers, compute_shared_content, count_match_rows_capped,
     find_matched_roms,
 };
-#[cfg(test)]
-use super::placement_planning::is_in_library;
 use super::placement_planning::{plan_disk_matches, plan_loose_matches};
 use super::rules::{
     MAX_MATCH_ROWS, apply_one_g_one_r_filter, archive_extension, archive_format_tag,
@@ -757,38 +753,6 @@ mod tests {
             resolve_dest_root(Some("/explicit/here"), Some("/lib"), "Acorn/BBC").unwrap(),
             Some("/explicit/here".to_string())
         );
-    }
-
-    #[test]
-    fn is_in_library_protects_destination_files_not_staging() {
-        let dd = Some("/lib/ROMs");
-        // Any file under the library root is a placement — protected, even one
-        // belonging to a different collection than the one being planned.
-        assert!(is_in_library(
-            "/lib/ROMs/MAME/g/r.bin",
-            dd,
-            "/lib/ROMs/FBNeo"
-        ));
-        assert!(is_in_library(
-            "/lib/ROMs/FBNeo/g/r.bin",
-            dd,
-            "/lib/ROMs/FBNeo"
-        ));
-        // A staging copy outside every destination root is still removable.
-        assert!(!is_in_library(
-            "/Volumes/ToSort/x.zip",
-            dd,
-            "/lib/ROMs/FBNeo"
-        ));
-        // With no library-wide default, the collection's own dest_root still
-        // protects its placements.
-        assert!(is_in_library(
-            "/lib/ROMs/FBNeo/g/r.bin",
-            None,
-            "/lib/ROMs/FBNeo"
-        ));
-        // A sibling path that merely shares a prefix is not "under" the root.
-        assert!(!is_in_library("/lib/ROMs2/x", dd, "/lib/ROMs/FBNeo"));
     }
 
     #[test]
@@ -2060,44 +2024,6 @@ mod tests {
             _ => None,
         });
         assert_eq!(dest.as_deref(), Some("/lib/ROMs/SET/Sys/Game.zip"));
-    }
-
-    #[test]
-    fn is_relocatable_archive_requires_matching_archive_format() {
-        let archived = |path: &str| MatchedRom {
-            game_name: "G".into(),
-            rom_name: "r".into(),
-            sha1: "AAA".into(),
-            size: 1,
-            source_root: "/s".into(),
-            source_path: path.into(),
-            archive_path: Some("r".into()),
-            is_disk: false,
-        };
-        let loose = |path: &str| MatchedRom {
-            archive_path: None,
-            ..archived(path)
-        };
-        // A real .zip whose entries are archived → relocatable.
-        assert!(is_relocatable_archive(
-            &[archived("Game.zip")],
-            "/s/Game.zip",
-            "zip"
-        ));
-        // A loose ROM (no archive_path) → must be repacked.
-        assert!(!is_relocatable_archive(
-            &[loose("game.tap")],
-            "/s/game.tap",
-            "zip"
-        ));
-        // An archive in a different format (.7z into a zip set) → repack.
-        assert!(!is_relocatable_archive(
-            &[archived("Game.7z")],
-            "/s/Game.7z",
-            "zip"
-        ));
-        // No entries → not relocatable.
-        assert!(!is_relocatable_archive(&[], "/s/Game.zip", "zip"));
     }
 
     #[test]
