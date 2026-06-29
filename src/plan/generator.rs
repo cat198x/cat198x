@@ -2,7 +2,7 @@
 
 use anyhow::Result;
 use rusqlite::Connection;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use super::Plan;
 use super::archive_planning::{ContainerDrain, emit_container_drains};
@@ -18,6 +18,7 @@ use super::source_policy::load_source_dispositions;
 pub use super::state_hash::compute_state_hash;
 use crate::config::{MergeMode, OutputFormat};
 use crate::db::collections;
+use crate::db::files::Disposition;
 
 /// Options controlling plan generation.
 #[derive(Debug, Clone, Default)]
@@ -48,6 +49,35 @@ struct PlanningRun {
     skipped_no_dest: Vec<String>,
 }
 
+struct PlanningSetup {
+    plan: Plan,
+    inputs: PlanningInputs,
+}
+
+struct PlanningInputs {
+    shared: HashSet<String>,
+    shared_containers: HashSet<String>,
+    dispositions: HashMap<String, Disposition>,
+    all_collections: Vec<collections::Collection>,
+}
+
+impl PlanningInputs {
+    fn collection_context<'a>(
+        &'a self,
+        conn: &'a Connection,
+        opts: &'a PlanOptions,
+    ) -> CollectionPlanningContext<'a> {
+        CollectionPlanningContext {
+            conn,
+            opts,
+            default_dest: opts.default_dest.as_deref(),
+            shared: &self.shared,
+            shared_containers: &self.shared_containers,
+            dispositions: &self.dispositions,
+        }
+    }
+}
+
 /// Generate a plan for all configured collections with default options.
 pub fn generate_plan(conn: &Connection) -> Result<Plan> {
     generate_plan_filtered(conn, &PlanOptions::default())
@@ -58,11 +88,52 @@ pub fn generate_plan(conn: &Connection) -> Result<Plan> {
 /// `dat_filter` supports glob patterns (`*`, `?`, case-insensitive) over
 /// collection names.
 pub fn generate_plan_filtered(conn: &Connection, opts: &PlanOptions) -> Result<Plan> {
-    let default_dest = opts.default_dest.as_deref();
+    let PlanningSetup { mut plan, inputs } = prepare_plan_generation(conn, opts)?;
 
-    // Calculate state hash
+    // Source containers a repack rebuilt from and that are safe to lose afterwards
+    // — recorded here and emitted as deletes *after* every repack, so the apply
+    // runs the rebuilds first and the verify-before-delete net sees each entry
+    // surviving at its destination before removing the container. Draining these
+    // is what lets `consume` staging empty for recompressed archive sets (a shared
+    // .cue/.sub forces a rebuild over a whole-file relocate). Safety rests on the
+    // net, not a plan-time guess: a container still needed elsewhere is refused,
+    // sticky.
+    //
+    // Keyed by container path so a container feeding several games is drained
+    // once; the accumulated `entries` gather, across those games, where each of
+    // the container's entries was repacked to — the rollback spec that rebuilds
+    // the container before those destinations are deleted. `reason_dest` is just a
+    // representative destination for the human-readable reason.
+    let mut drain_after_repack: BTreeMap<String, ContainerDrain> = BTreeMap::new();
+    let collection_context = inputs.collection_context(conn, opts);
+
+    let PlanningRun {
+        planned_any,
+        filter_matched_any,
+        skipped_no_dest,
+    } = plan_collections(
+        &collection_context,
+        &inputs.all_collections,
+        &mut plan,
+        &mut drain_after_repack,
+    )?;
+
+    emit_container_drains(&mut plan, drain_after_repack);
+
+    reporting::plan_completion(
+        opts.dat_filter.as_deref(),
+        planned_any,
+        filter_matched_any,
+        skipped_no_dest.len(),
+        plan.skipped_oversized.len(),
+    );
+    plan.skipped_no_dest = skipped_no_dest;
+    Ok(plan)
+}
+
+fn prepare_plan_generation(conn: &Connection, opts: &PlanOptions) -> Result<PlanningSetup> {
     let state_hash = compute_state_hash(conn)?;
-    let mut plan = Plan::new(state_hash);
+    let plan = Plan::new(state_hash);
 
     // Content shared across distinct entries is copied to each destination, never
     // moved or deleted (see compute_shared_content). Computed once up front.
@@ -92,52 +163,15 @@ pub fn generate_plan_filtered(conn: &Connection, opts: &PlanOptions) -> Result<P
     // silently overwrite each other's same-named games.
     check_unique_destinations(conn, opts, &all_collections)?;
 
-    // Source containers a repack rebuilt from and that are safe to lose afterwards
-    // — recorded here and emitted as deletes *after* every repack, so the apply
-    // runs the rebuilds first and the verify-before-delete net sees each entry
-    // surviving at its destination before removing the container. Draining these
-    // is what lets `consume` staging empty for recompressed archive sets (a shared
-    // .cue/.sub forces a rebuild over a whole-file relocate). Safety rests on the
-    // net, not a plan-time guess: a container still needed elsewhere is refused,
-    // sticky.
-    //
-    // Keyed by container path so a container feeding several games is drained
-    // once; the accumulated `entries` gather, across those games, where each of
-    // the container's entries was repacked to — the rollback spec that rebuilds
-    // the container before those destinations are deleted. `reason_dest` is just a
-    // representative destination for the human-readable reason.
-    let mut drain_after_repack: BTreeMap<String, ContainerDrain> = BTreeMap::new();
-    let collection_context = CollectionPlanningContext {
-        conn,
-        opts,
-        default_dest,
-        shared: &shared,
-        shared_containers: &shared_containers,
-        dispositions: &dispositions,
-    };
-
-    let PlanningRun {
-        planned_any,
-        filter_matched_any,
-        skipped_no_dest,
-    } = plan_collections(
-        &collection_context,
-        &all_collections,
-        &mut plan,
-        &mut drain_after_repack,
-    )?;
-
-    emit_container_drains(&mut plan, drain_after_repack);
-
-    reporting::plan_completion(
-        opts.dat_filter.as_deref(),
-        planned_any,
-        filter_matched_any,
-        skipped_no_dest.len(),
-        plan.skipped_oversized.len(),
-    );
-    plan.skipped_no_dest = skipped_no_dest;
-    Ok(plan)
+    Ok(PlanningSetup {
+        plan,
+        inputs: PlanningInputs {
+            shared,
+            shared_containers,
+            dispositions,
+            all_collections,
+        },
+    })
 }
 
 fn plan_collections(
