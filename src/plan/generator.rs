@@ -21,6 +21,7 @@ use super::matching::{
     find_matched_roms,
 };
 use super::placement_planning::{plan_disk_matches, plan_loose_matches};
+use super::reporting;
 use super::rules::{
     MAX_MATCH_ROWS, apply_one_g_one_r_filter, archive_extension, archive_format_tag,
     effective_format, effective_merge_mode, glob_match,
@@ -78,20 +79,14 @@ pub fn generate_plan_filtered(conn: &Connection, opts: &PlanOptions) -> Result<P
     // moved or deleted (see compute_shared_content). Computed once up front.
     let shared = compute_shared_content(conn)?;
     if !shared.is_empty() {
-        println!(
-            "{} shared content(s) span multiple entries — copied to each, not moved.",
-            shared.len()
-        );
+        reporting::shared_content(shared.len());
     }
 
     // Containers (archive files) whose entries serve more than one game must not
     // be relocated whole or deleted — each game repacks its own entries instead.
     let shared_containers = compute_shared_containers(conn)?;
     if !shared_containers.is_empty() {
-        println!(
-            "{} container(s) source multiple games — repacked per game, not relocated.",
-            shared_containers.len()
-        );
+        reporting::shared_containers(shared_containers.len());
     }
 
     // Each source's disposition decides, per operation, whether content is moved
@@ -175,11 +170,7 @@ pub fn generate_plan_filtered(conn: &Connection, opts: &PlanOptions) -> Result<P
         // match-rows and would exhaust memory. Skip-and-report instead of OOM.
         let match_rows = count_match_rows_capped(conn, version.id, MAX_MATCH_ROWS)?;
         if match_rows > MAX_MATCH_ROWS {
-            println!(
-                "Skipping {} — match expansion exceeds the {}-row memory cap \
-                 (a meta-aggregate, not a placeable romset).",
-                collection.name, MAX_MATCH_ROWS
-            );
+            reporting::oversized_collection(&collection.name);
             plan.skipped_oversized.push(format!(
                 "{} (>{} match-rows)",
                 collection.name, MAX_MATCH_ROWS
@@ -188,7 +179,7 @@ pub fn generate_plan_filtered(conn: &Connection, opts: &PlanOptions) -> Result<P
         }
 
         planned_any = true;
-        println!("Planning for: {} (v{})", collection.name, version.version);
+        reporting::planning_collection(&collection.name, &version.version);
 
         // Effective merge mode (explicit per-collection → per-set rule →
         // library-wide default). Split mode drops a clone's inherited
@@ -197,11 +188,7 @@ pub fn generate_plan_filtered(conn: &Connection, opts: &PlanOptions) -> Result<P
         // wired in the planner. Shared with `compute_desired_state`.
         let merge_mode = effective_merge_mode(conn, opts, cfg.as_ref(), &hierarchy)?;
         if merge_mode == MergeMode::Merged {
-            println!(
-                "  note: merged mode is not yet implemented in the planner; \
-                 planning {} as non-merged.",
-                collection.name
-            );
+            reporting::merged_mode_not_implemented(&collection.name);
         }
 
         // Find all matched ROMs for this version. In split mode, a clone's
@@ -221,12 +208,7 @@ pub fn generate_plan_filtered(conn: &Connection, opts: &PlanOptions) -> Result<P
                 let original_count = matches.len();
                 let filtered = apply_one_g_one_r_filter(&matches, &prefs);
                 if filtered.len() < original_count {
-                    println!(
-                        "  1G1R: {} -> {} ROMs (filtered {} variants)",
-                        original_count,
-                        filtered.len(),
-                        original_count - filtered.len()
-                    );
+                    reporting::one_g_one_r(original_count, filtered.len());
                 }
                 filtered
             }
@@ -268,10 +250,7 @@ pub fn generate_plan_filtered(conn: &Connection, opts: &PlanOptions) -> Result<P
                 to_write += c.to_write;
                 bytes += c.bytes;
                 deduped += c.deduped;
-                println!(
-                    "  {} already correct, {} to place, {} duplicate(s) to delete",
-                    already_correct, to_write, deduped
-                );
+                reporting::loose_summary(already_correct, to_write, deduped);
             }
             Some(tag) => {
                 let ext = archive_extension(tag);
@@ -292,10 +271,7 @@ pub fn generate_plan_filtered(conn: &Connection, opts: &PlanOptions) -> Result<P
                 to_write += c.to_write;
                 bytes += c.bytes;
                 deduped += c.deduped;
-                println!(
-                    "  {} ROMs already archived, {} to relocate, {} archive(s) to build, {} duplicate(s) to delete",
-                    already_correct, relocated, to_write, deduped
-                );
+                reporting::archive_summary(already_correct, relocated, to_write, deduped);
             }
         }
 
@@ -331,33 +307,22 @@ pub fn generate_plan_filtered(conn: &Connection, opts: &PlanOptions) -> Result<P
     // could be resolved, and how to include them. The full list rides on the
     // plan so the caller can write it out for review.
     if !skipped_no_dest.is_empty() {
-        println!();
-        println!(
-            "{} collection(s) skipped — no destination resolved.",
-            skipped_no_dest.len()
-        );
-        println!("  Set one per collection:  cat198x config set <collection> dest_path <path>");
-        println!("  or library-wide:         cat198x config set-default dest_path <path>");
+        reporting::skipped_no_dest(skipped_no_dest.len());
     }
 
     // Report collections left out because their match expansion is too large to
     // plan safely (a meta-aggregate, not a romset). Already named individually
     // above as they were hit; this is the rollup.
     if !plan.skipped_oversized.is_empty() {
-        println!();
-        println!(
-            "{} collection(s) skipped — match expansion over the {}-row memory cap.",
-            plan.skipped_oversized.len(),
-            MAX_MATCH_ROWS
-        );
+        reporting::skipped_oversized_rollup(plan.skipped_oversized.len());
     }
 
     if let Some(pattern) = dat_filter
         && !filter_matched_any
     {
-        println!("No collections match the filter: {}", pattern);
+        reporting::no_matching_filter(pattern);
     } else if !planned_any && skipped_no_dest.is_empty() && plan.skipped_oversized.is_empty() {
-        println!("No collections with an active version to plan.");
+        reporting::no_active_collections();
     }
 
     plan.skipped_no_dest = skipped_no_dest;

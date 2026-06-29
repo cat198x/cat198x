@@ -4,6 +4,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use super::destinations::{build_dest_path, build_disk_dest_path};
 use super::generator::PlanOptions;
 use super::matching::MatchedRom;
+use super::reporting;
 use super::source_policy::{dedup_reason, is_in_library, may_delete, may_move};
 use super::{Plan, SourceRef};
 use crate::db::files::Disposition;
@@ -137,10 +138,7 @@ pub(crate) fn plan_disk_matches(
         plan,
     )?;
 
-    println!(
-        "  {} CHD(s) already correct, {} to place, {} duplicate(s) to delete",
-        counts.already_correct, counts.to_write, counts.deduped
-    );
+    reporting::disk_summary(counts.already_correct, counts.to_write, counts.deduped);
 
     Ok(counts)
 }
