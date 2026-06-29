@@ -1,6 +1,7 @@
 use rusqlite::Connection;
 
-use super::{ApplyEvent, OpView, sync_catalogue_after};
+use super::catalogue::sync_catalogue_after;
+use super::{ApplyEvent, OpView};
 use crate::db::files::Source;
 use crate::plan::executor::{
     PlacementEvent, PlacementJob, PlacementKind, PlacementOutcome, RepackEvent, RepackJob,
