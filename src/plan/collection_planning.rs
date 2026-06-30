@@ -3,15 +3,15 @@ use rusqlite::Connection;
 use std::collections::{HashMap, HashSet};
 
 use super::archive_planning::{ArchivePlanInputs, ArchivePlanSinks, plan_archive_matches};
+use super::collection_matches::{CollectionMatchInputs, load_collection_matches};
 use super::collection_scope::{ScopedCollectionResolution, resolve_scoped_collection};
 use super::container_drains::ContainerDrains;
-use super::matching::{MatchedRom, count_match_rows_capped, find_matched_roms};
+use super::matching::{MatchedRom, count_match_rows_capped};
 use super::options::PlanOptions;
 use super::placement_planning::{PlacementPlanCounts, plan_disk_matches, plan_loose_matches};
 use super::reporting;
 use super::rules::{
-    MAX_MATCH_ROWS, apply_one_g_one_r_filter, archive_extension, archive_format_tag,
-    effective_format, effective_merge_mode,
+    MAX_MATCH_ROWS, archive_extension, archive_format_tag, effective_format, effective_merge_mode,
 };
 use super::{CollectionPlanStat, Plan};
 use crate::config::{MergeMode, OutputFormat};
@@ -157,20 +157,23 @@ fn prepare_collection_plan(
 
     let merge_mode =
         collection_merge_mode(ctx, scoped.cfg.as_ref(), &scoped.hierarchy, &scoped.name)?;
-    let matches = collection_matches(
-        ctx,
-        scoped.version.id,
-        &scoped.name,
+    let matches = load_collection_matches(CollectionMatchInputs {
+        conn: ctx.conn,
+        version_id: scoped.version.id,
+        collection_name: &scoped.name,
         merge_mode,
-        scoped.cfg.as_ref(),
-    )?;
+        cfg: scoped.cfg.as_ref(),
+    })?;
+    if matches.matches.len() < matches.original_count {
+        reporting::one_g_one_r(matches.original_count, matches.matches.len());
+    }
     let format = collection_format(ctx, scoped.cfg.as_ref(), &scoped.hierarchy)?;
 
     Ok(CollectionPlanPreparation::Ready(PreparedCollectionPlan {
         name: scoped.name,
         hierarchy: scoped.hierarchy,
         dest_root,
-        matches,
+        matches: matches.matches,
         format,
     }))
 }
@@ -210,47 +213,6 @@ fn collection_merge_mode(
         reporting::merged_mode_not_implemented(collection_name);
     }
     Ok(merge_mode)
-}
-
-fn collection_matches(
-    ctx: &CollectionPlanningContext<'_>,
-    version_id: i64,
-    collection_name: &str,
-    merge_mode: MergeMode,
-    cfg: Option<&db_config::CollectionConfig>,
-) -> Result<Vec<MatchedRom>> {
-    // Find all matched ROMs for this version. In split mode, a clone's
-    // merge-tagged inherited ROMs are excluded here (they belong to the parent),
-    // so the clone is placed with only its own unique ROMs.
-    let matches = find_matched_roms(
-        ctx.conn,
-        version_id,
-        collection_name,
-        merge_mode == MergeMode::Split,
-    )?;
-
-    Ok(apply_collection_filter(matches, cfg))
-}
-
-fn apply_collection_filter(
-    matches: Vec<MatchedRom>,
-    cfg: Option<&db_config::CollectionConfig>,
-) -> Vec<MatchedRom> {
-    let Some(extra) = cfg.and_then(|c| c.extra_config.as_ref()) else {
-        return matches;
-    };
-
-    if !extra.one_g_one_r {
-        return matches;
-    }
-
-    let prefs = extra.to_filter_preferences();
-    let original_count = matches.len();
-    let filtered = apply_one_g_one_r_filter(&matches, &prefs);
-    if filtered.len() < original_count {
-        reporting::one_g_one_r(original_count, filtered.len());
-    }
-    filtered
 }
 
 fn collection_format(

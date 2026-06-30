@@ -2,16 +2,16 @@ use anyhow::Result;
 use rusqlite::Connection;
 use std::collections::{BTreeMap, HashMap, HashSet};
 
+use super::collection_matches::{CollectionMatchInputs, load_collection_matches};
 use super::collection_scope::{ScopedCollectionResolution, resolve_scoped_collection};
 use super::destinations::{build_archive_dest_path, build_dest_path, build_disk_dest_path};
-use super::matching::{MatchedRom, count_match_rows_capped, find_matched_roms};
+use super::matching::{MatchedRom, count_match_rows_capped};
 use super::options::PlanOptions;
 use super::rules::{
-    MAX_MATCH_ROWS, apply_one_g_one_r_filter, archive_extension, archive_format_tag,
-    effective_format, effective_merge_mode,
+    MAX_MATCH_ROWS, archive_extension, archive_format_tag, effective_format, effective_merge_mode,
 };
 use super::scope::collection_name_matches;
-use crate::config::{MergeMode, OutputFormat};
+use crate::config::OutputFormat;
 use crate::db::collections;
 
 /// The library's desired state, derived from the active DATs exactly as the
@@ -78,22 +78,17 @@ pub fn compute_desired_state(
         }
 
         let merge_mode = effective_merge_mode(conn, opts, scoped.cfg.as_ref(), &scoped.hierarchy)?;
-        let matches = find_matched_roms(
+        let matches = load_collection_matches(CollectionMatchInputs {
             conn,
-            scoped.version.id,
-            &scoped.name,
-            merge_mode == MergeMode::Split,
-        )?;
-        let matches = match scoped.cfg.as_ref().and_then(|c| c.extra_config.as_ref()) {
-            Some(extra) if extra.one_g_one_r => {
-                apply_one_g_one_r_filter(&matches, &extra.to_filter_preferences())
-            }
-            _ => matches,
-        };
+            version_id: scoped.version.id,
+            collection_name: &scoped.name,
+            merge_mode,
+            cfg: scoped.cfg.as_ref(),
+        })?;
         record_collection_desired_state(
             &mut state,
             &dest_root,
-            matches,
+            matches.matches,
             effective_format(conn, opts, scoped.cfg.as_ref(), &scoped.hierarchy)?,
             interesting_sha1s,
         )?;
@@ -204,6 +199,7 @@ fn record_loose_destinations(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::MergeMode;
     use crate::config::OutputFormat;
     use crate::db::Database;
     use crate::db::dats;
