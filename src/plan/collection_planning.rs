@@ -35,6 +35,19 @@ pub(crate) enum CollectionPlanningOutcome {
     Planned,
 }
 
+enum CollectionPlanPreparation {
+    Ready(PreparedCollectionPlan),
+    Skipped(CollectionPlanningOutcome),
+}
+
+struct PreparedCollectionPlan {
+    name: String,
+    hierarchy: String,
+    dest_root: String,
+    matches: Vec<MatchedRom>,
+    format: OutputFormat,
+}
+
 #[derive(Default)]
 struct CollectionPlanAccumulator {
     already_correct: usize,
@@ -84,10 +97,41 @@ pub(crate) fn plan_collection(
     plan: &mut Plan,
     container_drains: &mut ContainerDrains,
 ) -> Result<CollectionPlanningOutcome> {
+    let prepared = match prepare_collection_plan(ctx, collection)? {
+        CollectionPlanPreparation::Ready(prepared) => prepared,
+        CollectionPlanPreparation::Skipped(outcome) => return Ok(outcome),
+    };
+
+    // CHDs (<disk> entries) are always stored loose in a machine folder
+    // (<dest>/<game>/<name>.chd) and never packed, even when the set's format is
+    // an archive — so plan them on their own path and run the format branch over
+    // the remaining <rom> entries only.
+    let acc = plan_collection_matches(
+        ctx,
+        prepared.matches,
+        prepared.format,
+        &prepared.dest_root,
+        plan,
+        container_drains,
+    )?;
+
+    acc.record_on_plan(plan, prepared.name, prepared.hierarchy);
+
+    Ok(CollectionPlanningOutcome::Planned)
+}
+
+fn prepare_collection_plan(
+    ctx: &CollectionPlanningContext<'_>,
+    collection: &collections::Collection,
+) -> Result<CollectionPlanPreparation> {
     // Only collections with an active version can be planned.
     let version = match collections::get_active_version(ctx.conn, collection.id)? {
         Some(v) => v,
-        None => return Ok(CollectionPlanningOutcome::NoActiveVersion),
+        None => {
+            return Ok(CollectionPlanPreparation::Skipped(
+                CollectionPlanningOutcome::NoActiveVersion,
+            ));
+        }
     };
 
     let cfg = db_config::get_collection_config(ctx.conn, &collection.name)?;
@@ -103,7 +147,9 @@ pub(crate) fn plan_collection(
     if let Some(sets) = ctx.opts.set_filter.as_ref() {
         let set = hierarchy.split('/').next().unwrap_or(hierarchy.as_str());
         if !sets.iter().any(|s| s == set) {
-            return Ok(CollectionPlanningOutcome::ExcludedBySet);
+            return Ok(CollectionPlanPreparation::Skipped(
+                CollectionPlanningOutcome::ExcludedBySet,
+            ));
         }
     }
 
@@ -113,8 +159,8 @@ pub(crate) fn plan_collection(
         Some(root) => root,
         None => {
             // No destination resolved — recorded and reported, never silent.
-            return Ok(CollectionPlanningOutcome::SkippedNoDest(
-                collection.name.clone(),
+            return Ok(CollectionPlanPreparation::Skipped(
+                CollectionPlanningOutcome::SkippedNoDest(collection.name.clone()),
             ));
         }
     };
@@ -125,10 +171,12 @@ pub(crate) fn plan_collection(
     let match_rows = count_match_rows_capped(ctx.conn, version.id, MAX_MATCH_ROWS)?;
     if match_rows > MAX_MATCH_ROWS {
         reporting::oversized_collection(&collection.name);
-        return Ok(CollectionPlanningOutcome::SkippedOversized(format!(
-            "{} (>{} match-rows)",
-            collection.name, MAX_MATCH_ROWS
-        )));
+        return Ok(CollectionPlanPreparation::Skipped(
+            CollectionPlanningOutcome::SkippedOversized(format!(
+                "{} (>{} match-rows)",
+                collection.name, MAX_MATCH_ROWS
+            )),
+        ));
     }
 
     reporting::planning_collection(&collection.name, &version.version);
@@ -175,15 +223,13 @@ pub(crate) fn plan_collection(
     // `compute_desired_state`.
     let format = effective_format(ctx.conn, ctx.opts, cfg.as_ref(), &hierarchy)?;
 
-    // CHDs (<disk> entries) are always stored loose in a machine folder
-    // (<dest>/<game>/<name>.chd) and never packed, even when the set's format is
-    // an archive — so plan them on their own path and run the format branch over
-    // the remaining <rom> entries only.
-    let acc = plan_collection_matches(ctx, matches, format, &dest_root, plan, container_drains)?;
-
-    acc.record_on_plan(plan, collection.name.clone(), hierarchy);
-
-    Ok(CollectionPlanningOutcome::Planned)
+    Ok(CollectionPlanPreparation::Ready(PreparedCollectionPlan {
+        name: collection.name.clone(),
+        hierarchy,
+        dest_root,
+        matches,
+        format,
+    }))
 }
 
 fn plan_collection_matches(
