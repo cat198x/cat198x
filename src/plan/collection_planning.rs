@@ -15,7 +15,7 @@ use super::rules::{
     effective_format, effective_merge_mode,
 };
 use super::{CollectionPlanStat, Plan};
-use crate::config::MergeMode;
+use crate::config::{MergeMode, OutputFormat};
 use crate::db::files::Disposition;
 use crate::db::{collections, config as db_config, dats};
 
@@ -176,12 +176,27 @@ pub(crate) fn plan_collection(
     // `compute_desired_state`.
     let format = effective_format(ctx.conn, ctx.opts, cfg.as_ref(), &hierarchy)?;
 
-    let mut acc = CollectionPlanAccumulator::default();
-
     // CHDs (<disk> entries) are always stored loose in a machine folder
     // (<dest>/<game>/<name>.chd) and never packed, even when the set's format is
     // an archive — so plan them on their own path and run the format branch over
     // the remaining <rom> entries only.
+    let acc = plan_collection_matches(ctx, matches, format, &dest_root, plan, container_drains)?;
+
+    acc.record_on_plan(plan, collection.name.clone(), hierarchy);
+
+    Ok(CollectionPlanningOutcome::Planned)
+}
+
+fn plan_collection_matches(
+    ctx: &CollectionPlanningContext<'_>,
+    matches: Vec<MatchedRom>,
+    format: OutputFormat,
+    dest_root: &str,
+    plan: &mut Plan,
+    container_drains: &mut ContainerDrains,
+) -> Result<CollectionPlanAccumulator> {
+    let mut acc = CollectionPlanAccumulator::default();
+
     let (disk_matches, matches): (Vec<MatchedRom>, Vec<MatchedRom>) =
         matches.into_iter().partition(|m| m.is_disk);
 
@@ -189,7 +204,7 @@ pub(crate) fn plan_collection(
         None => {
             let c = plan_loose_matches(
                 matches,
-                &dest_root,
+                dest_root,
                 ctx.default_dest,
                 ctx.shared,
                 ctx.dispositions,
@@ -205,7 +220,7 @@ pub(crate) fn plan_collection(
                 ArchivePlanInputs {
                     tag,
                     ext,
-                    dest_root: &dest_root,
+                    dest_root,
                     default_dest: ctx.default_dest,
                     shared: ctx.shared,
                     shared_containers: ctx.shared_containers,
@@ -226,12 +241,12 @@ pub(crate) fn plan_collection(
         }
     }
 
-    // Plan any CHDs loose, regardless of the set's format. (Disk dedups are
-    // reported within the helper, like the other branches' own counts.)
+    // Plan any CHDs loose, regardless of the set's format. Disk dedups are
+    // reported within the helper, like the other branches' own counts.
     if !disk_matches.is_empty() {
         let d = plan_disk_matches(
             disk_matches,
-            &dest_root,
+            dest_root,
             ctx.opts,
             ctx.shared,
             ctx.dispositions,
@@ -240,7 +255,5 @@ pub(crate) fn plan_collection(
         acc.add_disk(d);
     }
 
-    acc.record_on_plan(plan, collection.name.clone(), hierarchy);
-
-    Ok(CollectionPlanningOutcome::Planned)
+    Ok(acc)
 }
