@@ -3,6 +3,8 @@
 //! The quarantine is a holding area for files that are no longer needed
 //! at their current location but shouldn't be immediately deleted.
 
+mod status;
+
 use anyhow::Result;
 use std::fs;
 use std::io::{self, Write};
@@ -10,6 +12,7 @@ use std::path::PathBuf;
 
 use crate::cli::args::QuarantineCommands;
 use crate::db::quarantine as db_quarantine;
+use crate::util::format_bytes;
 
 use super::open_database;
 
@@ -19,7 +22,7 @@ pub fn run(cmd: QuarantineCommands, data_dir: Option<PathBuf>) -> Result<()> {
         QuarantineCommands::Status {
             collection,
             detailed,
-        } => run_status(collection, detailed, data_dir),
+        } => status::run(collection, detailed, data_dir),
         QuarantineCommands::Prune { collection, yes } => run_prune(collection, yes, data_dir),
         QuarantineCommands::Restore {
             collection,
@@ -27,80 +30,6 @@ pub fn run(cmd: QuarantineCommands, data_dir: Option<PathBuf>) -> Result<()> {
             yes,
         } => run_restore(collection, target, yes, data_dir),
     }
-}
-
-/// Show quarantine status and contents
-fn run_status(collection: Option<String>, detailed: bool, data_dir: Option<PathBuf>) -> Result<()> {
-    let db = open_database(data_dir.clone())?;
-    let conn = db.conn();
-
-    let entries = if let Some(ref pattern) = collection {
-        db_quarantine::list_entries_by_collection(conn, pattern)?
-    } else {
-        db_quarantine::list_entries(conn)?
-    };
-
-    if entries.is_empty() {
-        println!("Quarantine is empty.");
-        return Ok(());
-    }
-
-    let total_size = db_quarantine::total_size(conn)?;
-    let count = entries.len();
-
-    println!(
-        "Quarantine: {} files, {}",
-        count,
-        format_bytes(total_size as u64)
-    );
-    println!();
-
-    // Show summary by collection
-    let by_collection = db_quarantine::summary_by_collection(conn)?;
-    if by_collection.len() > 1 || by_collection.iter().any(|(c, _, _)| c.is_some()) {
-        println!("By collection:");
-        for (coll, cnt, size) in &by_collection {
-            let name = coll.as_deref().unwrap_or("(unknown)");
-            println!(
-                "  {} ··· {} files, {}",
-                name,
-                cnt,
-                format_bytes(*size as u64)
-            );
-        }
-        println!();
-    }
-
-    // Show summary by reason
-    let by_reason = db_quarantine::summary_by_reason(conn)?;
-    println!("By reason:");
-    for (reason, cnt, size) in &by_reason {
-        println!(
-            "  {} ··· {} files, {}",
-            reason.description(),
-            cnt,
-            format_bytes(*size as u64)
-        );
-    }
-
-    if detailed {
-        println!();
-        println!("Files:");
-        for entry in &entries {
-            println!(
-                "  {} ({}) - {}",
-                truncate_path(&entry.original_path, 50),
-                format_bytes(entry.size as u64),
-                entry.reason.description()
-            );
-        }
-    }
-
-    println!();
-    println!("Use 'cat198x quarantine prune' to permanently delete.");
-    println!("Use 'cat198x quarantine restore' to move back to sources.");
-
-    Ok(())
 }
 
 /// Permanently delete quarantined files
@@ -384,54 +313,9 @@ pub fn move_to_quarantine(
     )
 }
 
-/// Format bytes as human-readable string
-fn format_bytes(bytes: u64) -> String {
-    const KB: u64 = 1024;
-    const MB: u64 = KB * 1024;
-    const GB: u64 = MB * 1024;
-
-    if bytes >= GB {
-        format!("{:.2} GB", bytes as f64 / GB as f64)
-    } else if bytes >= MB {
-        format!("{:.2} MB", bytes as f64 / MB as f64)
-    } else if bytes >= KB {
-        format!("{:.2} KB", bytes as f64 / KB as f64)
-    } else {
-        format!("{} bytes", bytes)
-    }
-}
-
-/// Truncate a path for display
-fn truncate_path(path: &str, max_len: usize) -> String {
-    if path.len() <= max_len {
-        path.to_string()
-    } else {
-        format!("...{}", &path[path.len() - max_len + 3..])
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_format_bytes() {
-        assert_eq!(format_bytes(0), "0 bytes");
-        assert_eq!(format_bytes(512), "512 bytes");
-        assert_eq!(format_bytes(1024), "1.00 KB");
-        assert_eq!(format_bytes(1536), "1.50 KB");
-        assert_eq!(format_bytes(1048576), "1.00 MB");
-        assert_eq!(format_bytes(1073741824), "1.00 GB");
-    }
-
-    #[test]
-    fn test_truncate_path() {
-        assert_eq!(truncate_path("/short/path", 50), "/short/path");
-        let long = "/very/long/path/that/exceeds/the/maximum/length/allowed";
-        let truncated = truncate_path(long, 30);
-        assert!(truncated.starts_with("..."));
-        assert_eq!(truncated.len(), 30);
-    }
 
     #[test]
     fn test_holds_content_loose_file_byte_hash() {
