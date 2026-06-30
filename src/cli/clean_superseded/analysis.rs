@@ -7,13 +7,13 @@ use crate::plan::compute_desired_state;
 
 /// A loose file under the library, a candidate for removal.
 #[derive(Debug, Clone)]
-pub(super) struct Candidate {
+pub(in crate::cli::clean_superseded) struct Candidate {
     /// Absolute path on disk.
-    pub(super) abs_path: String,
+    pub(in crate::cli::clean_superseded) abs_path: String,
     /// Content SHA1 (the catalogue's native upper-case form).
-    pub(super) sha1: String,
+    pub(in crate::cli::clean_superseded) sha1: String,
     /// Bytes freed by removing it.
-    pub(super) size: i64,
+    pub(in crate::cli::clean_superseded) size: i64,
 }
 
 /// The outcome of analysing the library's loose layer against the desired state.

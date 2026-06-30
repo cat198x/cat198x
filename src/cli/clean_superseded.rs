@@ -26,17 +26,18 @@
 //! `--execute`, journaling what it removed.
 
 mod analysis;
+mod execution;
 
 use anyhow::Result;
 use std::path::PathBuf;
 
 use crate::config::Config;
 use crate::db::files;
-use crate::plan::executor::delete_has_surviving_copy;
 use crate::util::format_bytes;
 
 use super::{get_data_dir, open_database};
 use analysis::analyze;
+use execution::execute_cleanup;
 
 #[cfg(test)]
 use std::collections::HashSet;
@@ -124,64 +125,20 @@ pub fn run(
         return Ok(());
     }
 
-    // --execute: verify-before-delete (condition 4), then hard delete, journaled.
-    let mut removed: Vec<String> = Vec::new();
-    let mut freed: i64 = 0;
-    let mut skipped = 0usize;
-    for c in &report.targets {
-        match delete_has_surviving_copy(conn, &sources, &c.abs_path) {
-            Ok(true) => {}
-            Ok(false) => {
-                eprintln!(
-                    "  SKIP (no surviving copy verified on disk): {}",
-                    c.abs_path
-                );
-                skipped += 1;
-                continue;
-            }
-            Err(e) => {
-                eprintln!("  SKIP (verify failed: {:#}): {}", e, c.abs_path);
-                skipped += 1;
-                continue;
-            }
-        }
-        // A successful delete, or a file already gone, both drop the catalogue
-        // row (the file has left the tracked sources either way).
-        let gone = match std::fs::remove_file(&c.abs_path) {
-            Ok(()) => true,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
-            Err(e) => {
-                eprintln!("  ERROR deleting {}: {:#}", c.abs_path, e);
-                false
-            }
-        };
-        if gone {
-            if let Some((sid, rel)) = files::resolve_in_sources(&sources, &c.abs_path) {
-                files::remove_locations_at(conn, sid, &rel)?;
-            }
-            removed.push(c.abs_path.clone());
-            freed += c.size;
-        }
-    }
-
-    // Journal the run for audit (hard delete is irreversible).
-    let logs_dir = get_data_dir(data_dir)?.join("objects/clean-superseded-logs");
-    std::fs::create_dir_all(&logs_dir).ok();
-    let log_path = logs_dir.join(format!("clean-superseded-{}.txt", removed.len()));
-    std::fs::write(&log_path, removed.join("\n")).ok();
+    let execution = execute_cleanup(conn, &sources, &report.targets, data_dir)?;
 
     println!();
     println!(
         "Removed {} file(s), freed {}{}.",
-        removed.len(),
-        format_bytes(freed.max(0) as u64),
-        if skipped > 0 {
-            format!(" ({} skipped — survivor not verified)", skipped)
+        execution.removed_count,
+        format_bytes(execution.freed_bytes.max(0) as u64),
+        if execution.skipped > 0 {
+            format!(" ({} skipped — survivor not verified)", execution.skipped)
         } else {
             String::new()
         }
     );
-    println!("Audit log: {}", log_path.display());
+    println!("Audit log: {}", execution.log_path.display());
     Ok(())
 }
 
