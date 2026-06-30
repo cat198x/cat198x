@@ -2,6 +2,7 @@ use anyhow::Result;
 use rusqlite::Connection;
 use std::collections::{BTreeMap, HashMap, HashSet};
 
+use super::collection_scope::{ActiveCollectionResolution, resolve_active_collection};
 use super::destinations::{
     build_archive_dest_path, build_dest_path, build_disk_dest_path, resolve_dest_root,
 };
@@ -11,9 +12,9 @@ use super::rules::{
     MAX_MATCH_ROWS, apply_one_g_one_r_filter, archive_extension, archive_format_tag,
     effective_format, effective_merge_mode,
 };
-use super::scope::{collection_name_matches, hierarchy_matches_set_filter};
+use super::scope::collection_name_matches;
 use crate::config::{MergeMode, OutputFormat};
-use crate::db::{collections, config as db_config, dats};
+use crate::db::{collections, config as db_config};
 
 /// The library's desired state, derived from the active DATs exactly as the
 /// planner derives placement.
@@ -63,34 +64,29 @@ pub fn compute_desired_state(
         if !collection_name_matches(&collection.name, opts) {
             continue;
         }
-        let version = match collections::get_active_version(conn, collection.id)? {
-            Some(v) => v,
-            None => continue,
+        let active = match resolve_active_collection(conn, opts, &collection)? {
+            ActiveCollectionResolution::Active(active) => active,
+            ActiveCollectionResolution::NoActiveVersion
+            | ActiveCollectionResolution::ExcludedBySet => continue,
         };
-        let cfg = db_config::get_collection_config(conn, &collection.name)?;
-        let hierarchy =
-            dats::primary_node_path(conn, version.id)?.unwrap_or_else(|| collection.name.clone());
-
-        if !hierarchy_matches_set_filter(&hierarchy, opts) {
-            continue;
-        }
+        let cfg = db_config::get_collection_config(conn, &active.name)?;
 
         let explicit = cfg.as_ref().and_then(|c| c.dest_path.as_deref());
-        let dest_root = match resolve_dest_root(explicit, opts.default_dest.as_deref(), &hierarchy)?
-        {
-            Some(root) => root,
-            None => continue,
-        };
+        let dest_root =
+            match resolve_dest_root(explicit, opts.default_dest.as_deref(), &active.hierarchy)? {
+                Some(root) => root,
+                None => continue,
+            };
 
-        if count_match_rows_capped(conn, version.id, MAX_MATCH_ROWS)? > MAX_MATCH_ROWS {
+        if count_match_rows_capped(conn, active.version.id, MAX_MATCH_ROWS)? > MAX_MATCH_ROWS {
             continue;
         }
 
-        let merge_mode = effective_merge_mode(conn, opts, cfg.as_ref(), &hierarchy)?;
+        let merge_mode = effective_merge_mode(conn, opts, cfg.as_ref(), &active.hierarchy)?;
         let matches = find_matched_roms(
             conn,
-            version.id,
-            &collection.name,
+            active.version.id,
+            &active.name,
             merge_mode == MergeMode::Split,
         )?;
         let matches = match cfg.as_ref().and_then(|c| c.extra_config.as_ref()) {
@@ -103,7 +99,7 @@ pub fn compute_desired_state(
             &mut state,
             &dest_root,
             matches,
-            effective_format(conn, opts, cfg.as_ref(), &hierarchy)?,
+            effective_format(conn, opts, cfg.as_ref(), &active.hierarchy)?,
             interesting_sha1s,
         )?;
     }
@@ -215,6 +211,7 @@ mod tests {
     use super::*;
     use crate::config::OutputFormat;
     use crate::db::Database;
+    use crate::db::dats;
 
     fn setup_db() -> Database {
         Database::open_in_memory().unwrap()

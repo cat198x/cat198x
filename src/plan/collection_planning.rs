@@ -3,6 +3,7 @@ use rusqlite::Connection;
 use std::collections::{HashMap, HashSet};
 
 use super::archive_planning::{ArchivePlanInputs, ArchivePlanSinks, plan_archive_matches};
+use super::collection_scope::{ActiveCollectionResolution, resolve_active_collection};
 use super::container_drains::ContainerDrains;
 use super::destinations::resolve_dest_root;
 use super::matching::{MatchedRom, count_match_rows_capped, find_matched_roms};
@@ -13,11 +14,10 @@ use super::rules::{
     MAX_MATCH_ROWS, apply_one_g_one_r_filter, archive_extension, archive_format_tag,
     effective_format, effective_merge_mode,
 };
-use super::scope::hierarchy_matches_set_filter;
 use super::{CollectionPlanStat, Plan};
 use crate::config::{MergeMode, OutputFormat};
 use crate::db::files::Disposition;
-use crate::db::{collections, config as db_config, dats};
+use crate::db::{collections, config as db_config};
 
 pub(crate) struct CollectionPlanningContext<'a> {
     pub(crate) conn: &'a Connection,
@@ -125,52 +125,51 @@ fn prepare_collection_plan(
     ctx: &CollectionPlanningContext<'_>,
     collection: &collections::Collection,
 ) -> Result<CollectionPlanPreparation> {
-    // Only collections with an active version can be planned.
-    let version = match collections::get_active_version(ctx.conn, collection.id)? {
-        Some(v) => v,
-        None => {
+    let active = match resolve_active_collection(ctx.conn, ctx.opts, collection)? {
+        ActiveCollectionResolution::Active(active) => active,
+        ActiveCollectionResolution::NoActiveVersion => {
             return Ok(CollectionPlanPreparation::Skipped(
                 CollectionPlanningOutcome::NoActiveVersion,
             ));
         }
-    };
-
-    let cfg = db_config::get_collection_config(ctx.conn, &collection.name)?;
-
-    // The collection's library path (set by recursive `dat add`), used when
-    // falling back to the library-wide default destination.
-    let hierarchy =
-        dats::primary_node_path(ctx.conn, version.id)?.unwrap_or_else(|| collection.name.clone());
-
-    if !hierarchy_matches_set_filter(&hierarchy, ctx.opts) {
-        return Ok(CollectionPlanPreparation::Skipped(
-            CollectionPlanningOutcome::ExcludedBySet,
-        ));
-    }
-
-    let dest_root = match collection_dest_root(ctx, cfg.as_ref(), &hierarchy)? {
-        Some(root) => root,
-        None => {
-            // No destination resolved — recorded and reported, never silent.
+        ActiveCollectionResolution::ExcludedBySet => {
             return Ok(CollectionPlanPreparation::Skipped(
-                CollectionPlanningOutcome::SkippedNoDest(collection.name.clone()),
+                CollectionPlanningOutcome::ExcludedBySet,
             ));
         }
     };
 
-    if let Some(outcome) = collection_size_skip(ctx, version.id, &collection.name)? {
+    let cfg = db_config::get_collection_config(ctx.conn, &active.name)?;
+
+    let dest_root = match collection_dest_root(ctx, cfg.as_ref(), &active.hierarchy)? {
+        Some(root) => root,
+        None => {
+            // No destination resolved — recorded and reported, never silent.
+            return Ok(CollectionPlanPreparation::Skipped(
+                CollectionPlanningOutcome::SkippedNoDest(active.name),
+            ));
+        }
+    };
+
+    if let Some(outcome) = collection_size_skip(ctx, active.version.id, &active.name)? {
         return Ok(CollectionPlanPreparation::Skipped(outcome));
     }
 
-    reporting::planning_collection(&collection.name, &version.version);
+    reporting::planning_collection(&active.name, &active.version.version);
 
-    let merge_mode = collection_merge_mode(ctx, cfg.as_ref(), &hierarchy, &collection.name)?;
-    let matches = collection_matches(ctx, version.id, &collection.name, merge_mode, cfg.as_ref())?;
-    let format = collection_format(ctx, cfg.as_ref(), &hierarchy)?;
+    let merge_mode = collection_merge_mode(ctx, cfg.as_ref(), &active.hierarchy, &active.name)?;
+    let matches = collection_matches(
+        ctx,
+        active.version.id,
+        &active.name,
+        merge_mode,
+        cfg.as_ref(),
+    )?;
+    let format = collection_format(ctx, cfg.as_ref(), &active.hierarchy)?;
 
     Ok(CollectionPlanPreparation::Ready(PreparedCollectionPlan {
-        name: collection.name.clone(),
-        hierarchy,
+        name: active.name,
+        hierarchy: active.hierarchy,
         dest_root,
         matches,
         format,

@@ -2,10 +2,11 @@ use anyhow::Result;
 use rusqlite::Connection;
 use std::collections::BTreeMap;
 
+use super::collection_scope::{ActiveCollectionResolution, resolve_active_collection};
 use super::destinations::resolve_dest_root;
 use super::options::PlanOptions;
-use super::scope::{collection_name_matches, hierarchy_matches_set_filter};
-use crate::db::{collections, config as db_config, dats};
+use super::scope::collection_name_matches;
+use crate::db::{collections, config as db_config};
 
 /// Whether a version is disk-only: it has at least one `<disk>` and no `<rom>`.
 /// Such a collection places loose `<game>/<name>.chd` and never a `<game>.zip`,
@@ -69,25 +70,23 @@ pub fn find_destination_collisions(
         if !collection_name_matches(&collection.name, opts) {
             continue;
         }
-        let version = match collections::get_active_version(conn, collection.id)? {
-            Some(v) => v,
-            None => continue,
+        let active = match resolve_active_collection(conn, opts, collection)? {
+            ActiveCollectionResolution::Active(active) => active,
+            ActiveCollectionResolution::NoActiveVersion
+            | ActiveCollectionResolution::ExcludedBySet => continue,
         };
-        let hierarchy =
-            dats::primary_node_path(conn, version.id)?.unwrap_or_else(|| collection.name.clone());
-        if !hierarchy_matches_set_filter(&hierarchy, opts) {
-            continue;
-        }
-        let cfg = db_config::get_collection_config(conn, &collection.name)?;
+        let cfg = db_config::get_collection_config(conn, &active.name)?;
         let explicit = cfg.as_ref().and_then(|c| c.dest_path.as_deref());
-        if let Some(root) = resolve_dest_root(explicit, opts.default_dest.as_deref(), &hierarchy)? {
-            let disk_only = version_is_disk_only(conn, version.id)?;
+        if let Some(root) =
+            resolve_dest_root(explicit, opts.default_dest.as_deref(), &active.hierarchy)?
+        {
+            let disk_only = version_is_disk_only(conn, active.version.id)?;
             owners
                 .entry((root, disk_only))
                 .or_default()
                 .push(CollidingCollection {
-                    name: collection.name.clone(),
-                    version_id: version.id,
+                    name: active.name,
+                    version_id: active.version.id,
                     has_explicit_dest: explicit.is_some(),
                 });
         }
@@ -149,6 +148,7 @@ pub(crate) fn check_unique_destinations(
 mod tests {
     use super::*;
     use crate::db::Database;
+    use crate::db::dats;
 
     fn setup_db() -> Database {
         Database::open_in_memory().unwrap()
