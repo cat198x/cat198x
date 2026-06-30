@@ -227,7 +227,7 @@ fn plan_collection_matches(
                 },
                 ArchivePlanSinks {
                     plan,
-                    drain_after_repack: container_drains.pending_mut(),
+                    container_drains,
                 },
             )?;
             acc.add_archive(c);

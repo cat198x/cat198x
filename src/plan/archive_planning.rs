@@ -1,13 +1,13 @@
 use anyhow::Result;
 use std::collections::{BTreeMap, HashMap, HashSet};
 
+use super::Plan;
 use super::archive_game::ArchiveGame;
-use super::container_drains::{ContainerDrain, container_archive_format};
-use super::destinations::{build_archive_dest_path, validate_relative_path};
+use super::container_drains::ContainerDrains;
+use super::destinations::build_archive_dest_path;
 use super::matching::MatchedRom;
 use super::placement_planning::PlacementPlanCounts;
 use super::source_policy::{dedup_reason, is_in_library, may_delete, may_move};
-use super::{Plan, RebuildEntry};
 use crate::db::files::Disposition;
 
 /// Whether a complete source container can be relocated whole to its
@@ -33,7 +33,7 @@ pub(crate) struct ArchivePlanInputs<'a> {
 
 pub(crate) struct ArchivePlanSinks<'a> {
     pub(crate) plan: &'a mut Plan,
-    pub(crate) drain_after_repack: &'a mut BTreeMap<String, ContainerDrain>,
+    pub(crate) container_drains: &'a mut ContainerDrains,
 }
 
 /// Plan archive-format ROM matches: one archive per game at
@@ -191,28 +191,11 @@ fn record_container_drain(
         return Ok(());
     };
 
-    let drain = sinks
-        .drain_after_repack
-        .entry(container.to_string())
-        .or_insert_with(|| ContainerDrain {
-            format: container_archive_format(container),
-            reason_dest: dest.to_string(),
-            entries: Vec::new(),
-        });
-    for m in &game.containers[container] {
-        if let Some(archive_entry) = &m.archive_path {
-            validate_relative_path("archive entry name", archive_entry)?;
-            validate_relative_path("ROM entry name", &m.rom_name)?;
-            drain.entries.push(RebuildEntry {
-                dest: dest.to_string(),
-                dest_entry: m.rom_name.clone(),
-                container_entry: archive_entry.clone(),
-                sha1: m.sha1.clone(),
-            });
-        }
-    }
-
-    Ok(())
+    sinks.container_drains.record_repack_from_container(
+        container,
+        dest,
+        &game.containers[container],
+    )
 }
 
 fn add_dedup_deletes(

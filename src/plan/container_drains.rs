@@ -1,16 +1,19 @@
+use anyhow::Result;
 use std::collections::{BTreeMap, HashSet};
 
+use super::destinations::validate_relative_path;
+use super::matching::MatchedRom;
 use super::{ContainerRebuild, Plan, RebuildEntry};
 
 /// Accumulates, across the games that repack from one staging container, the
 /// spec to rebuild that container on rollback.
-pub(crate) struct ContainerDrain {
+struct ContainerDrain {
     /// Archive format to rebuild the container in (`zip` or `7z`).
-    pub(crate) format: String,
+    format: String,
     /// A representative destination, for the human-readable drain reason.
-    pub(crate) reason_dest: String,
+    reason_dest: String,
     /// Where each of the container's entries was repacked to.
-    pub(crate) entries: Vec<RebuildEntry>,
+    entries: Vec<RebuildEntry>,
 }
 
 /// Source containers a repack rebuilt from and that are safe to lose afterwards.
@@ -26,8 +29,34 @@ pub(crate) struct ContainerDrains {
 }
 
 impl ContainerDrains {
-    pub(crate) fn pending_mut(&mut self) -> &mut BTreeMap<String, ContainerDrain> {
-        &mut self.pending
+    pub(crate) fn record_repack_from_container(
+        &mut self,
+        container: &str,
+        dest: &str,
+        entries: &[MatchedRom],
+    ) -> Result<()> {
+        let drain = self
+            .pending
+            .entry(container.to_string())
+            .or_insert_with(|| ContainerDrain {
+                format: container_archive_format(container),
+                reason_dest: dest.to_string(),
+                entries: Vec::new(),
+            });
+        for m in entries {
+            if let Some(archive_entry) = &m.archive_path {
+                validate_relative_path("archive entry name", archive_entry)?;
+                validate_relative_path("ROM entry name", &m.rom_name)?;
+                drain.entries.push(RebuildEntry {
+                    dest: dest.to_string(),
+                    dest_entry: m.rom_name.clone(),
+                    container_entry: archive_entry.clone(),
+                    sha1: m.sha1.clone(),
+                });
+            }
+        }
+
+        Ok(())
     }
 
     pub(crate) fn emit_into(self, plan: &mut Plan) {
@@ -35,7 +64,7 @@ impl ContainerDrains {
     }
 }
 
-pub(crate) fn container_archive_format(path: &str) -> String {
+fn container_archive_format(path: &str) -> String {
     if path.to_ascii_lowercase().ends_with(".7z") {
         "7z".to_string()
     } else {
