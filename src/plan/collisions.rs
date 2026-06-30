@@ -2,11 +2,10 @@ use anyhow::Result;
 use rusqlite::Connection;
 use std::collections::BTreeMap;
 
-use super::collection_scope::{ActiveCollectionResolution, resolve_active_collection};
-use super::destinations::resolve_dest_root;
+use super::collection_scope::{ScopedCollectionResolution, resolve_scoped_collection};
 use super::options::PlanOptions;
 use super::scope::collection_name_matches;
-use crate::db::{collections, config as db_config};
+use crate::db::collections;
 
 /// Whether a version is disk-only: it has at least one `<disk>` and no `<rom>`.
 /// Such a collection places loose `<game>/<name>.chd` and never a `<game>.zip`,
@@ -70,26 +69,27 @@ pub fn find_destination_collisions(
         if !collection_name_matches(&collection.name, opts) {
             continue;
         }
-        let active = match resolve_active_collection(conn, opts, collection)? {
-            ActiveCollectionResolution::Active(active) => active,
-            ActiveCollectionResolution::NoActiveVersion
-            | ActiveCollectionResolution::ExcludedBySet => continue,
+        let scoped = match resolve_scoped_collection(
+            conn,
+            opts,
+            opts.default_dest.as_deref(),
+            collection,
+        )? {
+            ScopedCollectionResolution::Resolved(scoped) => *scoped,
+            ScopedCollectionResolution::NoActiveVersion
+            | ScopedCollectionResolution::ExcludedBySet => continue,
         };
-        let cfg = db_config::get_collection_config(conn, &active.name)?;
-        let explicit = cfg.as_ref().and_then(|c| c.dest_path.as_deref());
-        if let Some(root) =
-            resolve_dest_root(explicit, opts.default_dest.as_deref(), &active.hierarchy)?
-        {
-            let disk_only = version_is_disk_only(conn, active.version.id)?;
+        if let Some(root) = scoped.dest_root {
+            let disk_only = version_is_disk_only(conn, scoped.version.id)?;
             owners
                 .entry((root, disk_only))
                 .or_default()
                 .push(CollidingCollection {
-                    name: active.name,
-                    version_id: active.version.id,
-                    has_explicit_dest: explicit.is_some(),
+                    name: scoped.name,
+                    version_id: scoped.version.id,
+                    has_explicit_dest: scoped.has_explicit_dest,
                 });
-        }
+        };
     }
 
     let mut collisions: Vec<DestinationCollision> = owners

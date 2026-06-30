@@ -3,9 +3,8 @@ use rusqlite::Connection;
 use std::collections::{HashMap, HashSet};
 
 use super::archive_planning::{ArchivePlanInputs, ArchivePlanSinks, plan_archive_matches};
-use super::collection_scope::{ActiveCollectionResolution, resolve_active_collection};
+use super::collection_scope::{ScopedCollectionResolution, resolve_scoped_collection};
 use super::container_drains::ContainerDrains;
-use super::destinations::resolve_dest_root;
 use super::matching::{MatchedRom, count_match_rows_capped, find_matched_roms};
 use super::options::PlanOptions;
 use super::placement_planning::{PlacementPlanCounts, plan_disk_matches, plan_loose_matches};
@@ -125,64 +124,55 @@ fn prepare_collection_plan(
     ctx: &CollectionPlanningContext<'_>,
     collection: &collections::Collection,
 ) -> Result<CollectionPlanPreparation> {
-    let active = match resolve_active_collection(ctx.conn, ctx.opts, collection)? {
-        ActiveCollectionResolution::Active(active) => active,
-        ActiveCollectionResolution::NoActiveVersion => {
+    let scoped = match resolve_scoped_collection(ctx.conn, ctx.opts, ctx.default_dest, collection)?
+    {
+        ScopedCollectionResolution::Resolved(scoped) => *scoped,
+        ScopedCollectionResolution::NoActiveVersion => {
             return Ok(CollectionPlanPreparation::Skipped(
                 CollectionPlanningOutcome::NoActiveVersion,
             ));
         }
-        ActiveCollectionResolution::ExcludedBySet => {
+        ScopedCollectionResolution::ExcludedBySet => {
             return Ok(CollectionPlanPreparation::Skipped(
                 CollectionPlanningOutcome::ExcludedBySet,
             ));
         }
     };
 
-    let cfg = db_config::get_collection_config(ctx.conn, &active.name)?;
-
-    let dest_root = match collection_dest_root(ctx, cfg.as_ref(), &active.hierarchy)? {
+    let dest_root = match scoped.dest_root {
         Some(root) => root,
         None => {
             // No destination resolved — recorded and reported, never silent.
             return Ok(CollectionPlanPreparation::Skipped(
-                CollectionPlanningOutcome::SkippedNoDest(active.name),
+                CollectionPlanningOutcome::SkippedNoDest(scoped.name),
             ));
         }
     };
 
-    if let Some(outcome) = collection_size_skip(ctx, active.version.id, &active.name)? {
+    if let Some(outcome) = collection_size_skip(ctx, scoped.version.id, &scoped.name)? {
         return Ok(CollectionPlanPreparation::Skipped(outcome));
     }
 
-    reporting::planning_collection(&active.name, &active.version.version);
+    reporting::planning_collection(&scoped.name, &scoped.version.version);
 
-    let merge_mode = collection_merge_mode(ctx, cfg.as_ref(), &active.hierarchy, &active.name)?;
+    let merge_mode =
+        collection_merge_mode(ctx, scoped.cfg.as_ref(), &scoped.hierarchy, &scoped.name)?;
     let matches = collection_matches(
         ctx,
-        active.version.id,
-        &active.name,
+        scoped.version.id,
+        &scoped.name,
         merge_mode,
-        cfg.as_ref(),
+        scoped.cfg.as_ref(),
     )?;
-    let format = collection_format(ctx, cfg.as_ref(), &active.hierarchy)?;
+    let format = collection_format(ctx, scoped.cfg.as_ref(), &scoped.hierarchy)?;
 
     Ok(CollectionPlanPreparation::Ready(PreparedCollectionPlan {
-        name: active.name,
-        hierarchy: active.hierarchy,
+        name: scoped.name,
+        hierarchy: scoped.hierarchy,
         dest_root,
         matches,
         format,
     }))
-}
-
-fn collection_dest_root(
-    ctx: &CollectionPlanningContext<'_>,
-    cfg: Option<&db_config::CollectionConfig>,
-    hierarchy: &str,
-) -> Result<Option<String>> {
-    let explicit = cfg.and_then(|c| c.dest_path.as_deref());
-    resolve_dest_root(explicit, ctx.default_dest, hierarchy)
 }
 
 fn collection_size_skip(

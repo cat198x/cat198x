@@ -2,10 +2,8 @@ use anyhow::Result;
 use rusqlite::Connection;
 use std::collections::{BTreeMap, HashMap, HashSet};
 
-use super::collection_scope::{ActiveCollectionResolution, resolve_active_collection};
-use super::destinations::{
-    build_archive_dest_path, build_dest_path, build_disk_dest_path, resolve_dest_root,
-};
+use super::collection_scope::{ScopedCollectionResolution, resolve_scoped_collection};
+use super::destinations::{build_archive_dest_path, build_dest_path, build_disk_dest_path};
 use super::matching::{MatchedRom, count_match_rows_capped, find_matched_roms};
 use super::options::PlanOptions;
 use super::rules::{
@@ -14,7 +12,7 @@ use super::rules::{
 };
 use super::scope::collection_name_matches;
 use crate::config::{MergeMode, OutputFormat};
-use crate::db::{collections, config as db_config};
+use crate::db::collections;
 
 /// The library's desired state, derived from the active DATs exactly as the
 /// planner derives placement.
@@ -64,32 +62,29 @@ pub fn compute_desired_state(
         if !collection_name_matches(&collection.name, opts) {
             continue;
         }
-        let active = match resolve_active_collection(conn, opts, &collection)? {
-            ActiveCollectionResolution::Active(active) => active,
-            ActiveCollectionResolution::NoActiveVersion
-            | ActiveCollectionResolution::ExcludedBySet => continue,
-        };
-        let cfg = db_config::get_collection_config(conn, &active.name)?;
-
-        let explicit = cfg.as_ref().and_then(|c| c.dest_path.as_deref());
-        let dest_root =
-            match resolve_dest_root(explicit, opts.default_dest.as_deref(), &active.hierarchy)? {
-                Some(root) => root,
-                None => continue,
+        let scoped =
+            match resolve_scoped_collection(conn, opts, opts.default_dest.as_deref(), &collection)?
+            {
+                ScopedCollectionResolution::Resolved(scoped) => *scoped,
+                ScopedCollectionResolution::NoActiveVersion
+                | ScopedCollectionResolution::ExcludedBySet => continue,
             };
+        let Some(dest_root) = scoped.dest_root else {
+            continue;
+        };
 
-        if count_match_rows_capped(conn, active.version.id, MAX_MATCH_ROWS)? > MAX_MATCH_ROWS {
+        if count_match_rows_capped(conn, scoped.version.id, MAX_MATCH_ROWS)? > MAX_MATCH_ROWS {
             continue;
         }
 
-        let merge_mode = effective_merge_mode(conn, opts, cfg.as_ref(), &active.hierarchy)?;
+        let merge_mode = effective_merge_mode(conn, opts, scoped.cfg.as_ref(), &scoped.hierarchy)?;
         let matches = find_matched_roms(
             conn,
-            active.version.id,
-            &active.name,
+            scoped.version.id,
+            &scoped.name,
             merge_mode == MergeMode::Split,
         )?;
-        let matches = match cfg.as_ref().and_then(|c| c.extra_config.as_ref()) {
+        let matches = match scoped.cfg.as_ref().and_then(|c| c.extra_config.as_ref()) {
             Some(extra) if extra.one_g_one_r => {
                 apply_one_g_one_r_filter(&matches, &extra.to_filter_preferences())
             }
@@ -99,7 +94,7 @@ pub fn compute_desired_state(
             &mut state,
             &dest_root,
             matches,
-            effective_format(conn, opts, cfg.as_ref(), &active.hierarchy)?,
+            effective_format(conn, opts, scoped.cfg.as_ref(), &scoped.hierarchy)?,
             interesting_sha1s,
         )?;
     }
