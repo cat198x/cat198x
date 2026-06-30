@@ -11,6 +11,7 @@ pub(crate) mod collisions;
 pub(crate) mod container_drains;
 pub(crate) mod coverage;
 pub(crate) mod desired_state;
+pub(crate) mod desired_state_recording;
 pub(crate) mod destinations;
 pub mod executor;
 pub mod generator;
