@@ -8,7 +8,7 @@ use super::archive_planning::{
 use super::destinations::resolve_dest_root;
 use super::matching::{MatchedRom, count_match_rows_capped, find_matched_roms};
 use super::options::PlanOptions;
-use super::placement_planning::{plan_disk_matches, plan_loose_matches};
+use super::placement_planning::{PlacementPlanCounts, plan_disk_matches, plan_loose_matches};
 use super::reporting;
 use super::rules::{
     MAX_MATCH_ROWS, apply_one_g_one_r_filter, archive_extension, archive_format_tag,
@@ -34,6 +34,49 @@ pub(crate) enum CollectionPlanningOutcome {
     SkippedNoDest(String),
     SkippedOversized(String),
     Planned,
+}
+
+#[derive(Default)]
+struct CollectionPlanAccumulator {
+    already_correct: usize,
+    to_write: usize,
+    relocated: usize,
+    deduped: usize,
+    bytes: u64,
+}
+
+impl CollectionPlanAccumulator {
+    fn add_loose(&mut self, counts: PlacementPlanCounts) {
+        self.already_correct += counts.already_correct;
+        self.to_write += counts.to_write;
+        self.deduped += counts.deduped;
+        self.bytes += counts.bytes;
+    }
+
+    fn add_archive(&mut self, counts: PlacementPlanCounts) {
+        self.already_correct += counts.already_correct;
+        self.relocated += counts.relocated;
+        self.to_write += counts.to_write;
+        self.deduped += counts.deduped;
+        self.bytes += counts.bytes;
+    }
+
+    fn add_disk(&mut self, counts: PlacementPlanCounts) {
+        self.already_correct += counts.already_correct;
+        self.to_write += counts.to_write;
+        self.bytes += counts.bytes;
+    }
+
+    fn record_on_plan(self, plan: &mut Plan, name: String, node_path: String) {
+        plan.summary.already_correct += self.already_correct;
+        plan.per_collection.push(CollectionPlanStat {
+            name,
+            node_path,
+            to_write: self.to_write,
+            already_correct: self.already_correct,
+            bytes: self.bytes,
+        });
+    }
 }
 
 pub(crate) fn plan_collection(
@@ -133,11 +176,7 @@ pub(crate) fn plan_collection(
     // `compute_desired_state`.
     let format = effective_format(ctx.conn, ctx.opts, cfg.as_ref(), &hierarchy)?;
 
-    let mut already_correct = 0;
-    let mut to_write = 0;
-    let mut relocated = 0;
-    let mut deduped = 0;
-    let mut bytes = 0u64;
+    let mut acc = CollectionPlanAccumulator::default();
 
     // CHDs (<disk> entries) are always stored loose in a machine folder
     // (<dest>/<game>/<name>.chd) and never packed, even when the set's format is
@@ -156,11 +195,8 @@ pub(crate) fn plan_collection(
                 ctx.dispositions,
                 plan,
             )?;
-            already_correct += c.already_correct;
-            to_write += c.to_write;
-            bytes += c.bytes;
-            deduped += c.deduped;
-            reporting::loose_summary(already_correct, to_write, deduped);
+            acc.add_loose(c);
+            reporting::loose_summary(acc.already_correct, acc.to_write, acc.deduped);
         }
         Some(tag) => {
             let ext = archive_extension(tag);
@@ -180,12 +216,13 @@ pub(crate) fn plan_collection(
                     drain_after_repack: container_drains.pending_mut(),
                 },
             )?;
-            already_correct += c.already_correct;
-            relocated += c.relocated;
-            to_write += c.to_write;
-            bytes += c.bytes;
-            deduped += c.deduped;
-            reporting::archive_summary(already_correct, relocated, to_write, deduped);
+            acc.add_archive(c);
+            reporting::archive_summary(
+                acc.already_correct,
+                acc.relocated,
+                acc.to_write,
+                acc.deduped,
+            );
         }
     }
 
@@ -200,19 +237,10 @@ pub(crate) fn plan_collection(
             ctx.dispositions,
             plan,
         )?;
-        already_correct += d.already_correct;
-        to_write += d.to_write;
-        bytes += d.bytes;
+        acc.add_disk(d);
     }
 
-    plan.summary.already_correct += already_correct;
-    plan.per_collection.push(CollectionPlanStat {
-        name: collection.name.clone(),
-        node_path: hierarchy,
-        to_write,
-        already_correct,
-        bytes,
-    });
+    acc.record_on_plan(plan, collection.name.clone(), hierarchy);
 
     Ok(CollectionPlanningOutcome::Planned)
 }
