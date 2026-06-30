@@ -5,11 +5,11 @@ use rusqlite::Connection;
 use std::collections::{HashMap, HashSet};
 
 use super::Plan;
-use super::archive_planning::ContainerDrains;
 use super::collection_planning::{
     CollectionPlanningContext, CollectionPlanningOutcome, plan_collection,
 };
 use super::collisions::check_unique_destinations;
+use super::container_drains::ContainerDrains;
 pub use super::coverage::count_missing_roms;
 use super::matching::{compute_shared_containers, compute_shared_content};
 use super::options::PlanOptions;

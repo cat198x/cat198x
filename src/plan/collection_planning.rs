@@ -2,9 +2,8 @@ use anyhow::Result;
 use rusqlite::Connection;
 use std::collections::{HashMap, HashSet};
 
-use super::archive_planning::{
-    ArchivePlanInputs, ArchivePlanSinks, ContainerDrains, plan_archive_matches,
-};
+use super::archive_planning::{ArchivePlanInputs, ArchivePlanSinks, plan_archive_matches};
+use super::container_drains::ContainerDrains;
 use super::destinations::resolve_dest_root;
 use super::matching::{MatchedRom, count_match_rows_capped, find_matched_roms};
 use super::options::PlanOptions;
