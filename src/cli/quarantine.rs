@@ -4,16 +4,14 @@
 //! at their current location but shouldn't be immediately deleted.
 
 mod prune;
+mod restore;
 mod status;
 
 use anyhow::Result;
-use std::fs;
-use std::io::{self, Write};
 use std::path::PathBuf;
 
 use crate::cli::args::QuarantineCommands;
 use crate::db::quarantine as db_quarantine;
-use crate::util::format_bytes;
 
 use super::open_database;
 
@@ -29,140 +27,8 @@ pub fn run(cmd: QuarantineCommands, data_dir: Option<PathBuf>) -> Result<()> {
             collection,
             target,
             yes,
-        } => run_restore(collection, target, yes, data_dir),
+        } => restore::run(collection, target, yes, data_dir),
     }
-}
-
-/// Restore quarantined files back to a source directory
-fn run_restore(
-    collection: Option<String>,
-    target: Option<PathBuf>,
-    yes: bool,
-    data_dir: Option<PathBuf>,
-) -> Result<()> {
-    let db = open_database(data_dir.clone())?;
-    let conn = db.conn();
-    let quarantine_dir = super::config::resolve_quarantine_dir(data_dir)?;
-
-    let entries = if let Some(ref pattern) = collection {
-        db_quarantine::list_entries_by_collection(conn, pattern)?
-    } else {
-        db_quarantine::list_entries(conn)?
-    };
-
-    if entries.is_empty() {
-        println!("No files to restore.");
-        return Ok(());
-    }
-
-    // Determine target directory
-    let target_dir = match target {
-        Some(t) => t,
-        None => {
-            // Try to get first source directory
-            let sources = crate::db::files::list_sources(conn)?;
-            if sources.is_empty() {
-                anyhow::bail!(
-                    "No target directory specified and no sources registered.\n\
-                     Use --target <path> to specify where to restore files."
-                );
-            }
-            PathBuf::from(&sources[0].path)
-        }
-    };
-
-    if !target_dir.exists() {
-        anyhow::bail!("Target directory does not exist: {}", target_dir.display());
-    }
-
-    let total_size: i64 = entries.iter().map(|e| e.size).sum();
-
-    println!(
-        "Will restore {} files ({}) to {}",
-        entries.len(),
-        format_bytes(total_size as u64),
-        target_dir.display()
-    );
-
-    if !yes {
-        print!("Continue? [y/N] ");
-        io::stdout().flush()?;
-
-        let mut input = String::new();
-        io::stdin().read_line(&mut input)?;
-
-        if !input.trim().eq_ignore_ascii_case("y") {
-            println!("Aborted.");
-            return Ok(());
-        }
-    }
-
-    let mut restored = 0;
-    let mut errors = 0;
-
-    for entry in &entries {
-        let source_path = quarantine_dir.join(&entry.quarantine_path);
-
-        // Use original filename for restoration
-        let filename = std::path::Path::new(&entry.original_path)
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or(&entry.quarantine_path);
-
-        let dest_path = target_dir.join(filename);
-
-        // Check for conflicts
-        if dest_path.exists() {
-            eprintln!("Skipping {} - file already exists at destination", filename);
-            errors += 1;
-            continue;
-        }
-
-        // Move the file
-        if source_path.exists() {
-            if let Err(e) = fs::rename(&source_path, &dest_path) {
-                // If rename fails (cross-device), try copy + delete
-                if let Err(e2) = fs::copy(&source_path, &dest_path) {
-                    eprintln!("Failed to restore {}: {} / {}", filename, e, e2);
-                    errors += 1;
-                    continue;
-                }
-                if let Err(e) = fs::remove_file(&source_path) {
-                    eprintln!("Warning: Failed to remove source after copy: {}", e);
-                }
-            }
-        } else {
-            eprintln!(
-                "Skipping {} - quarantine file not found",
-                entry.quarantine_path
-            );
-            errors += 1;
-            continue;
-        }
-
-        // Remove from database
-        if let Err(e) = db_quarantine::remove_entry(conn, entry.id) {
-            eprintln!("Warning: Failed to remove database entry: {}", e);
-        }
-
-        restored += 1;
-    }
-
-    println!();
-    println!(
-        "Restored {} files to {}, {} errors",
-        restored,
-        target_dir.display(),
-        errors
-    );
-
-    // Remind user to rescan
-    if restored > 0 {
-        println!();
-        println!("Run 'cat198x scan' to update the file catalog.");
-    }
-
-    Ok(())
 }
 
 /// Move a file to quarantine
