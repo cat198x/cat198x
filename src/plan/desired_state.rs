@@ -9,8 +9,9 @@ use super::matching::{MatchedRom, count_match_rows_capped, find_matched_roms};
 use super::options::PlanOptions;
 use super::rules::{
     MAX_MATCH_ROWS, apply_one_g_one_r_filter, archive_extension, archive_format_tag,
-    effective_format, effective_merge_mode, glob_match,
+    effective_format, effective_merge_mode,
 };
+use super::scope::{collection_name_matches, hierarchy_matches_set_filter};
 use crate::config::{MergeMode, OutputFormat};
 use crate::db::{collections, config as db_config, dats};
 
@@ -59,9 +60,7 @@ pub fn compute_desired_state(
     };
 
     for collection in collections::list_collections(conn)? {
-        if let Some(pattern) = opts.dat_filter.as_deref()
-            && !glob_match(pattern, &collection.name)
-        {
+        if !collection_name_matches(&collection.name, opts) {
             continue;
         }
         let version = match collections::get_active_version(conn, collection.id)? {
@@ -72,11 +71,8 @@ pub fn compute_desired_state(
         let hierarchy =
             dats::primary_node_path(conn, version.id)?.unwrap_or_else(|| collection.name.clone());
 
-        if let Some(sets) = opts.set_filter.as_ref() {
-            let set = hierarchy.split('/').next().unwrap_or(hierarchy.as_str());
-            if !sets.iter().any(|s| s == set) {
-                continue;
-            }
+        if !hierarchy_matches_set_filter(&hierarchy, opts) {
+            continue;
         }
 
         let explicit = cfg.as_ref().and_then(|c| c.dest_path.as_deref());

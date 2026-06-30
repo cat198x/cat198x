@@ -13,6 +13,7 @@ use super::rules::{
     MAX_MATCH_ROWS, apply_one_g_one_r_filter, archive_extension, archive_format_tag,
     effective_format, effective_merge_mode,
 };
+use super::scope::hierarchy_matches_set_filter;
 use super::{CollectionPlanStat, Plan};
 use crate::config::{MergeMode, OutputFormat};
 use crate::db::files::Disposition;
@@ -141,7 +142,7 @@ fn prepare_collection_plan(
     let hierarchy =
         dats::primary_node_path(ctx.conn, version.id)?.unwrap_or_else(|| collection.name.clone());
 
-    if !selected_set_matches(&hierarchy, ctx.opts) {
+    if !hierarchy_matches_set_filter(&hierarchy, ctx.opts) {
         return Ok(CollectionPlanPreparation::Skipped(
             CollectionPlanningOutcome::ExcludedBySet,
         ));
@@ -174,15 +175,6 @@ fn prepare_collection_plan(
         matches,
         format,
     }))
-}
-
-fn selected_set_matches(hierarchy: &str, opts: &PlanOptions) -> bool {
-    let Some(sets) = opts.set_filter.as_ref() else {
-        return true;
-    };
-
-    let set = hierarchy.split('/').next().unwrap_or(hierarchy);
-    sets.iter().any(|s| s == set)
 }
 
 fn collection_dest_root(

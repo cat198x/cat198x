@@ -14,7 +14,7 @@ pub use super::coverage::count_missing_roms;
 use super::matching::{compute_shared_containers, compute_shared_content};
 use super::options::PlanOptions;
 use super::reporting;
-use super::rules::glob_match;
+use super::scope::collection_name_matches;
 use super::source_policy::load_source_dispositions;
 pub use super::state_hash::compute_state_hash;
 use crate::db::collections;
@@ -147,9 +147,7 @@ fn plan_collections(
     let mut run = PlanningRun::default();
 
     for collection in all_collections {
-        if let Some(pattern) = ctx.opts.dat_filter.as_deref()
-            && !glob_match(pattern, &collection.name)
-        {
+        if !collection_name_matches(&collection.name, ctx.opts) {
             continue;
         }
         run.filter_matched_any = true;

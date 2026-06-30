@@ -17,6 +17,7 @@ pub(crate) mod options;
 pub(crate) mod placement_planning;
 pub(crate) mod reporting;
 pub(crate) mod rules;
+pub(crate) mod scope;
 pub(crate) mod source_policy;
 pub(crate) mod state_hash;
 pub mod types;

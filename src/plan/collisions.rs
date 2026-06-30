@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 
 use super::destinations::resolve_dest_root;
 use super::options::PlanOptions;
-use super::rules::glob_match;
+use super::scope::{collection_name_matches, hierarchy_matches_set_filter};
 use crate::db::{collections, config as db_config, dats};
 
 /// Whether a version is disk-only: it has at least one `<disk>` and no `<rom>`.
@@ -66,9 +66,7 @@ pub fn find_destination_collisions(
 ) -> Result<Vec<DestinationCollision>> {
     let mut owners: BTreeMap<(String, bool), Vec<CollidingCollection>> = BTreeMap::new();
     for collection in all_collections {
-        if let Some(pattern) = opts.dat_filter.as_deref()
-            && !glob_match(pattern, &collection.name)
-        {
+        if !collection_name_matches(&collection.name, opts) {
             continue;
         }
         let version = match collections::get_active_version(conn, collection.id)? {
@@ -77,11 +75,8 @@ pub fn find_destination_collisions(
         };
         let hierarchy =
             dats::primary_node_path(conn, version.id)?.unwrap_or_else(|| collection.name.clone());
-        if let Some(sets) = opts.set_filter.as_ref() {
-            let set = hierarchy.split('/').next().unwrap_or(hierarchy.as_str());
-            if !sets.iter().any(|s| s == set) {
-                continue;
-            }
+        if !hierarchy_matches_set_filter(&hierarchy, opts) {
+            continue;
         }
         let cfg = db_config::get_collection_config(conn, &collection.name)?;
         let explicit = cfg.as_ref().and_then(|c| c.dest_path.as_deref());
