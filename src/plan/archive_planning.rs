@@ -36,6 +36,13 @@ pub(crate) struct ArchivePlanSinks<'a> {
     pub(crate) container_drains: &'a mut ContainerDrains,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum ArchiveGameAction<'a> {
+    AlreadyCorrect,
+    Relocate { src: &'a str },
+    Repack,
+}
+
 /// Plan archive-format ROM matches: one archive per game at
 /// `<dest_root>/<game>.<ext>`.
 pub(crate) fn plan_archive_matches(
@@ -71,25 +78,24 @@ fn plan_archive_game(
     let game_shared = game.has_shared_content(inputs.shared);
     let build_from = game.build_from(&dest);
 
-    if game.is_complete(&dest) && inputs.tag != "torrentzip" {
-        counts.already_correct += game.expected.len();
-    } else if let Some(src) =
-        relocatable_source(build_from.as_deref(), &dest, &game, game_shared, inputs)
-    {
-        let size: u64 = game.containers[src].iter().map(|m| m.size as u64).sum();
-        counts.bytes += size;
-        sinks.plan.add_relocate(src.to_string(), dest.clone(), size);
-        counts.relocated += 1;
-    } else {
-        counts.merge(plan_repack(
-            game_name,
-            &dest,
-            build_from.as_deref(),
-            &game,
-            game_shared,
-            inputs,
-            sinks,
-        )?);
+    match choose_archive_game_action(build_from.as_deref(), &dest, &game, game_shared, inputs) {
+        ArchiveGameAction::AlreadyCorrect => {
+            counts.already_correct += game.expected.len();
+        }
+        ArchiveGameAction::Relocate { src } => {
+            record_relocate(src, &dest, &game, sinks, &mut counts);
+        }
+        ArchiveGameAction::Repack => {
+            counts.merge(plan_repack(
+                game_name,
+                &dest,
+                build_from.as_deref(),
+                &game,
+                game_shared,
+                inputs,
+                sinks,
+            )?);
+        }
     }
 
     if !game_shared {
@@ -104,6 +110,37 @@ fn plan_archive_game(
     }
 
     Ok(counts)
+}
+
+fn choose_archive_game_action<'a>(
+    build_from: Option<&'a str>,
+    dest: &str,
+    game: &ArchiveGame,
+    game_shared: bool,
+    inputs: &ArchivePlanInputs<'_>,
+) -> ArchiveGameAction<'a> {
+    if game.is_complete(dest) && inputs.tag != "torrentzip" {
+        ArchiveGameAction::AlreadyCorrect
+    } else if let Some(src) = relocatable_source(build_from, dest, game, game_shared, inputs) {
+        ArchiveGameAction::Relocate { src }
+    } else {
+        ArchiveGameAction::Repack
+    }
+}
+
+fn record_relocate(
+    src: &str,
+    dest: &str,
+    game: &ArchiveGame,
+    sinks: &mut ArchivePlanSinks<'_>,
+    counts: &mut PlacementPlanCounts,
+) {
+    let size: u64 = game.containers[src].iter().map(|m| m.size as u64).sum();
+    counts.bytes += size;
+    sinks
+        .plan
+        .add_relocate(src.to_string(), dest.to_string(), size);
+    counts.relocated += 1;
 }
 
 fn relocatable_source<'a>(
@@ -211,44 +248,5 @@ fn add_dedup_deletes(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn is_relocatable_archive_requires_matching_archive_format() {
-        let archived = |path: &str| MatchedRom {
-            game_name: "G".into(),
-            rom_name: "r".into(),
-            sha1: "AAA".into(),
-            size: 1,
-            source_root: "/s".into(),
-            source_path: path.into(),
-            archive_path: Some("r".into()),
-            is_disk: false,
-        };
-        let loose = |path: &str| MatchedRom {
-            archive_path: None,
-            ..archived(path)
-        };
-        // A real .zip whose entries are archived -> relocatable.
-        assert!(is_relocatable_archive(
-            &[archived("Game.zip")],
-            "/s/Game.zip",
-            "zip"
-        ));
-        // A loose ROM (no archive_path) -> must be repacked.
-        assert!(!is_relocatable_archive(
-            &[loose("game.tap")],
-            "/s/game.tap",
-            "zip"
-        ));
-        // An archive in a different format (.7z into a zip set) -> repack.
-        assert!(!is_relocatable_archive(
-            &[archived("Game.7z")],
-            "/s/Game.7z",
-            "zip"
-        ));
-        // No entries -> not relocatable.
-        assert!(!is_relocatable_archive(&[], "/s/Game.zip", "zip"));
-    }
-}
+#[path = "archive_planning_tests.rs"]
+mod tests;
