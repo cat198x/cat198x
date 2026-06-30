@@ -1,6 +1,7 @@
 //! Configuration management commands
 
 mod defaults;
+mod get;
 mod set;
 
 use anyhow::Result;
@@ -21,9 +22,7 @@ pub fn run(cmd: ConfigCommands, data_dir: Option<PathBuf>) -> Result<()> {
         } => set::run(&collection, &key, &value, data_dir),
         ConfigCommands::SetDefault { key, value } => defaults::set(&key, &value, data_dir),
         ConfigCommands::GetDefault { key } => defaults::get(key.as_deref(), data_dir),
-        ConfigCommands::Get { collection, key } => {
-            get_config(&collection, key.as_deref(), data_dir)
-        }
+        ConfigCommands::Get { collection, key } => get::run(&collection, key.as_deref(), data_dir),
         ConfigCommands::List { collection } => list_config(collection.as_deref(), data_dir),
     }
 }
@@ -37,131 +36,13 @@ pub fn resolve_quarantine_dir(data_dir: Option<PathBuf>) -> Result<PathBuf> {
     crate::config::resolve_quarantine_dir(&get_data_dir(data_dir)?)
 }
 
-fn get_config(collection: &str, key: Option<&str>, data_dir: Option<PathBuf>) -> Result<()> {
-    let db = open_database(data_dir)?;
-    let conn = db.conn();
-
-    let config = db_config::get_collection_config(conn, collection)?;
-
-    match config {
-        Some(cfg) => {
-            if let Some(k) = key {
-                // Show specific key
-                match k {
-                    "dest_path" => {
-                        if let Some(v) = cfg.dest_path {
-                            println!("{}", v);
-                        } else {
-                            println!("(not set)");
-                        }
-                    }
-                    "output_format" => {
-                        if let Some(v) = cfg.output_format {
-                            println!("{}", v);
-                        } else {
-                            println!("(not set)");
-                        }
-                    }
-                    "merge_mode" => {
-                        if let Some(v) = cfg.merge_mode {
-                            println!("{}", v);
-                        } else {
-                            println!("(not set)");
-                        }
-                    }
-                    "1g1r" => {
-                        let enabled = cfg.extra_config.as_ref().is_some_and(|e| e.one_g_one_r);
-                        println!("{}", if enabled { "on" } else { "off" });
-                    }
-                    "regions" => {
-                        if let Some(ref extra) = cfg.extra_config {
-                            if !extra.region_priority.is_empty() {
-                                println!("{}", extra.region_priority.join(", "));
-                            } else {
-                                println!("(default)");
-                            }
-                        } else {
-                            println!("(default)");
-                        }
-                    }
-                    "exclude_prereleases" => {
-                        let enabled = cfg
-                            .extra_config
-                            .as_ref()
-                            .is_some_and(|e| e.exclude_prereleases);
-                        println!("{}", if enabled { "on" } else { "off" });
-                    }
-                    _ => anyhow::bail!("Unknown config key: '{}'", k),
-                }
-            } else {
-                // Show all keys for collection
-                println!("Configuration for '{}':", collection);
-                println!(
-                    "  dest_path:     {}",
-                    cfg.dest_path.as_deref().unwrap_or("(not set)")
-                );
-                println!(
-                    "  output_format: {}",
-                    cfg.output_format.as_deref().unwrap_or("(not set)")
-                );
-                println!(
-                    "  merge_mode:    {}",
-                    cfg.merge_mode.as_deref().unwrap_or("(not set)")
-                );
-
-                // Show filter settings if any are configured
-                if let Some(ref extra) = cfg.extra_config {
-                    println!();
-                    println!("  Filtering:");
-                    println!(
-                        "    1g1r:               {}",
-                        if extra.one_g_one_r { "on" } else { "off" }
-                    );
-                    if !extra.region_priority.is_empty() {
-                        println!(
-                            "    regions:            {}",
-                            extra.region_priority.join(", ")
-                        );
-                    }
-                    println!(
-                        "    exclude_modified:   {}",
-                        if extra.exclude_modified { "on" } else { "off" }
-                    );
-                    println!(
-                        "    exclude_bad_dumps:  {}",
-                        if extra.exclude_bad_dumps { "on" } else { "off" }
-                    );
-                    println!(
-                        "    exclude_prereleases:{}",
-                        if extra.exclude_prereleases {
-                            "on"
-                        } else {
-                            "off"
-                        }
-                    );
-                }
-            }
-        }
-        None => {
-            if key.is_some() {
-                println!("(not set)");
-            } else {
-                println!("No configuration set for '{}'", collection);
-            }
-        }
-    }
-
-    Ok(())
-}
-
 fn list_config(collection: Option<&str>, data_dir: Option<PathBuf>) -> Result<()> {
-    let db = open_database(data_dir.clone())?;
-    let conn = db.conn();
-
     if let Some(coll) = collection {
-        // Show config for specific collection
-        get_config(coll, None, None)?;
+        get::run(coll, None, data_dir)?;
     } else {
+        let db = open_database(data_dir.clone())?;
+        let conn = db.conn();
+
         // Lead with the library-wide defaults, then the per-collection overrides.
         defaults::get(None, data_dir)?;
         println!();
