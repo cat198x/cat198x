@@ -141,21 +141,13 @@ fn prepare_collection_plan(
     let hierarchy =
         dats::primary_node_path(ctx.conn, version.id)?.unwrap_or_else(|| collection.name.clone());
 
-    // Restrict to requested sets (the top segment of the library path), so a
-    // phase can target e.g. just TOSEC without the arcade sets. Checked before
-    // the match query so excluded collections cost nothing.
-    if let Some(sets) = ctx.opts.set_filter.as_ref() {
-        let set = hierarchy.split('/').next().unwrap_or(hierarchy.as_str());
-        if !sets.iter().any(|s| s == set) {
-            return Ok(CollectionPlanPreparation::Skipped(
-                CollectionPlanningOutcome::ExcludedBySet,
-            ));
-        }
+    if !selected_set_matches(&hierarchy, ctx.opts) {
+        return Ok(CollectionPlanPreparation::Skipped(
+            CollectionPlanningOutcome::ExcludedBySet,
+        ));
     }
 
-    let explicit = cfg.as_ref().and_then(|c| c.dest_path.as_deref());
-
-    let dest_root = match resolve_dest_root(explicit, ctx.default_dest, &hierarchy)? {
+    let dest_root = match collection_dest_root(ctx, cfg.as_ref(), &hierarchy)? {
         Some(root) => root,
         None => {
             // No destination resolved — recorded and reported, never silent.
@@ -165,63 +157,15 @@ fn prepare_collection_plan(
         }
     };
 
-    // Guard against pathological collections before materialising any matches:
-    // a MAME-style meta-aggregate expands to tens of millions of match-rows and
-    // would exhaust memory. Skip-and-report instead of OOM.
-    let match_rows = count_match_rows_capped(ctx.conn, version.id, MAX_MATCH_ROWS)?;
-    if match_rows > MAX_MATCH_ROWS {
-        reporting::oversized_collection(&collection.name);
-        return Ok(CollectionPlanPreparation::Skipped(
-            CollectionPlanningOutcome::SkippedOversized(format!(
-                "{} (>{} match-rows)",
-                collection.name, MAX_MATCH_ROWS
-            )),
-        ));
+    if let Some(outcome) = collection_size_skip(ctx, version.id, &collection.name)? {
+        return Ok(CollectionPlanPreparation::Skipped(outcome));
     }
 
     reporting::planning_collection(&collection.name, &version.version);
 
-    // Effective merge mode (explicit per-collection → per-set rule →
-    // library-wide default). Split mode drops a clone's inherited (merge-tagged)
-    // ROMs from its placement so they live only in the parent; non-merged places
-    // every ROM the DAT lists per game. Merged is not yet wired in the planner.
-    // Shared with `compute_desired_state`.
-    let merge_mode = effective_merge_mode(ctx.conn, ctx.opts, cfg.as_ref(), &hierarchy)?;
-    if merge_mode == MergeMode::Merged {
-        reporting::merged_mode_not_implemented(&collection.name);
-    }
-
-    // Find all matched ROMs for this version. In split mode, a clone's
-    // merge-tagged inherited ROMs are excluded here (they belong to the parent),
-    // so the clone is placed with only its own unique ROMs.
-    let matches = find_matched_roms(
-        ctx.conn,
-        version.id,
-        &collection.name,
-        merge_mode == MergeMode::Split,
-    )?;
-
-    // Apply 1G1R filtering if enabled for this collection.
-    let matches = match cfg.as_ref().and_then(|c| c.extra_config.as_ref()) {
-        Some(extra) if extra.one_g_one_r => {
-            let prefs = extra.to_filter_preferences();
-            let original_count = matches.len();
-            let filtered = apply_one_g_one_r_filter(&matches, &prefs);
-            if filtered.len() < original_count {
-                reporting::one_g_one_r(original_count, filtered.len());
-            }
-            filtered
-        }
-        _ => matches,
-    };
-
-    // Effective output format (explicit per-collection → per-set rule →
-    // library-wide default). The per-set tier lets whole sets diverge — TOSEC
-    // kept as zip, TOSEC-PIX left loose for later PDF/collateral extraction —
-    // without configuring every collection. Loose copies each ROM into place;
-    // zip/torrentzip packs each game into one archive. Shared with
-    // `compute_desired_state`.
-    let format = effective_format(ctx.conn, ctx.opts, cfg.as_ref(), &hierarchy)?;
+    let merge_mode = collection_merge_mode(ctx, cfg.as_ref(), &hierarchy, &collection.name)?;
+    let matches = collection_matches(ctx, version.id, &collection.name, merge_mode, cfg.as_ref())?;
+    let format = collection_format(ctx, cfg.as_ref(), &hierarchy)?;
 
     Ok(CollectionPlanPreparation::Ready(PreparedCollectionPlan {
         name: collection.name.clone(),
@@ -230,6 +174,113 @@ fn prepare_collection_plan(
         matches,
         format,
     }))
+}
+
+fn selected_set_matches(hierarchy: &str, opts: &PlanOptions) -> bool {
+    let Some(sets) = opts.set_filter.as_ref() else {
+        return true;
+    };
+
+    let set = hierarchy.split('/').next().unwrap_or(hierarchy);
+    sets.iter().any(|s| s == set)
+}
+
+fn collection_dest_root(
+    ctx: &CollectionPlanningContext<'_>,
+    cfg: Option<&db_config::CollectionConfig>,
+    hierarchy: &str,
+) -> Result<Option<String>> {
+    let explicit = cfg.and_then(|c| c.dest_path.as_deref());
+    resolve_dest_root(explicit, ctx.default_dest, hierarchy)
+}
+
+fn collection_size_skip(
+    ctx: &CollectionPlanningContext<'_>,
+    version_id: i64,
+    collection_name: &str,
+) -> Result<Option<CollectionPlanningOutcome>> {
+    // Guard against pathological collections before materialising any matches:
+    // a MAME-style meta-aggregate expands to tens of millions of match-rows and
+    // would exhaust memory. Skip-and-report instead of OOM.
+    let match_rows = count_match_rows_capped(ctx.conn, version_id, MAX_MATCH_ROWS)?;
+    if match_rows <= MAX_MATCH_ROWS {
+        return Ok(None);
+    }
+
+    reporting::oversized_collection(collection_name);
+    Ok(Some(CollectionPlanningOutcome::SkippedOversized(format!(
+        "{collection_name} (>{MAX_MATCH_ROWS} match-rows)"
+    ))))
+}
+
+fn collection_merge_mode(
+    ctx: &CollectionPlanningContext<'_>,
+    cfg: Option<&db_config::CollectionConfig>,
+    hierarchy: &str,
+    collection_name: &str,
+) -> Result<MergeMode> {
+    // Effective merge mode (explicit per-collection -> per-set rule ->
+    // library-wide default). Split mode drops a clone's inherited (merge-tagged)
+    // ROMs from its placement so they live only in the parent; non-merged places
+    // every ROM the DAT lists per game. Merged is not yet wired in the planner.
+    // Shared with `compute_desired_state`.
+    let merge_mode = effective_merge_mode(ctx.conn, ctx.opts, cfg, hierarchy)?;
+    if merge_mode == MergeMode::Merged {
+        reporting::merged_mode_not_implemented(collection_name);
+    }
+    Ok(merge_mode)
+}
+
+fn collection_matches(
+    ctx: &CollectionPlanningContext<'_>,
+    version_id: i64,
+    collection_name: &str,
+    merge_mode: MergeMode,
+    cfg: Option<&db_config::CollectionConfig>,
+) -> Result<Vec<MatchedRom>> {
+    // Find all matched ROMs for this version. In split mode, a clone's
+    // merge-tagged inherited ROMs are excluded here (they belong to the parent),
+    // so the clone is placed with only its own unique ROMs.
+    let matches = find_matched_roms(
+        ctx.conn,
+        version_id,
+        collection_name,
+        merge_mode == MergeMode::Split,
+    )?;
+
+    Ok(apply_collection_filter(matches, cfg))
+}
+
+fn apply_collection_filter(
+    matches: Vec<MatchedRom>,
+    cfg: Option<&db_config::CollectionConfig>,
+) -> Vec<MatchedRom> {
+    let Some(extra) = cfg.and_then(|c| c.extra_config.as_ref()) else {
+        return matches;
+    };
+
+    if !extra.one_g_one_r {
+        return matches;
+    }
+
+    let prefs = extra.to_filter_preferences();
+    let original_count = matches.len();
+    let filtered = apply_one_g_one_r_filter(&matches, &prefs);
+    if filtered.len() < original_count {
+        reporting::one_g_one_r(original_count, filtered.len());
+    }
+    filtered
+}
+
+fn collection_format(
+    ctx: &CollectionPlanningContext<'_>,
+    cfg: Option<&db_config::CollectionConfig>,
+    hierarchy: &str,
+) -> Result<OutputFormat> {
+    // Effective output format (explicit per-collection -> per-set rule ->
+    // library-wide default). The per-set tier lets whole sets diverge without
+    // configuring every collection. Shared with `compute_desired_state`.
+    effective_format(ctx.conn, ctx.opts, cfg, hierarchy)
 }
 
 fn plan_collection_matches(
