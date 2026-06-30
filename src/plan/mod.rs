@@ -1,6 +1,7 @@
 //! Plan generation and management
 
 pub mod apply;
+pub(crate) mod archive_game;
 pub(crate) mod archive_planning;
 pub(crate) mod collection_planning;
 pub(crate) mod collisions;

@@ -1,11 +1,12 @@
-use anyhow::{Context, Result};
+use anyhow::Result;
 use std::collections::{BTreeMap, HashMap, HashSet};
 
+use super::archive_game::ArchiveGame;
 use super::destinations::{build_archive_dest_path, validate_relative_path};
 use super::matching::MatchedRom;
 use super::placement_planning::PlacementPlanCounts;
 use super::source_policy::{dedup_reason, is_in_library, may_delete, may_move};
-use super::{ContainerRebuild, Plan, RebuildEntry, SourceRef};
+use super::{ContainerRebuild, Plan, RebuildEntry};
 use crate::db::files::Disposition;
 
 /// Accumulates, across the games that repack from one staging container, the
@@ -67,144 +68,12 @@ pub(crate) struct ArchivePlanSinks<'a> {
     pub(crate) drain_after_repack: &'a mut BTreeMap<String, ContainerDrain>,
 }
 
-type ContentKey = (String, String);
-
-struct ArchiveGame {
-    expected: Vec<ContentKey>,
-    expected_keys: Vec<ContentKey>,
-    containers: BTreeMap<String, Vec<MatchedRom>>,
-    container_keys: HashMap<String, HashSet<ContentKey>>,
-    holders: HashMap<ContentKey, Vec<String>>,
-    name_size: HashMap<String, u64>,
-}
-
-impl ArchiveGame {
-    fn from_matches(matches: Vec<MatchedRom>) -> Self {
-        let mut expected = Vec::new();
-        let mut seen = HashSet::new();
-        let mut containers: BTreeMap<String, Vec<MatchedRom>> = BTreeMap::new();
-        let mut container_keys: HashMap<String, HashSet<ContentKey>> = HashMap::new();
-        let mut holders: HashMap<ContentKey, Vec<String>> = HashMap::new();
-        let mut name_size: HashMap<String, u64> = HashMap::new();
-
-        for m in matches {
-            if seen.insert((m.rom_name.clone(), m.sha1.clone())) {
-                expected.push((m.rom_name.clone(), m.sha1.clone()));
-            }
-
-            let container = format!("{}/{}", m.source_root, m.source_path);
-            name_size.entry(m.rom_name.clone()).or_insert(m.size as u64);
-
-            let key = content_key(&m.rom_name, &m.sha1);
-            let keys = container_keys.entry(container.clone()).or_default();
-            if keys.insert(key.clone()) {
-                holders.entry(key).or_default().push(container.clone());
-            }
-            containers.entry(container).or_default().push(m);
-        }
-
-        let expected_keys = expected
-            .iter()
-            .map(|(name, sha1)| content_key(name, sha1))
-            .collect();
-
-        Self {
-            expected,
-            expected_keys,
-            containers,
-            container_keys,
-            holders,
-            name_size,
-        }
-    }
-
-    fn is_complete(&self, path: &str) -> bool {
-        self.container_keys
-            .get(path)
-            .is_some_and(|set| self.expected_keys.iter().all(|key| set.contains(key)))
-    }
-
-    fn build_from(&self, dest: &str) -> Option<String> {
-        if self.is_complete(dest) {
-            return Some(dest.to_string());
-        }
-
-        self.expected_keys
-            .iter()
-            .map(|key| self.holders.get(key).map_or(&[][..], Vec::as_slice))
-            .min_by_key(|paths| paths.len())
-            .and_then(|candidates| {
-                candidates
-                    .iter()
-                    .find(|path| self.is_complete(path))
-                    .cloned()
-            })
-    }
-
-    fn has_shared_content(&self, shared: &HashSet<String>) -> bool {
-        self.expected.iter().any(|(_, sha1)| shared.contains(sha1))
-    }
-
-    fn expected_size(&self) -> u64 {
-        self.expected
-            .iter()
-            .filter_map(|(name, _)| self.name_size.get(name).copied())
-            .sum()
-    }
-
-    fn source_refs_for(&self, game_name: &str, build_from: Option<&str>) -> Result<Vec<SourceRef>> {
-        match build_from {
-            Some(path) => self.containers[path]
-                .iter()
-                .map(source_ref_for)
-                .collect::<Result<Vec<_>>>()
-                .with_context(|| format!("invalid DAT path in {game_name}")),
-            None => self
-                .containers
-                .values()
-                .flatten()
-                .map(source_ref_for)
-                .collect::<Result<Vec<_>>>()
-                .with_context(|| format!("invalid DAT path in {game_name}")),
-        }
-    }
-
-    fn feeder_roots(&self, build_from: Option<&str>) -> Vec<&str> {
-        match build_from {
-            Some(path) => self.containers[path]
-                .iter()
-                .map(|m| m.source_root.as_str())
-                .collect(),
-            None => self
-                .containers
-                .values()
-                .flatten()
-                .map(|m| m.source_root.as_str())
-                .collect(),
-        }
-    }
-}
-
-fn content_key(name: &str, sha1: &str) -> ContentKey {
-    (name.to_string(), sha1.to_ascii_lowercase())
-}
-
 fn container_archive_format(path: &str) -> String {
     if path.to_ascii_lowercase().ends_with(".7z") {
         "7z".to_string()
     } else {
         "zip".to_string()
     }
-}
-
-fn source_ref_for(m: &MatchedRom) -> Result<SourceRef> {
-    validate_relative_path("ROM entry name", &m.rom_name)?;
-    Ok(SourceRef {
-        path: format!("{}/{}", m.source_root, m.source_path),
-        archive_path: m.archive_path.clone(),
-        sha1: m.sha1.clone(),
-        entry_name: Some(m.rom_name.clone()),
-    })
 }
 
 /// Plan archive-format ROM matches: one archive per game at
