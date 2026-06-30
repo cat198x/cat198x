@@ -4,12 +4,11 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 
 use super::collection_matches::{CollectionMatchInputs, load_collection_matches};
 use super::collection_scope::{ScopedCollectionResolution, resolve_scoped_collection};
+use super::collection_settings::resolve_collection_settings;
 use super::destinations::{build_archive_dest_path, build_dest_path, build_disk_dest_path};
 use super::matching::{MatchedRom, count_match_rows_capped};
 use super::options::PlanOptions;
-use super::rules::{
-    MAX_MATCH_ROWS, archive_extension, archive_format_tag, effective_format, effective_merge_mode,
-};
+use super::rules::{MAX_MATCH_ROWS, archive_extension, archive_format_tag};
 use super::scope::collection_name_matches;
 use crate::config::OutputFormat;
 use crate::db::collections;
@@ -77,19 +76,20 @@ pub fn compute_desired_state(
             continue;
         }
 
-        let merge_mode = effective_merge_mode(conn, opts, scoped.cfg.as_ref(), &scoped.hierarchy)?;
+        let settings =
+            resolve_collection_settings(conn, opts, scoped.cfg.as_ref(), &scoped.hierarchy)?;
         let matches = load_collection_matches(CollectionMatchInputs {
             conn,
             version_id: scoped.version.id,
             collection_name: &scoped.name,
-            merge_mode,
+            merge_mode: settings.merge_mode,
             cfg: scoped.cfg.as_ref(),
         })?;
         record_collection_desired_state(
             &mut state,
             &dest_root,
             matches.matches,
-            effective_format(conn, opts, scoped.cfg.as_ref(), &scoped.hierarchy)?,
+            settings.format,
             interesting_sha1s,
         )?;
     }

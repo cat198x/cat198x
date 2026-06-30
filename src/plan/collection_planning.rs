@@ -5,18 +5,17 @@ use std::collections::{HashMap, HashSet};
 use super::archive_planning::{ArchivePlanInputs, ArchivePlanSinks, plan_archive_matches};
 use super::collection_matches::{CollectionMatchInputs, load_collection_matches};
 use super::collection_scope::{ScopedCollectionResolution, resolve_scoped_collection};
+use super::collection_settings::resolve_collection_settings;
 use super::container_drains::ContainerDrains;
 use super::matching::{MatchedRom, count_match_rows_capped};
 use super::options::PlanOptions;
 use super::placement_planning::{PlacementPlanCounts, plan_disk_matches, plan_loose_matches};
 use super::reporting;
-use super::rules::{
-    MAX_MATCH_ROWS, archive_extension, archive_format_tag, effective_format, effective_merge_mode,
-};
+use super::rules::{MAX_MATCH_ROWS, archive_extension, archive_format_tag};
 use super::{CollectionPlanStat, Plan};
 use crate::config::{MergeMode, OutputFormat};
+use crate::db::collections;
 use crate::db::files::Disposition;
-use crate::db::{collections, config as db_config};
 
 pub(crate) struct CollectionPlanningContext<'a> {
     pub(crate) conn: &'a Connection,
@@ -155,26 +154,28 @@ fn prepare_collection_plan(
 
     reporting::planning_collection(&scoped.name, &scoped.version.version);
 
-    let merge_mode =
-        collection_merge_mode(ctx, scoped.cfg.as_ref(), &scoped.hierarchy, &scoped.name)?;
+    let settings =
+        resolve_collection_settings(ctx.conn, ctx.opts, scoped.cfg.as_ref(), &scoped.hierarchy)?;
+    if settings.merge_mode == MergeMode::Merged {
+        reporting::merged_mode_not_implemented(&scoped.name);
+    }
     let matches = load_collection_matches(CollectionMatchInputs {
         conn: ctx.conn,
         version_id: scoped.version.id,
         collection_name: &scoped.name,
-        merge_mode,
+        merge_mode: settings.merge_mode,
         cfg: scoped.cfg.as_ref(),
     })?;
     if matches.matches.len() < matches.original_count {
         reporting::one_g_one_r(matches.original_count, matches.matches.len());
     }
-    let format = collection_format(ctx, scoped.cfg.as_ref(), &scoped.hierarchy)?;
 
     Ok(CollectionPlanPreparation::Ready(PreparedCollectionPlan {
         name: scoped.name,
         hierarchy: scoped.hierarchy,
         dest_root,
         matches: matches.matches,
-        format,
+        format: settings.format,
     }))
 }
 
@@ -195,35 +196,6 @@ fn collection_size_skip(
     Ok(Some(CollectionPlanningOutcome::SkippedOversized(format!(
         "{collection_name} (>{MAX_MATCH_ROWS} match-rows)"
     ))))
-}
-
-fn collection_merge_mode(
-    ctx: &CollectionPlanningContext<'_>,
-    cfg: Option<&db_config::CollectionConfig>,
-    hierarchy: &str,
-    collection_name: &str,
-) -> Result<MergeMode> {
-    // Effective merge mode (explicit per-collection -> per-set rule ->
-    // library-wide default). Split mode drops a clone's inherited (merge-tagged)
-    // ROMs from its placement so they live only in the parent; non-merged places
-    // every ROM the DAT lists per game. Merged is not yet wired in the planner.
-    // Shared with `compute_desired_state`.
-    let merge_mode = effective_merge_mode(ctx.conn, ctx.opts, cfg, hierarchy)?;
-    if merge_mode == MergeMode::Merged {
-        reporting::merged_mode_not_implemented(collection_name);
-    }
-    Ok(merge_mode)
-}
-
-fn collection_format(
-    ctx: &CollectionPlanningContext<'_>,
-    cfg: Option<&db_config::CollectionConfig>,
-    hierarchy: &str,
-) -> Result<OutputFormat> {
-    // Effective output format (explicit per-collection -> per-set rule ->
-    // library-wide default). The per-set tier lets whole sets diverge without
-    // configuring every collection. Shared with `compute_desired_state`.
-    effective_format(ctx.conn, ctx.opts, cfg, hierarchy)
 }
 
 fn plan_collection_matches(

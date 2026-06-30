@@ -6,6 +6,7 @@ pub(crate) mod archive_planning;
 pub(crate) mod collection_matches;
 pub(crate) mod collection_planning;
 pub(crate) mod collection_scope;
+pub(crate) mod collection_settings;
 pub(crate) mod collisions;
 pub(crate) mod container_drains;
 pub(crate) mod coverage;
