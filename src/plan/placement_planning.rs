@@ -19,6 +19,16 @@ pub(crate) struct PlacementPlanCounts {
     pub(crate) bytes: u64,
 }
 
+impl PlacementPlanCounts {
+    pub(crate) fn merge(&mut self, delta: Self) {
+        self.already_correct += delta.already_correct;
+        self.to_write += delta.to_write;
+        self.relocated += delta.relocated;
+        self.deduped += delta.deduped;
+        self.bytes += delta.bytes;
+    }
+}
+
 /// Plan loose ROM matches: one canonical file per destination, with redundant
 /// loose copies deleted only when the source disposition permits it.
 pub(crate) fn plan_loose_matches(

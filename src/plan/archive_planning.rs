@@ -51,10 +51,9 @@ pub(crate) fn plan_archive_matches(
     }
 
     for (game_name, gmatches) in games {
-        merge_counts(
-            &mut counts,
-            plan_archive_game(&game_name, gmatches, &inputs, &mut sinks)?,
-        );
+        counts.merge(plan_archive_game(
+            &game_name, gmatches, &inputs, &mut sinks,
+        )?);
     }
 
     Ok(counts)
@@ -82,18 +81,15 @@ fn plan_archive_game(
         sinks.plan.add_relocate(src.to_string(), dest.clone(), size);
         counts.relocated += 1;
     } else {
-        merge_counts(
-            &mut counts,
-            plan_repack(
-                game_name,
-                &dest,
-                build_from.as_deref(),
-                &game,
-                game_shared,
-                inputs,
-                sinks,
-            )?,
-        );
+        counts.merge(plan_repack(
+            game_name,
+            &dest,
+            build_from.as_deref(),
+            &game,
+            game_shared,
+            inputs,
+            sinks,
+        )?);
     }
 
     if !game_shared {
@@ -108,14 +104,6 @@ fn plan_archive_game(
     }
 
     Ok(counts)
-}
-
-fn merge_counts(total: &mut PlacementPlanCounts, delta: PlacementPlanCounts) {
-    total.already_correct += delta.already_correct;
-    total.to_write += delta.to_write;
-    total.relocated += delta.relocated;
-    total.deduped += delta.deduped;
-    total.bytes += delta.bytes;
 }
 
 fn relocatable_source<'a>(
