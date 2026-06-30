@@ -1,9 +1,8 @@
 use anyhow::Result;
 use std::path::PathBuf;
 
+use crate::cli::open_database;
 use crate::db::config as db_config;
-
-use super::open_database;
 
 pub(super) fn run(
     collection: &str,
