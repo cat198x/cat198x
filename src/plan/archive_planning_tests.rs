@@ -15,6 +15,15 @@ fn archived_match(path: &str) -> MatchedRom {
     }
 }
 
+fn archived_match_at(source_root: &str, source_path: &str, sha1: &str) -> MatchedRom {
+    MatchedRom {
+        source_root: source_root.into(),
+        source_path: source_path.into(),
+        sha1: sha1.into(),
+        ..archived_match(source_path)
+    }
+}
+
 fn plan_inputs<'a>(
     tag: &'a str,
     ext: &'a str,
@@ -30,6 +39,18 @@ fn plan_inputs<'a>(
         shared,
         shared_containers,
         dispositions,
+    }
+}
+
+fn plan_inputs_with_default_dest<'a>(
+    default_dest: Option<&'a str>,
+    shared: &'a HashSet<String>,
+    shared_containers: &'a HashSet<String>,
+    dispositions: &'a HashMap<String, Disposition>,
+) -> ArchivePlanInputs<'a> {
+    ArchivePlanInputs {
+        default_dest,
+        ..plan_inputs("zip", "zip", shared, shared_containers, dispositions)
     }
 }
 
@@ -122,5 +143,53 @@ fn archive_game_action_repacks_shared_or_torrentzip_content() {
             &torrentzip_inputs
         ),
         ArchiveGameAction::Repack
+    );
+}
+
+#[test]
+fn archive_dedup_delete_candidates_skip_protected_containers() {
+    let game = ArchiveGame::from_matches(vec![
+        archived_match_at("/stage", "candidate.zip", "AAA"),
+        archived_match_at("/dest", "G.zip", "AAA"),
+        archived_match_at("/stage", "build.zip", "AAA"),
+        archived_match_at("/stage", "shared.zip", "AAA"),
+        archived_match_at("/library", "Other.zip", "AAA"),
+        archived_match_at("/preserve", "outside.zip", "AAA"),
+    ]);
+    let shared = HashSet::new();
+    let shared_containers = HashSet::from(["/stage/shared.zip".to_string()]);
+    let dispositions = HashMap::from([
+        ("/stage".to_string(), Disposition::Consume),
+        ("/preserve".to_string(), Disposition::Preserve),
+    ]);
+    let inputs =
+        plan_inputs_with_default_dest(Some("/library"), &shared, &shared_containers, &dispositions);
+
+    assert_eq!(
+        archive_dedup_delete_candidates(&game, "/dest/G.zip", Some("/stage/build.zip"), &inputs),
+        vec!["/stage/candidate.zip"]
+    );
+}
+
+#[test]
+fn archive_dedup_delete_candidates_allow_preserve_source_with_same_tree_survivor() {
+    let game =
+        ArchiveGame::from_matches(vec![archived_match_at("/preserve", "staged/G.zip", "AAA")]);
+    let shared = HashSet::new();
+    let shared_containers = HashSet::new();
+    let dispositions = HashMap::from([("/preserve".to_string(), Disposition::Preserve)]);
+    let inputs = ArchivePlanInputs {
+        tag: "zip",
+        ext: "zip",
+        dest_root: "/preserve/library",
+        default_dest: None,
+        shared: &shared,
+        shared_containers: &shared_containers,
+        dispositions: &dispositions,
+    };
+
+    assert_eq!(
+        archive_dedup_delete_candidates(&game, "/preserve/library/G.zip", None, &inputs),
+        vec!["/preserve/staged/G.zip"]
     );
 }

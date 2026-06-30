@@ -231,6 +231,20 @@ fn add_dedup_deletes(
     sinks: &mut ArchivePlanSinks<'_>,
     counts: &mut PlacementPlanCounts,
 ) {
+    for path in archive_dedup_delete_candidates(game, dest, build_from, inputs) {
+        sinks.plan.add_delete(path.to_string(), dedup_reason(dest));
+        counts.deduped += 1;
+    }
+}
+
+fn archive_dedup_delete_candidates<'a>(
+    game: &'a ArchiveGame,
+    dest: &str,
+    build_from: Option<&str>,
+    inputs: &ArchivePlanInputs<'_>,
+) -> Vec<&'a str> {
+    let mut candidates = Vec::new();
+
     for (path, entries) in &game.containers {
         if path == dest
             || build_from == Some(path.as_str())
@@ -239,12 +253,16 @@ fn add_dedup_deletes(
         {
             continue;
         }
-        if !may_delete(inputs.dispositions, &entries[0].source_root, dest) {
+
+        let Some(first) = entries.first() else {
             continue;
+        };
+        if may_delete(inputs.dispositions, &first.source_root, dest) {
+            candidates.push(path.as_str());
         }
-        sinks.plan.add_delete(path.clone(), dedup_reason(dest));
-        counts.deduped += 1;
     }
+
+    candidates
 }
 
 #[cfg(test)]
