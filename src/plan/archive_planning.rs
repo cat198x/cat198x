@@ -176,23 +176,33 @@ fn plan_repack(
     let size = game.expected_size();
     counts.bytes += size;
 
-    let feeders = game.feeder_roots(build_from);
-    let consume_feeders = !feeders.is_empty()
-        && feeders
-            .iter()
-            .all(|root| may_delete(inputs.dispositions, root, dest));
     sinks.plan.add_repack(
         sources,
         dest.to_string(),
         inputs.tag.to_string(),
         size,
-        consume_feeders && !game_shared,
+        can_consume_repack_feeders(game, build_from, dest, game_shared, inputs),
     );
     counts.to_write += 1;
 
     record_container_drain(game, dest, build_from, inputs, sinks)?;
 
     Ok(counts)
+}
+
+fn can_consume_repack_feeders(
+    game: &ArchiveGame,
+    build_from: Option<&str>,
+    dest: &str,
+    game_shared: bool,
+    inputs: &ArchivePlanInputs<'_>,
+) -> bool {
+    let feeders = game.feeder_roots(build_from);
+    !game_shared
+        && !feeders.is_empty()
+        && feeders
+            .iter()
+            .all(|root| may_delete(inputs.dispositions, root, dest))
 }
 
 fn record_container_drain(
@@ -202,17 +212,7 @@ fn record_container_drain(
     inputs: &ArchivePlanInputs<'_>,
     sinks: &mut ArchivePlanSinks<'_>,
 ) -> Result<()> {
-    let Some(container) = build_from.filter(|container| {
-        *container != dest
-            && game
-                .containers
-                .get(*container)
-                .and_then(|entries| entries.first())
-                .is_some_and(|m| {
-                    m.archive_path.is_some()
-                        && may_delete(inputs.dispositions, &m.source_root, dest)
-                })
-    }) else {
+    let Some(container) = drainable_repack_container(game, dest, build_from, inputs) else {
         return Ok(());
     };
 
@@ -221,6 +221,19 @@ fn record_container_drain(
         dest,
         &game.containers[container],
     )
+}
+
+fn drainable_repack_container<'a>(
+    game: &ArchiveGame,
+    dest: &str,
+    build_from: Option<&'a str>,
+    inputs: &ArchivePlanInputs<'_>,
+) -> Option<&'a str> {
+    let container = build_from.filter(|container| *container != dest)?;
+    let first = game.containers.get(container)?.first()?;
+
+    (first.archive_path.is_some() && may_delete(inputs.dispositions, &first.source_root, dest))
+        .then_some(container)
 }
 
 fn add_dedup_deletes(

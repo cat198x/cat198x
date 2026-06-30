@@ -193,3 +193,107 @@ fn archive_dedup_delete_candidates_allow_preserve_source_with_same_tree_survivor
         vec!["/preserve/staged/G.zip"]
     );
 }
+
+#[test]
+fn can_consume_repack_feeders_requires_non_shared_deletable_sources() {
+    let game = ArchiveGame::from_matches(vec![archived_match_at("/stage", "G.zip", "AAA")]);
+    let shared = HashSet::new();
+    let shared_containers = HashSet::new();
+    let dispositions = HashMap::from([("/stage".to_string(), Disposition::Consume)]);
+    let inputs = plan_inputs("zip", "zip", &shared, &shared_containers, &dispositions);
+
+    assert!(can_consume_repack_feeders(
+        &game,
+        Some("/stage/G.zip"),
+        "/dest/G.zip",
+        false,
+        &inputs
+    ));
+    assert!(!can_consume_repack_feeders(
+        &game,
+        Some("/stage/G.zip"),
+        "/dest/G.zip",
+        true,
+        &inputs
+    ));
+
+    let preserve_game =
+        ArchiveGame::from_matches(vec![archived_match_at("/preserve", "G.zip", "AAA")]);
+    let preserve_dispositions = HashMap::from([("/preserve".to_string(), Disposition::Preserve)]);
+    let preserve_inputs = plan_inputs(
+        "zip",
+        "zip",
+        &shared,
+        &shared_containers,
+        &preserve_dispositions,
+    );
+    assert!(!can_consume_repack_feeders(
+        &preserve_game,
+        Some("/preserve/G.zip"),
+        "/dest/G.zip",
+        false,
+        &preserve_inputs
+    ));
+}
+
+#[test]
+fn can_consume_repack_feeders_allows_preserve_source_with_same_tree_survivor() {
+    let game =
+        ArchiveGame::from_matches(vec![archived_match_at("/preserve", "staged/G.zip", "AAA")]);
+    let shared = HashSet::new();
+    let shared_containers = HashSet::new();
+    let dispositions = HashMap::from([("/preserve".to_string(), Disposition::Preserve)]);
+    let inputs = ArchivePlanInputs {
+        tag: "zip",
+        ext: "zip",
+        dest_root: "/preserve/library",
+        default_dest: None,
+        shared: &shared,
+        shared_containers: &shared_containers,
+        dispositions: &dispositions,
+    };
+
+    assert!(can_consume_repack_feeders(
+        &game,
+        Some("/preserve/staged/G.zip"),
+        "/preserve/library/G.zip",
+        false,
+        &inputs
+    ));
+}
+
+#[test]
+fn drainable_repack_container_requires_distinct_archived_deletable_container() {
+    let game = ArchiveGame::from_matches(vec![
+        archived_match_at("/stage", "G.zip", "AAA"),
+        MatchedRom {
+            archive_path: None,
+            ..archived_match_at("/stage", "loose.rom", "AAA")
+        },
+        archived_match_at("/preserve", "P.zip", "AAA"),
+    ]);
+    let shared = HashSet::new();
+    let shared_containers = HashSet::new();
+    let dispositions = HashMap::from([
+        ("/stage".to_string(), Disposition::Consume),
+        ("/preserve".to_string(), Disposition::Preserve),
+    ]);
+    let inputs = plan_inputs("zip", "zip", &shared, &shared_containers, &dispositions);
+
+    assert_eq!(
+        drainable_repack_container(&game, "/dest/G.zip", Some("/stage/G.zip"), &inputs),
+        Some("/stage/G.zip")
+    );
+    assert_eq!(
+        drainable_repack_container(&game, "/stage/G.zip", Some("/stage/G.zip"), &inputs),
+        None
+    );
+    assert_eq!(
+        drainable_repack_container(&game, "/dest/G.zip", Some("/stage/loose.rom"), &inputs),
+        None
+    );
+    assert_eq!(
+        drainable_repack_container(&game, "/dest/G.zip", Some("/preserve/P.zip"), &inputs),
+        None
+    );
+}
