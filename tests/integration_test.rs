@@ -4,7 +4,7 @@
 //! init → dat add → source add → scan → status
 
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tempfile::TempDir;
 
 // Import the library crate
@@ -45,6 +45,45 @@ impl TestEnv {
 
     fn data_dir_opt(&self) -> Option<PathBuf> {
         Some(self.data_dir.clone())
+    }
+
+    fn add_source(&self, path: &Path, preserve: bool, consume: bool) {
+        use cat198x::SourceCommands;
+
+        cli::source::run(
+            SourceCommands::Add {
+                preserve,
+                consume,
+                path: path.to_path_buf(),
+            },
+            self.data_dir_opt(),
+        )
+        .expect("source add failed");
+    }
+
+    fn source_id(&self, path: &Path, message: &str) -> i64 {
+        let db = self.db();
+        let conn = db.conn();
+        let root = fs::canonicalize(path)
+            .expect("source path should canonicalize")
+            .to_string_lossy()
+            .into_owned();
+        cat198x::db::files::list_sources(conn)
+            .expect("sources should list")
+            .into_iter()
+            .find(|source| source.path == root)
+            .expect(message)
+            .id
+    }
+
+    fn single_reclaim_log(&self) -> String {
+        let logs_dir = self.data_dir.join("objects/reclaim-logs");
+        let logs: Vec<_> = fs::read_dir(&logs_dir)
+            .expect("reclaim log directory should exist")
+            .filter_map(|entry| entry.ok())
+            .collect();
+        assert_eq!(logs.len(), 1);
+        fs::read_to_string(logs[0].path()).expect("reclaim log should be readable")
     }
 }
 
@@ -377,42 +416,12 @@ fn test_reclaim_execute_removes_redundant_consume_source_file() {
         .unwrap()
         .sha1;
 
-    use cat198x::SourceCommands;
-    cli::source::run(
-        SourceCommands::Add {
-            preserve: false,
-            consume: true,
-            path: staging_dir.clone(),
-        },
-        env.data_dir_opt(),
-    )
-    .unwrap();
-    cli::source::run(
-        SourceCommands::Add {
-            preserve: true,
-            consume: false,
-            path: library_dir.clone(),
-        },
-        env.data_dir_opt(),
-    )
-    .unwrap();
+    env.add_source(&staging_dir, false, true);
+    env.add_source(&library_dir, true, false);
 
     cli::scan::run(None, false, None, env.data_dir_opt()).unwrap();
 
-    let staging_id = {
-        let db = env.db();
-        let conn = db.conn();
-        let staging_root = fs::canonicalize(&staging_dir)
-            .unwrap()
-            .to_string_lossy()
-            .into_owned();
-        cat198x::db::files::list_sources(conn)
-            .unwrap()
-            .into_iter()
-            .find(|source| source.path == staging_root)
-            .expect("staging source exists")
-            .id
-    };
+    let staging_id = env.source_id(&staging_dir, "staging source exists");
 
     cli::reclaim::run(Some(staging_id.to_string()), true, env.data_dir_opt()).unwrap();
 
@@ -425,14 +434,7 @@ fn test_reclaim_execute_removes_redundant_consume_source_file() {
     assert_eq!(locations.len(), 1);
     assert_eq!(locations[0].path, "copy.rom");
 
-    let logs_dir = env.data_dir.join("objects/reclaim-logs");
-    let logs: Vec<_> = fs::read_dir(&logs_dir)
-        .unwrap()
-        .filter_map(|entry| entry.ok())
-        .collect();
-    assert_eq!(logs.len(), 1);
-    let log = fs::read_to_string(logs[0].path()).unwrap();
-    assert_eq!(log, staging_file_canonical);
+    assert_eq!(env.single_reclaim_log(), staging_file_canonical);
 }
 
 #[test]
@@ -448,42 +450,12 @@ fn test_reclaim_execute_refuses_preserve_source() {
         .unwrap()
         .sha1;
 
-    use cat198x::SourceCommands;
-    cli::source::run(
-        SourceCommands::Add {
-            preserve: true,
-            consume: false,
-            path: preserve_dir.clone(),
-        },
-        env.data_dir_opt(),
-    )
-    .unwrap();
-    cli::source::run(
-        SourceCommands::Add {
-            preserve: true,
-            consume: false,
-            path: library_dir.clone(),
-        },
-        env.data_dir_opt(),
-    )
-    .unwrap();
+    env.add_source(&preserve_dir, true, false);
+    env.add_source(&library_dir, true, false);
 
     cli::scan::run(None, false, None, env.data_dir_opt()).unwrap();
 
-    let preserve_id = {
-        let db = env.db();
-        let conn = db.conn();
-        let preserve_root = fs::canonicalize(&preserve_dir)
-            .unwrap()
-            .to_string_lossy()
-            .into_owned();
-        cat198x::db::files::list_sources(conn)
-            .unwrap()
-            .into_iter()
-            .find(|source| source.path == preserve_root)
-            .expect("preserve source exists")
-            .id
-    };
+    let preserve_id = env.source_id(&preserve_dir, "preserve source exists");
 
     cli::reclaim::run(Some(preserve_id.to_string()), true, env.data_dir_opt()).unwrap();
 
@@ -526,52 +498,13 @@ fn test_reclaim_execute_removes_redundant_archive_container() {
         .map(|(_, content)| cat198x::util::hex_upper(sha1::Sha1::digest(content)))
         .collect::<Vec<_>>();
 
-    use cat198x::SourceCommands;
-    cli::source::run(
-        SourceCommands::Add {
-            preserve: false,
-            consume: true,
-            path: staging_dir.clone(),
-        },
-        env.data_dir_opt(),
-    )
-    .unwrap();
-    cli::source::run(
-        SourceCommands::Add {
-            preserve: true,
-            consume: false,
-            path: library_dir.clone(),
-        },
-        env.data_dir_opt(),
-    )
-    .unwrap();
+    env.add_source(&staging_dir, false, true);
+    env.add_source(&library_dir, true, false);
 
     cli::scan::run(None, false, None, env.data_dir_opt()).unwrap();
 
-    let (staging_id, library_id) = {
-        let db = env.db();
-        let conn = db.conn();
-        let staging_root = fs::canonicalize(&staging_dir)
-            .unwrap()
-            .to_string_lossy()
-            .into_owned();
-        let library_root = fs::canonicalize(&library_dir)
-            .unwrap()
-            .to_string_lossy()
-            .into_owned();
-        let sources = cat198x::db::files::list_sources(conn).unwrap();
-        let staging_id = sources
-            .iter()
-            .find(|source| source.path == staging_root)
-            .expect("staging source exists")
-            .id;
-        let library_id = sources
-            .iter()
-            .find(|source| source.path == library_root)
-            .expect("library source exists")
-            .id;
-        (staging_id, library_id)
-    };
+    let staging_id = env.source_id(&staging_dir, "staging source exists");
+    let library_id = env.source_id(&library_dir, "library source exists");
 
     cli::reclaim::run(Some(staging_id.to_string()), true, env.data_dir_opt()).unwrap();
 
@@ -591,14 +524,7 @@ fn test_reclaim_execute_removes_redundant_archive_container() {
         assert_eq!(locations[0].archive_path.as_deref(), Some(*entry_name));
     }
 
-    let logs_dir = env.data_dir.join("objects/reclaim-logs");
-    let logs: Vec<_> = fs::read_dir(&logs_dir)
-        .unwrap()
-        .filter_map(|entry| entry.ok())
-        .collect();
-    assert_eq!(logs.len(), 1);
-    let log = fs::read_to_string(logs[0].path()).unwrap();
-    assert_eq!(log, staging_archive_canonical);
+    assert_eq!(env.single_reclaim_log(), staging_archive_canonical);
 }
 
 #[test]
