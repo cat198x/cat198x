@@ -23,15 +23,6 @@ pub(super) struct ReclaimReport {
     pub(super) archive_count: usize,
 }
 
-/// Whether a `--source` selector picks this source: a numeric selector is a
-/// source id (exact); anything else matches as a path substring.
-pub(super) fn source_matches(source: &files::Source, selector: &str) -> bool {
-    match selector.parse::<i64>() {
-        Ok(id) => source.id == id,
-        Err(_) => source.path.contains(selector),
-    }
-}
-
 pub(super) fn analyze_reclaimable(
     conn: &rusqlite::Connection,
     sources: &[&files::Source],
@@ -214,22 +205,6 @@ mod tests {
         let (reclaimable, preserved) = partition_by_disposition(&matched);
         assert!(reclaimable.is_empty());
         assert_eq!(preserved.len(), 2);
-    }
-
-    #[test]
-    fn source_matches_numeric_selector_by_id_only() {
-        let source = source(42, "/roms/42", files::Disposition::Consume);
-
-        assert!(source_matches(&source, "42"));
-        assert!(!source_matches(&source, "41"));
-    }
-
-    #[test]
-    fn source_matches_non_numeric_selector_by_path_substring() {
-        let source = source(42, "/roms/ToSort/NES", files::Disposition::Consume);
-
-        assert!(source_matches(&source, "ToSort"));
-        assert!(!source_matches(&source, "Master"));
     }
 
     #[test]

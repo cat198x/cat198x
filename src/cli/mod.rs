@@ -1,6 +1,7 @@
 //! CLI command implementations
 
 mod audit_log;
+mod source_selector;
 
 pub mod apply;
 pub mod args;

@@ -27,7 +27,8 @@ use super::open_database;
 mod analysis;
 mod execution;
 
-use analysis::{analyze_reclaimable, partition_by_disposition, source_matches};
+use super::source_selector::source_matches;
+use analysis::{analyze_reclaimable, partition_by_disposition};
 use execution::execute_reclaim;
 
 /// Run the reclaim command.

@@ -5,6 +5,8 @@ use walkdir::WalkDir;
 
 use crate::db::files::{self, Source};
 
+use super::super::source_selector::source_matches;
+
 pub(super) struct SourceFilePlan {
     pub(super) files_to_scan: Vec<PathBuf>,
     pub(super) skipped: usize,
@@ -36,16 +38,6 @@ pub(super) fn select_sources(
         }
         None => all_sources,
     })
-}
-
-/// Whether a `--source` selector picks this source: a purely numeric selector
-/// is a source id and matches exactly; anything else matches as a path
-/// substring.
-pub(super) fn source_matches(source: &files::Source, selector: &str) -> bool {
-    match selector.parse::<i64>() {
-        Ok(id) => source.id == id,
-        Err(_) => source.path.contains(selector),
-    }
 }
 
 /// Resolve and validate the filesystem walk root for a source/subtree scan.

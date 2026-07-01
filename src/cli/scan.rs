@@ -251,7 +251,8 @@ fn ctrlc_handler<F: Fn() + Send + 'static>(handler: F) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use planning::{parse_sqlite_datetime, source_matches};
+    use crate::cli::source_selector::source_matches;
+    use planning::parse_sqlite_datetime;
 
     #[test]
     fn test_parse_sqlite_datetime() {
