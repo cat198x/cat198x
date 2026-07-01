@@ -361,6 +361,81 @@ fn test_scan_updates_last_scanned() {
 }
 
 #[test]
+fn test_reclaim_execute_removes_redundant_consume_source_file() {
+    let env = TestEnv::new();
+    env.init();
+
+    let staging_dir = env.temp_dir.path().join("staging");
+    let library_dir = env.temp_dir.path().join("library");
+    let staging_file = create_test_rom(&staging_dir, "redundant.rom", b"same bytes");
+    let library_file = create_test_rom(&library_dir, "copy.rom", b"same bytes");
+    let staging_file_canonical = fs::canonicalize(&staging_file)
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    let sha1 = cat198x::scanner::hasher::hash_file(&library_file)
+        .unwrap()
+        .sha1;
+
+    use cat198x::SourceCommands;
+    cli::source::run(
+        SourceCommands::Add {
+            preserve: false,
+            consume: true,
+            path: staging_dir.clone(),
+        },
+        env.data_dir_opt(),
+    )
+    .unwrap();
+    cli::source::run(
+        SourceCommands::Add {
+            preserve: true,
+            consume: false,
+            path: library_dir.clone(),
+        },
+        env.data_dir_opt(),
+    )
+    .unwrap();
+
+    cli::scan::run(None, false, None, env.data_dir_opt()).unwrap();
+
+    let staging_id = {
+        let db = env.db();
+        let conn = db.conn();
+        let staging_root = fs::canonicalize(&staging_dir)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        cat198x::db::files::list_sources(conn)
+            .unwrap()
+            .into_iter()
+            .find(|source| source.path == staging_root)
+            .expect("staging source exists")
+            .id
+    };
+
+    cli::reclaim::run(Some(staging_id.to_string()), true, env.data_dir_opt()).unwrap();
+
+    assert!(!staging_file.exists(), "redundant staging file is deleted");
+    assert!(library_file.exists(), "verified survivor remains on disk");
+
+    let db = env.db();
+    let conn = db.conn();
+    let locations = cat198x::db::files::get_file_locations(conn, &sha1).unwrap();
+    assert_eq!(locations.len(), 1);
+    assert_eq!(locations[0].path, "copy.rom");
+
+    let logs_dir = env.data_dir.join("objects/reclaim-logs");
+    let logs: Vec<_> = fs::read_dir(&logs_dir)
+        .unwrap()
+        .filter_map(|entry| entry.ok())
+        .collect();
+    assert_eq!(logs.len(), 1);
+    let log = fs::read_to_string(logs[0].path()).unwrap();
+    assert_eq!(log, staging_file_canonical);
+}
+
+#[test]
 fn test_dat_list_shows_collections() {
     let env = TestEnv::new();
     env.init();
