@@ -5,48 +5,12 @@
 
 use std::fs;
 use std::path::PathBuf;
-use tempfile::TempDir;
 
 // Import the library crate
 use cat198x::cli;
-use cat198x::db::Database;
 
-/// Helper to create a test environment with initialized Cat198x
-struct TestEnv {
-    temp_dir: TempDir,
-    data_dir: PathBuf,
-    roms_dir: PathBuf,
-}
-
-impl TestEnv {
-    fn new() -> Self {
-        let temp_dir = TempDir::new().expect("Failed to create temp dir");
-        let data_dir = temp_dir.path().join("data");
-        let roms_dir = temp_dir.path().join("roms");
-
-        // Create roms directory
-        fs::create_dir_all(&roms_dir).expect("Failed to create roms dir");
-
-        TestEnv {
-            temp_dir,
-            data_dir,
-            roms_dir,
-        }
-    }
-
-    fn init(&self) {
-        cli::init::run(Some(self.data_dir.clone()), None).expect("Init failed");
-    }
-
-    fn db(&self) -> Database {
-        let db_path = self.data_dir.join("db.sqlite");
-        Database::open(&db_path).expect("Failed to open database")
-    }
-
-    fn data_dir_opt(&self) -> Option<PathBuf> {
-        Some(self.data_dir.clone())
-    }
-}
+mod support;
+use support::{TestEnv, create_test_rom, create_test_zip};
 
 /// Create a sample DAT file for testing
 fn create_test_dat(dir: &std::path::Path, name: &str) -> PathBuf {
@@ -74,16 +38,6 @@ fn create_test_dat(dir: &std::path::Path, name: &str) -> PathBuf {
     );
     fs::write(&dat_path, content).expect("Failed to write DAT file");
     dat_path
-}
-
-/// Create a test ROM file with known content
-fn create_test_rom(dir: &std::path::Path, name: &str, content: &[u8]) -> PathBuf {
-    let rom_path = dir.join(name);
-    if let Some(parent) = rom_path.parent() {
-        fs::create_dir_all(parent).ok();
-    }
-    fs::write(&rom_path, content).expect("Failed to write ROM file");
-    rom_path
 }
 
 // ============================================================================
@@ -862,32 +816,6 @@ fn test_plan_apply_rollback_cycle() {
     // Verify source file still exists (rollback only affects destination)
     let source_file = env.roms_dir.join("source.rom");
     assert!(source_file.exists(), "Source file should remain untouched");
-}
-
-/// Create a ZIP archive containing a file with known content
-fn create_test_zip(
-    dir: &std::path::Path,
-    zip_name: &str,
-    entry_name: &str,
-    content: &[u8],
-) -> PathBuf {
-    use std::io::Write;
-
-    let zip_path = dir.join(zip_name);
-    if let Some(parent) = zip_path.parent() {
-        fs::create_dir_all(parent).expect("Failed to create ZIP parent directory");
-    }
-    let file = fs::File::create(&zip_path).expect("Failed to create ZIP file");
-    let mut zip = zip::ZipWriter::new(file);
-
-    let options =
-        zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
-    zip.start_file(entry_name, options)
-        .expect("start ZIP entry");
-    zip.write_all(content).expect("write ZIP entry");
-    zip.finish().expect("finish ZIP archive");
-
-    zip_path
 }
 
 #[test]
@@ -1920,7 +1848,7 @@ fn test_dat_fetch_list() {
 /// Test torrent create and verify commands
 #[test]
 fn test_torrent_create_and_verify() {
-    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let temp_dir = tempfile::TempDir::new().expect("Failed to create temp dir");
     let content_dir = temp_dir.path().join("content");
     fs::create_dir_all(&content_dir).unwrap();
 
