@@ -7,6 +7,8 @@ use cat198x::cli;
 use cat198x::db::Database;
 use tempfile::TempDir;
 
+pub mod dats;
+
 pub struct TestEnv {
     pub temp_dir: TempDir,
     pub data_dir: PathBuf,

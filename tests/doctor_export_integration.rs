@@ -1,62 +1,12 @@
 //! Integration tests for doctor and export command workflows.
 
 use std::fs;
-use std::path::PathBuf;
 
 use cat198x::cli;
 
 mod support;
+use support::dats::{create_matching_dat, create_test_dat};
 use support::{TestEnv, create_test_rom};
-
-fn create_test_dat(dir: &std::path::Path, name: &str) -> PathBuf {
-    let dat_path = dir.join(format!("{}.dat", name));
-    let content = format!(
-        r#"<?xml version="1.0"?>
-<!DOCTYPE datafile PUBLIC "-//Logiqx//DTD ROM Management Datafile//EN" "http://www.logiqx.com/Dats/datafile.dtd">
-<datafile>
-  <header>
-    <name>{}</name>
-    <description>{} (Test)</description>
-    <version>20231215</version>
-    <author>Test Author</author>
-  </header>
-  <game name="Test Game 1">
-    <description>Test Game 1</description>
-    <rom name="game1.rom" size="1024" crc="12345678" md5="D41D8CD98F00B204E9800998ECF8427E" sha1="DA39A3EE5E6B4B0D3255BFEF95601890AFD80709"/>
-  </game>
-  <game name="Test Game 2">
-    <description>Test Game 2</description>
-    <rom name="game2.rom" size="2048" crc="ABCDEF01" md5="098F6BCD4621D373CADE4E832627B4F6" sha1="A94A8FE5CCB19BA61C4C0873D391E987982FBBD3"/>
-  </game>
-</datafile>"#,
-        name, name
-    );
-    fs::write(&dat_path, content).expect("failed to write DAT file");
-    dat_path
-}
-
-fn create_matching_dat(dir: &std::path::Path, name: &str, content_sha1: &str) -> PathBuf {
-    let dat_path = dir.join(format!("{}.dat", name));
-    let content = format!(
-        r#"<?xml version="1.0"?>
-<!DOCTYPE datafile PUBLIC "-//Logiqx//DTD ROM Management Datafile//EN" "http://www.logiqx.com/Dats/datafile.dtd">
-<datafile>
-  <header>
-    <name>{}</name>
-    <description>{} (Test)</description>
-    <version>1.0</version>
-    <author>Test</author>
-  </header>
-  <game name="Test Game">
-    <description>Test Game</description>
-    <rom name="test.rom" size="5" sha1="{}"/>
-  </game>
-</datafile>"#,
-        name, name, content_sha1
-    );
-    fs::write(&dat_path, content).expect("failed to write DAT file");
-    dat_path
-}
 
 #[test]
 fn doctor_healthy_database() {
