@@ -19,47 +19,15 @@
 use anyhow::{Context, Result};
 use std::path::PathBuf;
 
-use crate::db::files::{self, resolve_in_sources};
+use crate::db::files;
 
-use super::{get_data_dir, open_database};
+use super::open_database;
 
 mod analysis;
+mod execution;
 
 use analysis::{ReclaimTarget, compute_reclaimable, partition_by_disposition, source_matches};
-
-/// Confirm every content of `target` has an external copy that physically exists
-/// on disk — the existence-verified-delete net. Returns false (skip) if any
-/// external copy is missing, so a stale catalogue record can't cause loss.
-fn external_copies_present(
-    conn: &rusqlite::Connection,
-    sources: &[files::Source],
-    source_id: i64,
-    target: &ReclaimTarget,
-) -> Result<bool> {
-    for sha1 in &target.sha1s {
-        let locs = files::get_file_locations(conn, sha1)?;
-        let mut ok = false;
-        for l in locs {
-            if l.source_id == source_id {
-                continue; // a copy in the source we're reclaiming doesn't count
-            }
-            let root = sources
-                .iter()
-                .find(|s| s.id == l.source_id)
-                .map(|s| s.path.trim_end_matches('/').to_string());
-            let Some(root) = root else { continue };
-            let abs = format!("{}/{}", root, l.path);
-            if std::path::Path::new(&abs).exists() {
-                ok = true;
-                break;
-            }
-        }
-        if !ok {
-            return Ok(false);
-        }
-    }
-    Ok(true)
-}
+use execution::execute_reclaim;
 
 /// Run the reclaim command.
 pub fn run(selector: Option<String>, execute: bool, data_dir: Option<PathBuf>) -> Result<()> {
@@ -130,58 +98,20 @@ pub fn run(selector: Option<String>, execute: bool, data_dir: Option<PathBuf>) -
         return Ok(());
     }
 
-    // --execute: existence-verified hard delete, journaled.
-    let mut removed: Vec<String> = Vec::new();
-    let mut freed: i64 = 0;
-    let mut skipped = 0usize;
-    for (source_id, t) in &all {
-        if !external_copies_present(conn, &sources, *source_id, t)? {
-            eprintln!("  SKIP (external copy missing on disk): {}", t.full_path);
-            skipped += 1;
-            continue;
-        }
-        match std::fs::remove_file(&t.full_path) {
-            Ok(()) => {
-                // Drop the catalogue rows for the removed file.
-                if let Some((sid, rel)) = resolve_in_sources(&sources, &t.full_path) {
-                    conn.execute(
-                        "DELETE FROM file_locations WHERE source_id = ?1 AND path = ?2",
-                        rusqlite::params![sid, rel],
-                    )?;
-                }
-                removed.push(t.full_path.clone());
-                freed += t.bytes;
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                if let Some((sid, rel)) = resolve_in_sources(&sources, &t.full_path) {
-                    conn.execute(
-                        "DELETE FROM file_locations WHERE source_id = ?1 AND path = ?2",
-                        rusqlite::params![sid, rel],
-                    )?;
-                }
-            }
-            Err(e) => eprintln!("  ERROR deleting {}: {:#}", t.full_path, e),
-        }
-    }
-
-    // Journal the run for audit (hard delete is irreversible).
-    let logs_dir = get_data_dir(data_dir)?.join("objects/reclaim-logs");
-    std::fs::create_dir_all(&logs_dir).ok();
-    let log_path = logs_dir.join(format!("reclaim-{}.txt", removed.len()));
-    std::fs::write(&log_path, removed.join("\n")).ok();
+    let report = execute_reclaim(conn, &sources, &all, data_dir)?;
 
     println!();
     println!(
         "Reclaimed {} file(s), freed {}{}.",
-        removed.len(),
-        format_bytes(freed.max(0) as u64),
-        if skipped > 0 {
-            format!(" ({} skipped — external copy missing)", skipped)
+        report.removed_count,
+        format_bytes(report.freed_bytes.max(0) as u64),
+        if report.skipped > 0 {
+            format!(" ({} skipped — external copy missing)", report.skipped)
         } else {
             String::new()
         }
     );
-    println!("Audit log: {}", log_path.display());
+    println!("Audit log: {}", report.log_path.display());
     Ok(())
 }
 
