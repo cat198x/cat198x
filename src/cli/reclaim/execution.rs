@@ -196,4 +196,39 @@ mod tests {
         assert_eq!(files::get_file_locations(conn, "AAA").unwrap().len(), 2);
         assert_eq!(std::fs::read_to_string(report.log_path).unwrap(), "");
     }
+
+    #[test]
+    fn execute_reclaim_removes_stale_catalogue_row_for_missing_target() {
+        let db = setup();
+        let conn = db.conn();
+        let data_dir = tempfile::tempdir().unwrap();
+        let staging = tempfile::tempdir().unwrap();
+        let library = tempfile::tempdir().unwrap();
+        let stale_file = staging.path().join("already-gone.rom");
+        let library_file = library.path().join("copy.rom");
+        std::fs::write(&library_file, b"library").unwrap();
+
+        let staging_id = files::add_source(conn, &path_string(staging.path()), false).unwrap();
+        let library_id = files::add_source(conn, &path_string(library.path()), false).unwrap();
+        files::upsert_file(conn, "AAA", None, None, None, 7).unwrap();
+        files::upsert_file_location(conn, "AAA", staging_id, "already-gone.rom", None).unwrap();
+        files::upsert_file_location(conn, "AAA", library_id, "copy.rom", None).unwrap();
+        let sources = files::list_sources(conn).unwrap();
+
+        let report = execute_reclaim(
+            conn,
+            &sources,
+            &[(staging_id, target(&stale_file, 7, "AAA"))],
+            Some(data_dir.path().to_path_buf()),
+        )
+        .unwrap();
+
+        assert_eq!(report.removed_count, 0);
+        assert_eq!(report.freed_bytes, 0);
+        assert_eq!(report.skipped, 0);
+        let locations = files::get_file_locations(conn, "AAA").unwrap();
+        assert_eq!(locations.len(), 1);
+        assert_eq!(locations[0].source_id, library_id);
+        assert_eq!(std::fs::read_to_string(report.log_path).unwrap(), "");
+    }
 }
