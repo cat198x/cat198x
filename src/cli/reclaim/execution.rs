@@ -78,8 +78,8 @@ fn external_copies_present(
                 .find(|s| s.id == l.source_id)
                 .map(|s| s.path.trim_end_matches('/').to_string());
             let Some(root) = root else { continue };
-            let abs = format!("{}/{}", root, l.path);
-            if Path::new(&abs).exists() {
+            let abs = Path::new(&root).join(&l.path);
+            if catalogued_location_exists(&abs, l.archive_path.as_deref()) {
                 ok = true;
                 break;
             }
@@ -89,6 +89,13 @@ fn external_copies_present(
         }
     }
     Ok(true)
+}
+
+fn catalogued_location_exists(path: &Path, archive_path: Option<&str>) -> bool {
+    match archive_path {
+        Some(entry_path) => crate::archive::extract_archive_entry(path, entry_path).is_ok(),
+        None => path.exists(),
+    }
 }
 
 fn remove_catalogue_rows(
@@ -122,6 +129,18 @@ mod tests {
             sha1s: vec![sha1.to_string()],
             is_archive: false,
         }
+    }
+
+    fn write_zip_entry(zip_path: &Path, entry_name: &str, content: &[u8]) {
+        use std::io::Write;
+
+        let file = std::fs::File::create(zip_path).unwrap();
+        let mut zip = zip::ZipWriter::new(file);
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
+        zip.start_file(entry_name, options).unwrap();
+        zip.write_all(content).unwrap();
+        zip.finish().unwrap();
     }
 
     #[test]
@@ -179,6 +198,42 @@ mod tests {
         files::upsert_file(conn, "AAA", None, None, None, 7).unwrap();
         files::upsert_file_location(conn, "AAA", staging_id, "redundant.rom", None).unwrap();
         files::upsert_file_location(conn, "AAA", library_id, "missing.rom", None).unwrap();
+        let sources = files::list_sources(conn).unwrap();
+
+        let report = execute_reclaim(
+            conn,
+            &sources,
+            &[(staging_id, target(&staging_file, 7, "AAA"))],
+            Some(data_dir.path().to_path_buf()),
+        )
+        .unwrap();
+
+        assert_eq!(report.removed_count, 0);
+        assert_eq!(report.freed_bytes, 0);
+        assert_eq!(report.skipped, 1);
+        assert!(staging_file.exists());
+        assert_eq!(files::get_file_locations(conn, "AAA").unwrap().len(), 2);
+        assert_eq!(std::fs::read_to_string(report.log_path).unwrap(), "");
+    }
+
+    #[test]
+    fn execute_reclaim_skips_when_external_archive_entry_is_missing() {
+        let db = setup();
+        let conn = db.conn();
+        let data_dir = tempfile::tempdir().unwrap();
+        let staging = tempfile::tempdir().unwrap();
+        let library = tempfile::tempdir().unwrap();
+        let staging_file = staging.path().join("redundant.rom");
+        let library_archive = library.path().join("copy.zip");
+        std::fs::write(&staging_file, b"staging").unwrap();
+        write_zip_entry(&library_archive, "other.rom", b"different");
+
+        let staging_id = files::add_source(conn, &path_string(staging.path()), false).unwrap();
+        let library_id = files::add_source(conn, &path_string(library.path()), false).unwrap();
+        files::upsert_file(conn, "AAA", None, None, None, 7).unwrap();
+        files::upsert_file_location(conn, "AAA", staging_id, "redundant.rom", None).unwrap();
+        files::upsert_file_location(conn, "AAA", library_id, "copy.zip", Some("missing.rom"))
+            .unwrap();
         let sources = files::list_sources(conn).unwrap();
 
         let report = execute_reclaim(
