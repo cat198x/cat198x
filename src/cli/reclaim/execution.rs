@@ -57,9 +57,9 @@ pub(super) fn execute_reclaim(
     })
 }
 
-/// Confirm every content of `target` has an external copy that physically exists
-/// on disk — the existence-verified-delete net. Returns false (skip) if any
-/// external copy is missing, so a stale catalogue record can't cause loss.
+/// Confirm every content of `target` has an external copy that physically
+/// matches its catalogued hash. Returns false (skip) if any external copy is
+/// missing or stale, so a bad catalogue record can't cause loss.
 fn external_copies_present(
     conn: &rusqlite::Connection,
     sources: &[Source],
@@ -79,7 +79,7 @@ fn external_copies_present(
                 .map(|s| s.path.trim_end_matches('/').to_string());
             let Some(root) = root else { continue };
             let abs = Path::new(&root).join(&l.path);
-            if catalogued_location_exists(&abs, l.archive_path.as_deref()) {
+            if catalogued_location_holds_sha1(&abs, l.archive_path.as_deref(), sha1) {
                 ok = true;
                 break;
             }
@@ -91,10 +91,23 @@ fn external_copies_present(
     Ok(true)
 }
 
-fn catalogued_location_exists(path: &Path, archive_path: Option<&str>) -> bool {
+fn catalogued_location_holds_sha1(
+    path: &Path,
+    archive_path: Option<&str>,
+    expected_sha1: &str,
+) -> bool {
     match archive_path {
-        Some(entry_path) => crate::archive::extract_archive_entry(path, entry_path).is_ok(),
-        None => path.exists(),
+        Some(entry_path) => {
+            use sha1::Digest;
+
+            crate::archive::extract_archive_entry(path, entry_path)
+                .map(|data| {
+                    let actual = crate::util::hex_upper(sha1::Sha1::digest(&data));
+                    actual.eq_ignore_ascii_case(expected_sha1)
+                })
+                .unwrap_or(false)
+        }
+        None => crate::util::verify_sha1(path, expected_sha1).unwrap_or(false),
     }
 }
 
@@ -120,6 +133,12 @@ mod tests {
 
     fn path_string(path: &Path) -> String {
         path.to_string_lossy().into_owned()
+    }
+
+    fn sha1_of(content: &[u8]) -> String {
+        use sha1::Digest;
+
+        crate::util::hex_upper(sha1::Sha1::digest(content))
     }
 
     fn target(full_path: &Path, bytes: i64, sha1: &str) -> ReclaimTarget {
@@ -152,29 +171,34 @@ mod tests {
         let library = tempfile::tempdir().unwrap();
         let staging_file = staging.path().join("redundant.rom");
         let library_file = library.path().join("copy.rom");
-        std::fs::write(&staging_file, b"staging").unwrap();
-        std::fs::write(&library_file, b"library").unwrap();
+        let content = b"same";
+        let sha1 = sha1_of(content);
+        std::fs::write(&staging_file, content).unwrap();
+        std::fs::write(&library_file, content).unwrap();
 
         let staging_id = files::add_source(conn, &path_string(staging.path()), false).unwrap();
         let library_id = files::add_source(conn, &path_string(library.path()), false).unwrap();
-        files::upsert_file(conn, "AAA", None, None, None, 7).unwrap();
-        files::upsert_file_location(conn, "AAA", staging_id, "redundant.rom", None).unwrap();
-        files::upsert_file_location(conn, "AAA", library_id, "copy.rom", None).unwrap();
+        files::upsert_file(conn, &sha1, None, None, None, content.len() as i64).unwrap();
+        files::upsert_file_location(conn, &sha1, staging_id, "redundant.rom", None).unwrap();
+        files::upsert_file_location(conn, &sha1, library_id, "copy.rom", None).unwrap();
         let sources = files::list_sources(conn).unwrap();
 
         let report = execute_reclaim(
             conn,
             &sources,
-            &[(staging_id, target(&staging_file, 7, "AAA"))],
+            &[(
+                staging_id,
+                target(&staging_file, content.len() as i64, &sha1),
+            )],
             Some(data_dir.path().to_path_buf()),
         )
         .unwrap();
 
         assert_eq!(report.removed_count, 1);
-        assert_eq!(report.freed_bytes, 7);
+        assert_eq!(report.freed_bytes, content.len() as i64);
         assert_eq!(report.skipped, 0);
         assert!(!staging_file.exists());
-        let locations = files::get_file_locations(conn, "AAA").unwrap();
+        let locations = files::get_file_locations(conn, &sha1).unwrap();
         assert_eq!(locations.len(), 1);
         assert_eq!(locations[0].source_id, library_id);
         assert_eq!(
@@ -191,19 +215,24 @@ mod tests {
         let staging = tempfile::tempdir().unwrap();
         let library = tempfile::tempdir().unwrap();
         let staging_file = staging.path().join("redundant.rom");
-        std::fs::write(&staging_file, b"staging").unwrap();
+        let content = b"same";
+        let sha1 = sha1_of(content);
+        std::fs::write(&staging_file, content).unwrap();
 
         let staging_id = files::add_source(conn, &path_string(staging.path()), false).unwrap();
         let library_id = files::add_source(conn, &path_string(library.path()), false).unwrap();
-        files::upsert_file(conn, "AAA", None, None, None, 7).unwrap();
-        files::upsert_file_location(conn, "AAA", staging_id, "redundant.rom", None).unwrap();
-        files::upsert_file_location(conn, "AAA", library_id, "missing.rom", None).unwrap();
+        files::upsert_file(conn, &sha1, None, None, None, content.len() as i64).unwrap();
+        files::upsert_file_location(conn, &sha1, staging_id, "redundant.rom", None).unwrap();
+        files::upsert_file_location(conn, &sha1, library_id, "missing.rom", None).unwrap();
         let sources = files::list_sources(conn).unwrap();
 
         let report = execute_reclaim(
             conn,
             &sources,
-            &[(staging_id, target(&staging_file, 7, "AAA"))],
+            &[(
+                staging_id,
+                target(&staging_file, content.len() as i64, &sha1),
+            )],
             Some(data_dir.path().to_path_buf()),
         )
         .unwrap();
@@ -212,7 +241,47 @@ mod tests {
         assert_eq!(report.freed_bytes, 0);
         assert_eq!(report.skipped, 1);
         assert!(staging_file.exists());
-        assert_eq!(files::get_file_locations(conn, "AAA").unwrap().len(), 2);
+        assert_eq!(files::get_file_locations(conn, &sha1).unwrap().len(), 2);
+        assert_eq!(std::fs::read_to_string(report.log_path).unwrap(), "");
+    }
+
+    #[test]
+    fn execute_reclaim_skips_when_external_copy_hash_mismatches() {
+        let db = setup();
+        let conn = db.conn();
+        let data_dir = tempfile::tempdir().unwrap();
+        let staging = tempfile::tempdir().unwrap();
+        let library = tempfile::tempdir().unwrap();
+        let staging_file = staging.path().join("redundant.rom");
+        let library_file = library.path().join("copy.rom");
+        let content = b"same";
+        let sha1 = sha1_of(content);
+        std::fs::write(&staging_file, content).unwrap();
+        std::fs::write(&library_file, b"different").unwrap();
+
+        let staging_id = files::add_source(conn, &path_string(staging.path()), false).unwrap();
+        let library_id = files::add_source(conn, &path_string(library.path()), false).unwrap();
+        files::upsert_file(conn, &sha1, None, None, None, content.len() as i64).unwrap();
+        files::upsert_file_location(conn, &sha1, staging_id, "redundant.rom", None).unwrap();
+        files::upsert_file_location(conn, &sha1, library_id, "copy.rom", None).unwrap();
+        let sources = files::list_sources(conn).unwrap();
+
+        let report = execute_reclaim(
+            conn,
+            &sources,
+            &[(
+                staging_id,
+                target(&staging_file, content.len() as i64, &sha1),
+            )],
+            Some(data_dir.path().to_path_buf()),
+        )
+        .unwrap();
+
+        assert_eq!(report.removed_count, 0);
+        assert_eq!(report.freed_bytes, 0);
+        assert_eq!(report.skipped, 1);
+        assert!(staging_file.exists());
+        assert_eq!(files::get_file_locations(conn, &sha1).unwrap().len(), 2);
         assert_eq!(std::fs::read_to_string(report.log_path).unwrap(), "");
     }
 
@@ -225,21 +294,26 @@ mod tests {
         let library = tempfile::tempdir().unwrap();
         let staging_file = staging.path().join("redundant.rom");
         let library_archive = library.path().join("copy.zip");
-        std::fs::write(&staging_file, b"staging").unwrap();
+        let content = b"same";
+        let sha1 = sha1_of(content);
+        std::fs::write(&staging_file, content).unwrap();
         write_zip_entry(&library_archive, "other.rom", b"different");
 
         let staging_id = files::add_source(conn, &path_string(staging.path()), false).unwrap();
         let library_id = files::add_source(conn, &path_string(library.path()), false).unwrap();
-        files::upsert_file(conn, "AAA", None, None, None, 7).unwrap();
-        files::upsert_file_location(conn, "AAA", staging_id, "redundant.rom", None).unwrap();
-        files::upsert_file_location(conn, "AAA", library_id, "copy.zip", Some("missing.rom"))
+        files::upsert_file(conn, &sha1, None, None, None, content.len() as i64).unwrap();
+        files::upsert_file_location(conn, &sha1, staging_id, "redundant.rom", None).unwrap();
+        files::upsert_file_location(conn, &sha1, library_id, "copy.zip", Some("missing.rom"))
             .unwrap();
         let sources = files::list_sources(conn).unwrap();
 
         let report = execute_reclaim(
             conn,
             &sources,
-            &[(staging_id, target(&staging_file, 7, "AAA"))],
+            &[(
+                staging_id,
+                target(&staging_file, content.len() as i64, &sha1),
+            )],
             Some(data_dir.path().to_path_buf()),
         )
         .unwrap();
@@ -248,7 +322,47 @@ mod tests {
         assert_eq!(report.freed_bytes, 0);
         assert_eq!(report.skipped, 1);
         assert!(staging_file.exists());
-        assert_eq!(files::get_file_locations(conn, "AAA").unwrap().len(), 2);
+        assert_eq!(files::get_file_locations(conn, &sha1).unwrap().len(), 2);
+        assert_eq!(std::fs::read_to_string(report.log_path).unwrap(), "");
+    }
+
+    #[test]
+    fn execute_reclaim_skips_when_external_archive_entry_hash_mismatches() {
+        let db = setup();
+        let conn = db.conn();
+        let data_dir = tempfile::tempdir().unwrap();
+        let staging = tempfile::tempdir().unwrap();
+        let library = tempfile::tempdir().unwrap();
+        let staging_file = staging.path().join("redundant.rom");
+        let library_archive = library.path().join("copy.zip");
+        let content = b"same";
+        let sha1 = sha1_of(content);
+        std::fs::write(&staging_file, content).unwrap();
+        write_zip_entry(&library_archive, "copy.rom", b"different");
+
+        let staging_id = files::add_source(conn, &path_string(staging.path()), false).unwrap();
+        let library_id = files::add_source(conn, &path_string(library.path()), false).unwrap();
+        files::upsert_file(conn, &sha1, None, None, None, content.len() as i64).unwrap();
+        files::upsert_file_location(conn, &sha1, staging_id, "redundant.rom", None).unwrap();
+        files::upsert_file_location(conn, &sha1, library_id, "copy.zip", Some("copy.rom")).unwrap();
+        let sources = files::list_sources(conn).unwrap();
+
+        let report = execute_reclaim(
+            conn,
+            &sources,
+            &[(
+                staging_id,
+                target(&staging_file, content.len() as i64, &sha1),
+            )],
+            Some(data_dir.path().to_path_buf()),
+        )
+        .unwrap();
+
+        assert_eq!(report.removed_count, 0);
+        assert_eq!(report.freed_bytes, 0);
+        assert_eq!(report.skipped, 1);
+        assert!(staging_file.exists());
+        assert_eq!(files::get_file_locations(conn, &sha1).unwrap().len(), 2);
         assert_eq!(std::fs::read_to_string(report.log_path).unwrap(), "");
     }
 
@@ -261,19 +375,21 @@ mod tests {
         let library = tempfile::tempdir().unwrap();
         let stale_file = staging.path().join("already-gone.rom");
         let library_file = library.path().join("copy.rom");
-        std::fs::write(&library_file, b"library").unwrap();
+        let content = b"library";
+        let sha1 = sha1_of(content);
+        std::fs::write(&library_file, content).unwrap();
 
         let staging_id = files::add_source(conn, &path_string(staging.path()), false).unwrap();
         let library_id = files::add_source(conn, &path_string(library.path()), false).unwrap();
-        files::upsert_file(conn, "AAA", None, None, None, 7).unwrap();
-        files::upsert_file_location(conn, "AAA", staging_id, "already-gone.rom", None).unwrap();
-        files::upsert_file_location(conn, "AAA", library_id, "copy.rom", None).unwrap();
+        files::upsert_file(conn, &sha1, None, None, None, content.len() as i64).unwrap();
+        files::upsert_file_location(conn, &sha1, staging_id, "already-gone.rom", None).unwrap();
+        files::upsert_file_location(conn, &sha1, library_id, "copy.rom", None).unwrap();
         let sources = files::list_sources(conn).unwrap();
 
         let report = execute_reclaim(
             conn,
             &sources,
-            &[(staging_id, target(&stale_file, 7, "AAA"))],
+            &[(staging_id, target(&stale_file, content.len() as i64, &sha1))],
             Some(data_dir.path().to_path_buf()),
         )
         .unwrap();
@@ -281,7 +397,7 @@ mod tests {
         assert_eq!(report.removed_count, 0);
         assert_eq!(report.freed_bytes, 0);
         assert_eq!(report.skipped, 0);
-        let locations = files::get_file_locations(conn, "AAA").unwrap();
+        let locations = files::get_file_locations(conn, &sha1).unwrap();
         assert_eq!(locations.len(), 1);
         assert_eq!(locations[0].source_id, library_id);
         assert_eq!(std::fs::read_to_string(report.log_path).unwrap(), "");
