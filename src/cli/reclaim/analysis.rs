@@ -217,6 +217,22 @@ mod tests {
     }
 
     #[test]
+    fn source_matches_numeric_selector_by_id_only() {
+        let source = source(42, "/roms/42", files::Disposition::Consume);
+
+        assert!(source_matches(&source, "42"));
+        assert!(!source_matches(&source, "41"));
+    }
+
+    #[test]
+    fn source_matches_non_numeric_selector_by_path_substring() {
+        let source = source(42, "/roms/ToSort/NES", files::Disposition::Consume);
+
+        assert!(source_matches(&source, "ToSort"));
+        assert!(!source_matches(&source, "Master"));
+    }
+
+    #[test]
     fn reclaims_fully_redundant_containers_keeps_unique_ones() {
         let db = setup();
         let conn = db.conn();
