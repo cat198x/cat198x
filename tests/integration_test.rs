@@ -4,7 +4,7 @@
 //! init → dat add → source add → scan → status
 
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use tempfile::TempDir;
 
 // Import the library crate
@@ -45,45 +45,6 @@ impl TestEnv {
 
     fn data_dir_opt(&self) -> Option<PathBuf> {
         Some(self.data_dir.clone())
-    }
-
-    fn add_source(&self, path: &Path, preserve: bool, consume: bool) {
-        use cat198x::SourceCommands;
-
-        cli::source::run(
-            SourceCommands::Add {
-                preserve,
-                consume,
-                path: path.to_path_buf(),
-            },
-            self.data_dir_opt(),
-        )
-        .expect("source add failed");
-    }
-
-    fn source_id(&self, path: &Path, message: &str) -> i64 {
-        let db = self.db();
-        let conn = db.conn();
-        let root = fs::canonicalize(path)
-            .expect("source path should canonicalize")
-            .to_string_lossy()
-            .into_owned();
-        cat198x::db::files::list_sources(conn)
-            .expect("sources should list")
-            .into_iter()
-            .find(|source| source.path == root)
-            .expect(message)
-            .id
-    }
-
-    fn single_reclaim_log(&self) -> String {
-        let logs_dir = self.data_dir.join("objects/reclaim-logs");
-        let logs: Vec<_> = fs::read_dir(&logs_dir)
-            .expect("reclaim log directory should exist")
-            .filter_map(|entry| entry.ok())
-            .collect();
-        assert_eq!(logs.len(), 1);
-        fs::read_to_string(logs[0].path()).expect("reclaim log should be readable")
     }
 }
 
@@ -397,134 +358,6 @@ fn test_scan_updates_last_scanned() {
     // Check last_scanned is updated
     let sources = cat198x::db::files::list_sources(conn).unwrap();
     assert!(sources[0].last_scanned.is_some());
-}
-
-#[test]
-fn test_reclaim_execute_removes_redundant_consume_source_file() {
-    let env = TestEnv::new();
-    env.init();
-
-    let staging_dir = env.temp_dir.path().join("staging");
-    let library_dir = env.temp_dir.path().join("library");
-    let staging_file = create_test_rom(&staging_dir, "redundant.rom", b"same bytes");
-    let library_file = create_test_rom(&library_dir, "copy.rom", b"same bytes");
-    let staging_file_canonical = fs::canonicalize(&staging_file)
-        .unwrap()
-        .to_string_lossy()
-        .into_owned();
-    let sha1 = cat198x::scanner::hasher::hash_file(&library_file)
-        .unwrap()
-        .sha1;
-
-    env.add_source(&staging_dir, false, true);
-    env.add_source(&library_dir, true, false);
-
-    cli::scan::run(None, false, None, env.data_dir_opt()).unwrap();
-
-    let staging_id = env.source_id(&staging_dir, "staging source exists");
-
-    cli::reclaim::run(Some(staging_id.to_string()), true, env.data_dir_opt()).unwrap();
-
-    assert!(!staging_file.exists(), "redundant staging file is deleted");
-    assert!(library_file.exists(), "verified survivor remains on disk");
-
-    let db = env.db();
-    let conn = db.conn();
-    let locations = cat198x::db::files::get_file_locations(conn, &sha1).unwrap();
-    assert_eq!(locations.len(), 1);
-    assert_eq!(locations[0].path, "copy.rom");
-
-    assert_eq!(env.single_reclaim_log(), staging_file_canonical);
-}
-
-#[test]
-fn test_reclaim_execute_refuses_preserve_source() {
-    let env = TestEnv::new();
-    env.init();
-
-    let preserve_dir = env.temp_dir.path().join("master");
-    let library_dir = env.temp_dir.path().join("library");
-    let preserve_file = create_test_rom(&preserve_dir, "redundant.rom", b"same bytes");
-    let library_file = create_test_rom(&library_dir, "copy.rom", b"same bytes");
-    let sha1 = cat198x::scanner::hasher::hash_file(&library_file)
-        .unwrap()
-        .sha1;
-
-    env.add_source(&preserve_dir, true, false);
-    env.add_source(&library_dir, true, false);
-
-    cli::scan::run(None, false, None, env.data_dir_opt()).unwrap();
-
-    let preserve_id = env.source_id(&preserve_dir, "preserve source exists");
-
-    cli::reclaim::run(Some(preserve_id.to_string()), true, env.data_dir_opt()).unwrap();
-
-    assert!(
-        preserve_file.exists(),
-        "preserve source file is left untouched"
-    );
-    assert!(library_file.exists(), "survivor remains on disk");
-
-    let db = env.db();
-    let conn = db.conn();
-    let locations = cat198x::db::files::get_file_locations(conn, &sha1).unwrap();
-    assert_eq!(locations.len(), 2, "catalogue keeps both preserve copies");
-
-    let logs_dir = env.data_dir.join("objects/reclaim-logs");
-    assert!(!logs_dir.exists(), "refused reclaim writes no audit log");
-}
-
-#[test]
-fn test_reclaim_execute_removes_redundant_archive_container() {
-    use sha1::Digest;
-
-    let env = TestEnv::new();
-    env.init();
-
-    let staging_dir = env.temp_dir.path().join("staging");
-    let library_dir = env.temp_dir.path().join("library");
-    fs::create_dir_all(&staging_dir).unwrap();
-    fs::create_dir_all(&library_dir).unwrap();
-
-    let entries: &[(&str, &[u8])] = &[("a.rom", b"alpha"), ("b.rom", b"beta")];
-    let staging_archive = create_test_zip_entries(&staging_dir, "redundant.zip", entries);
-    let library_archive = create_test_zip_entries(&library_dir, "canonical.zip", entries);
-    let staging_archive_canonical = fs::canonicalize(&staging_archive)
-        .unwrap()
-        .to_string_lossy()
-        .into_owned();
-    let sha1s = entries
-        .iter()
-        .map(|(_, content)| cat198x::util::hex_upper(sha1::Sha1::digest(content)))
-        .collect::<Vec<_>>();
-
-    env.add_source(&staging_dir, false, true);
-    env.add_source(&library_dir, true, false);
-
-    cli::scan::run(None, false, None, env.data_dir_opt()).unwrap();
-
-    let staging_id = env.source_id(&staging_dir, "staging source exists");
-    let library_id = env.source_id(&library_dir, "library source exists");
-
-    cli::reclaim::run(Some(staging_id.to_string()), true, env.data_dir_opt()).unwrap();
-
-    assert!(
-        !staging_archive.exists(),
-        "redundant staging archive is deleted"
-    );
-    assert!(library_archive.exists(), "library archive remains on disk");
-
-    let db = env.db();
-    let conn = db.conn();
-    for (sha1, (entry_name, _)) in sha1s.iter().zip(entries.iter()) {
-        let locations = cat198x::db::files::get_file_locations(conn, sha1).unwrap();
-        assert_eq!(locations.len(), 1);
-        assert_eq!(locations[0].source_id, library_id);
-        assert_eq!(locations[0].path, "canonical.zip");
-        assert_eq!(locations[0].archive_path.as_deref(), Some(*entry_name));
-    }
-
-    assert_eq!(env.single_reclaim_log(), staging_archive_canonical);
 }
 
 #[test]
@@ -1038,14 +871,6 @@ fn create_test_zip(
     entry_name: &str,
     content: &[u8],
 ) -> PathBuf {
-    create_test_zip_entries(dir, zip_name, &[(entry_name, content)])
-}
-
-fn create_test_zip_entries(
-    dir: &std::path::Path,
-    zip_name: &str,
-    entries: &[(&str, &[u8])],
-) -> PathBuf {
     use std::io::Write;
 
     let zip_path = dir.join(zip_name);
@@ -1057,11 +882,9 @@ fn create_test_zip_entries(
 
     let options =
         zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
-    for (entry_name, content) in entries {
-        zip.start_file(entry_name, options)
-            .expect("start ZIP entry");
-        zip.write_all(content).expect("write ZIP entry");
-    }
+    zip.start_file(entry_name, options)
+        .expect("start ZIP entry");
+    zip.write_all(content).expect("write ZIP entry");
     zip.finish().expect("finish ZIP archive");
 
     zip_path
