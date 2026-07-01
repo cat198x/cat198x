@@ -436,6 +436,73 @@ fn test_reclaim_execute_removes_redundant_consume_source_file() {
 }
 
 #[test]
+fn test_reclaim_execute_refuses_preserve_source() {
+    let env = TestEnv::new();
+    env.init();
+
+    let preserve_dir = env.temp_dir.path().join("master");
+    let library_dir = env.temp_dir.path().join("library");
+    let preserve_file = create_test_rom(&preserve_dir, "redundant.rom", b"same bytes");
+    let library_file = create_test_rom(&library_dir, "copy.rom", b"same bytes");
+    let sha1 = cat198x::scanner::hasher::hash_file(&library_file)
+        .unwrap()
+        .sha1;
+
+    use cat198x::SourceCommands;
+    cli::source::run(
+        SourceCommands::Add {
+            preserve: true,
+            consume: false,
+            path: preserve_dir.clone(),
+        },
+        env.data_dir_opt(),
+    )
+    .unwrap();
+    cli::source::run(
+        SourceCommands::Add {
+            preserve: true,
+            consume: false,
+            path: library_dir.clone(),
+        },
+        env.data_dir_opt(),
+    )
+    .unwrap();
+
+    cli::scan::run(None, false, None, env.data_dir_opt()).unwrap();
+
+    let preserve_id = {
+        let db = env.db();
+        let conn = db.conn();
+        let preserve_root = fs::canonicalize(&preserve_dir)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        cat198x::db::files::list_sources(conn)
+            .unwrap()
+            .into_iter()
+            .find(|source| source.path == preserve_root)
+            .expect("preserve source exists")
+            .id
+    };
+
+    cli::reclaim::run(Some(preserve_id.to_string()), true, env.data_dir_opt()).unwrap();
+
+    assert!(
+        preserve_file.exists(),
+        "preserve source file is left untouched"
+    );
+    assert!(library_file.exists(), "survivor remains on disk");
+
+    let db = env.db();
+    let conn = db.conn();
+    let locations = cat198x::db::files::get_file_locations(conn, &sha1).unwrap();
+    assert_eq!(locations.len(), 2, "catalogue keeps both preserve copies");
+
+    let logs_dir = env.data_dir.join("objects/reclaim-logs");
+    assert!(!logs_dir.exists(), "refused reclaim writes no audit log");
+}
+
+#[test]
 fn test_dat_list_shows_collections() {
     let env = TestEnv::new();
     env.init();
