@@ -27,7 +27,7 @@ use super::open_database;
 mod analysis;
 mod execution;
 
-use analysis::{ReclaimTarget, compute_reclaimable, partition_by_disposition, source_matches};
+use analysis::{analyze_reclaimable, partition_by_disposition, source_matches};
 use execution::execute_reclaim;
 
 /// Run the reclaim command.
@@ -64,42 +64,32 @@ pub fn run(selector: Option<String>, execute: bool, data_dir: Option<PathBuf>) -
         return Ok(());
     }
 
-    let mut all: Vec<(i64, ReclaimTarget)> = Vec::new();
-    for s in &reclaimable {
-        for t in compute_reclaimable(conn, s.id)? {
-            all.push((s.id, t));
-        }
-    }
-
-    if all.is_empty() {
+    let report = analyze_reclaimable(conn, &reclaimable)?;
+    if report.targets.is_empty() {
         println!("Nothing to reclaim: no fully-redundant files in the matched source(s).");
         return Ok(());
     }
 
-    let total_bytes: i64 = all.iter().map(|(_, t)| t.bytes).sum();
-    let loose = all.iter().filter(|(_, t)| !t.is_archive).count();
-    let archives = all.len() - loose;
-
     println!(
         "Reclaimable: {} archive(s) + {} loose file(s), {} — every content is held in another source.",
-        archives,
-        loose,
-        format_bytes(total_bytes.max(0) as u64)
+        report.archive_count,
+        report.loose_count,
+        format_bytes(report.total_bytes.max(0) as u64)
     );
 
     if !execute {
-        for (_, t) in all.iter().take(20) {
+        for (_, t) in report.targets.iter().take(20) {
             println!("  would remove  {}", t.full_path);
         }
-        if all.len() > 20 {
-            println!("  … and {} more", all.len() - 20);
+        if report.targets.len() > 20 {
+            println!("  … and {} more", report.targets.len() - 20);
         }
         println!();
         println!("Dry run — nothing deleted. Re-run with --execute to free the space.");
         return Ok(());
     }
 
-    let report = execute_reclaim(conn, &sources, &all, data_dir)?;
+    let report = execute_reclaim(conn, &sources, &report.targets, data_dir)?;
 
     println!();
     println!(

@@ -15,6 +15,14 @@ pub(super) struct ReclaimTarget {
     pub(super) is_archive: bool,
 }
 
+#[derive(Debug)]
+pub(super) struct ReclaimReport {
+    pub(super) targets: Vec<(i64, ReclaimTarget)>,
+    pub(super) total_bytes: i64,
+    pub(super) loose_count: usize,
+    pub(super) archive_count: usize,
+}
+
 /// Whether a `--source` selector picks this source: a numeric selector is a
 /// source id (exact); anything else matches as a path substring.
 pub(super) fn source_matches(source: &files::Source, selector: &str) -> bool {
@@ -22,6 +30,32 @@ pub(super) fn source_matches(source: &files::Source, selector: &str) -> bool {
         Ok(id) => source.id == id,
         Err(_) => source.path.contains(selector),
     }
+}
+
+pub(super) fn analyze_reclaimable(
+    conn: &rusqlite::Connection,
+    sources: &[&files::Source],
+) -> Result<ReclaimReport> {
+    let mut targets: Vec<(i64, ReclaimTarget)> = Vec::new();
+    for source in sources {
+        for target in compute_reclaimable(conn, source.id)? {
+            targets.push((source.id, target));
+        }
+    }
+
+    let total_bytes = targets.iter().map(|(_, target)| target.bytes).sum();
+    let loose_count = targets
+        .iter()
+        .filter(|(_, target)| !target.is_archive)
+        .count();
+    let archive_count = targets.len() - loose_count;
+
+    Ok(ReclaimReport {
+        targets,
+        total_bytes,
+        loose_count,
+        archive_count,
+    })
 }
 
 /// The files in `source_id` whose every content is also held in another source.
@@ -227,5 +261,12 @@ mod tests {
             .unwrap();
         assert_eq!(redundant.bytes, 30);
         assert_eq!(redundant.sha1s.len(), 2);
+
+        let staging_source = source(staging, "/ToSort", files::Disposition::Consume);
+        let report = analyze_reclaimable(conn, &[&staging_source]).unwrap();
+        assert_eq!(report.targets.len(), 2);
+        assert_eq!(report.total_bytes, 50);
+        assert_eq!(report.archive_count, 1);
+        assert_eq!(report.loose_count, 1);
     }
 }
