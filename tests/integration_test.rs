@@ -503,6 +503,105 @@ fn test_reclaim_execute_refuses_preserve_source() {
 }
 
 #[test]
+fn test_reclaim_execute_removes_redundant_archive_container() {
+    use sha1::Digest;
+
+    let env = TestEnv::new();
+    env.init();
+
+    let staging_dir = env.temp_dir.path().join("staging");
+    let library_dir = env.temp_dir.path().join("library");
+    fs::create_dir_all(&staging_dir).unwrap();
+    fs::create_dir_all(&library_dir).unwrap();
+
+    let entries: &[(&str, &[u8])] = &[("a.rom", b"alpha"), ("b.rom", b"beta")];
+    let staging_archive = create_test_zip_entries(&staging_dir, "redundant.zip", entries);
+    let library_archive = create_test_zip_entries(&library_dir, "canonical.zip", entries);
+    let staging_archive_canonical = fs::canonicalize(&staging_archive)
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    let sha1s = entries
+        .iter()
+        .map(|(_, content)| cat198x::util::hex_upper(sha1::Sha1::digest(content)))
+        .collect::<Vec<_>>();
+
+    use cat198x::SourceCommands;
+    cli::source::run(
+        SourceCommands::Add {
+            preserve: false,
+            consume: true,
+            path: staging_dir.clone(),
+        },
+        env.data_dir_opt(),
+    )
+    .unwrap();
+    cli::source::run(
+        SourceCommands::Add {
+            preserve: true,
+            consume: false,
+            path: library_dir.clone(),
+        },
+        env.data_dir_opt(),
+    )
+    .unwrap();
+
+    cli::scan::run(None, false, None, env.data_dir_opt()).unwrap();
+
+    let (staging_id, library_id) = {
+        let db = env.db();
+        let conn = db.conn();
+        let staging_root = fs::canonicalize(&staging_dir)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let library_root = fs::canonicalize(&library_dir)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let sources = cat198x::db::files::list_sources(conn).unwrap();
+        let staging_id = sources
+            .iter()
+            .find(|source| source.path == staging_root)
+            .expect("staging source exists")
+            .id;
+        let library_id = sources
+            .iter()
+            .find(|source| source.path == library_root)
+            .expect("library source exists")
+            .id;
+        (staging_id, library_id)
+    };
+
+    cli::reclaim::run(Some(staging_id.to_string()), true, env.data_dir_opt()).unwrap();
+
+    assert!(
+        !staging_archive.exists(),
+        "redundant staging archive is deleted"
+    );
+    assert!(library_archive.exists(), "library archive remains on disk");
+
+    let db = env.db();
+    let conn = db.conn();
+    for (sha1, (entry_name, _)) in sha1s.iter().zip(entries.iter()) {
+        let locations = cat198x::db::files::get_file_locations(conn, sha1).unwrap();
+        assert_eq!(locations.len(), 1);
+        assert_eq!(locations[0].source_id, library_id);
+        assert_eq!(locations[0].path, "canonical.zip");
+        assert_eq!(locations[0].archive_path.as_deref(), Some(*entry_name));
+    }
+
+    let logs_dir = env.data_dir.join("objects/reclaim-logs");
+    let logs: Vec<_> = fs::read_dir(&logs_dir)
+        .unwrap()
+        .filter_map(|entry| entry.ok())
+        .collect();
+    assert_eq!(logs.len(), 1);
+    let log = fs::read_to_string(logs[0].path()).unwrap();
+    assert_eq!(log, staging_archive_canonical);
+}
+
+#[test]
 fn test_dat_list_shows_collections() {
     let env = TestEnv::new();
     env.init();
@@ -1013,17 +1112,30 @@ fn create_test_zip(
     entry_name: &str,
     content: &[u8],
 ) -> PathBuf {
+    create_test_zip_entries(dir, zip_name, &[(entry_name, content)])
+}
+
+fn create_test_zip_entries(
+    dir: &std::path::Path,
+    zip_name: &str,
+    entries: &[(&str, &[u8])],
+) -> PathBuf {
     use std::io::Write;
 
     let zip_path = dir.join(zip_name);
+    if let Some(parent) = zip_path.parent() {
+        fs::create_dir_all(parent).expect("Failed to create ZIP parent directory");
+    }
     let file = fs::File::create(&zip_path).expect("Failed to create ZIP file");
     let mut zip = zip::ZipWriter::new(file);
 
     let options =
         zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
-    zip.start_file(entry_name, options)
-        .expect("start ZIP entry");
-    zip.write_all(content).expect("write ZIP entry");
+    for (entry_name, content) in entries {
+        zip.start_file(entry_name, options)
+            .expect("start ZIP entry");
+        zip.write_all(content).expect("write ZIP entry");
+    }
     zip.finish().expect("finish ZIP archive");
 
     zip_path
