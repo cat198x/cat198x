@@ -1,7 +1,7 @@
 use anyhow::Result;
 use std::path::{Path, PathBuf};
 
-use crate::cli::get_data_dir;
+use crate::cli::audit_log::write_hard_delete_log;
 use crate::db::files::{self, Source};
 
 use super::analysis::ReclaimTarget;
@@ -47,11 +47,7 @@ pub(super) fn execute_reclaim(
         }
     }
 
-    // Journal the run for audit (hard delete is irreversible).
-    let logs_dir = get_data_dir(data_dir)?.join("objects/reclaim-logs");
-    std::fs::create_dir_all(&logs_dir).ok();
-    let log_path = logs_dir.join(format!("reclaim-{}.txt", removed.len()));
-    std::fs::write(&log_path, removed.join("\n")).ok();
+    let log_path = write_hard_delete_log(data_dir, "reclaim-logs", "reclaim", &removed)?;
 
     Ok(ExecutionReport {
         removed_count: removed.len(),

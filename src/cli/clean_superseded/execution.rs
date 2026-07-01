@@ -1,11 +1,11 @@
 use anyhow::Result;
 use std::path::PathBuf;
 
+use crate::cli::audit_log::write_hard_delete_log;
 use crate::db::files::{self, Source};
 use crate::plan::executor::delete_has_surviving_copy;
 
 use super::analysis::Candidate;
-use super::get_data_dir;
 
 pub(super) struct ExecutionReport {
     pub(super) removed_count: usize,
@@ -62,11 +62,12 @@ pub(super) fn execute_cleanup(
         }
     }
 
-    // Journal the run for audit (hard delete is irreversible).
-    let logs_dir = get_data_dir(data_dir)?.join("objects/clean-superseded-logs");
-    std::fs::create_dir_all(&logs_dir).ok();
-    let log_path = logs_dir.join(format!("clean-superseded-{}.txt", removed.len()));
-    std::fs::write(&log_path, removed.join("\n")).ok();
+    let log_path = write_hard_delete_log(
+        data_dir,
+        "clean-superseded-logs",
+        "clean-superseded",
+        &removed,
+    )?;
 
     Ok(ExecutionReport {
         removed_count: removed.len(),

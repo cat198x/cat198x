@@ -1,5 +1,7 @@
 //! CLI command implementations
 
+mod audit_log;
+
 pub mod apply;
 pub mod args;
 pub mod catalogue;
