@@ -2,12 +2,11 @@
 
 The binary-asset cataloguing tool for the 198x family — inventory, DAT
 verification, deduplication, and safe reorganisation of ROM/disk/test-suite
-collections. One of five sibling projects under the `198x/` umbrella; see
-[`../../CLAUDE.md`](../../CLAUDE.md) for umbrella context and cross-project rules,
-[`../CLAUDE.md`](../CLAUDE.md) for the `cat198x` org-container layout, and
+collections. See [`../../CLAUDE.md`](../../CLAUDE.md) for umbrella context and
+cross-project rules, [`../CLAUDE.md`](../CLAUDE.md) for the `cat198x`
+org-container layout, and
 [`../../decisions/sibling-project-coordination.md`](../../decisions/sibling-project-coordination.md)
-for the sibling relationship (Cat198x is the fifth sibling, peer to Code198x,
-Emu198x, Asm198x, and Forge198x — not a child of any).
+for sibling-project boundaries.
 
 ## What this is
 
@@ -22,16 +21,14 @@ cycle. It manages the *binary* side of the umbrella asset library
 User-facing overview is in [`README.md`](README.md); the data model and on-disk
 layout are in [`SPECIFICATION.md`](SPECIFICATION.md).
 
-## Rescue, not rewrite
+## Existing-code stance
 
-Cat198x is a **rescue and rebrand of Romshelf** (~24k LoC Rust), not a
-green-field cataloguer. Read
+Evolve the existing `cat198x` tool; do not green-field a second cataloguer. Read
 [`../../decisions/cat198x-asset-tooling.md`](../../decisions/cat198x-asset-tooling.md)
-before proposing structural change: the binding stance is *evolve the existing
-code*, fixing correctness and trust as small tested commits, not reimplement it.
-The audit that preceded adoption already fixed the data-integrity blockers
-(transactional writes, verify-before-delete, full-hash quarantine, headerless
-matching); don't reintroduce the patterns it removed.
+before proposing structural change: the binding stance is to improve correctness
+and trust as small tested commits, not reimplement the tool. Preserve the
+current data-integrity guarantees: transactional writes, verify-before-delete,
+full-hash quarantine, and headerless matching.
 
 ## Safety model (load-bearing)
 
