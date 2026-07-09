@@ -2,10 +2,10 @@
 
 [![CI](https://github.com/cat198x/cat198x/actions/workflows/ci.yml/badge.svg)](https://github.com/cat198x/cat198x/actions/workflows/ci.yml)
 
-Catalogue, verify, and reorganise a retro-gaming ROM collection — safely.
+Catalogue, verify, and reorganise retro software and media asset collections — safely.
 
-Cat198x scans your ROM directories, matches every file against
-[DAT](#dat-files) reference databases (No-Intro, Redump, MAME, FinalBurn Neo),
+Cat198x scans your asset directories, matches files against [DAT](#dat-files)
+reference databases (No-Intro, Redump, MAME, FinalBurn Neo, and related sets),
 and tells you exactly what you have, what you're missing, and what's misnamed or
 duplicated. When you want to tidy the collection, it generates a **plan** you can
 inspect before anything moves — and every applied plan can be rolled back.
@@ -104,7 +104,9 @@ Cat198x is built so that a wrong command costs you time, never data.
   store under their full content hash — reviewable, restorable, and only removed
   by an explicit `quarantine prune`.
 
-## Command reference
+## Core command surface
+
+This table highlights the main workflow commands. Use `cat198x --help` and subcommand help for the complete current CLI, including maintenance, MCP, and DAT repair/relink utilities.
 
 | Command | What it does |
 |---------|--------------|
@@ -141,10 +143,9 @@ headered and headerless DATs.
 
 ## Project status
 
-Cat198x is part of the 198x family of retro-computing tooling, alongside the
-Code198x curriculum and the Emu198x emulator. It is under active development; the
-command surface above is stable, and the safety guarantees are covered by the
-test suite.
+Cat198x is the binary-asset catalogue layer in the 198x family. It complements the curriculum, emulator, assembler, and build-tools projects by keeping software and media collections verified, traceable, and organised.
+
+The safety guarantees are covered by the test suite. Treat `cat198x --help` as the current command reference when this README and the CLI differ.
 
 ## License
 
