@@ -12,6 +12,10 @@ pub(crate) struct CollectionMatchInputs<'a> {
     pub(crate) collection_name: &'a str,
     pub(crate) merge_mode: MergeMode,
     pub(crate) cfg: Option<&'a db_config::CollectionConfig>,
+    /// Per-content holder cap for a pathological oversized collection: `None`
+    /// leaves the match query uncapped (the normal path), `Some(n)` bounds each
+    /// content to its first `n` holder-locations. Set by the size guard.
+    pub(crate) location_cap: Option<i64>,
 }
 
 pub(crate) struct FilteredCollectionMatches {
@@ -30,6 +34,7 @@ pub(crate) fn load_collection_matches(
         inputs.version_id,
         inputs.collection_name,
         inputs.merge_mode == MergeMode::Split,
+        inputs.location_cap,
     )?;
 
     Ok(apply_collection_filter(matches, inputs.cfg))

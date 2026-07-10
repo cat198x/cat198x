@@ -1,6 +1,6 @@
 [package]
 name = "cat198x"
-version = "0.3.1"
+version = "0.4.0"
 edition = "2024"
 description = "A cross-platform CLI for managing retro gaming ROM collections"
 license = "MIT"
@@ -20,7 +20,7 @@ clap_complete = "4"
 rusqlite = { version = "0.40", features = ["bundled"] }
 
 # XML parsing (streaming for large DAT files)
-quick-xml = "0.40"
+quick-xml = "0.41"
 
 # Hashing
 sha1 = "0.11"
@@ -86,7 +86,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # operation surface is exposed over an MCP stdio server so agents drive Cat198x
 # headlessly — the same operations the CLI and UI use. See
 # ../../decisions/agent-native-surface-and-ui.md.
-rmcp = { version = "1.7", features = ["server", "macros", "transport-io"] }
+rmcp = { version = "2.2", features = ["server", "macros", "transport-io"] }
 # Async runtime the MCP server needs; only the mcp subcommand drives it.
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-std"] }
 

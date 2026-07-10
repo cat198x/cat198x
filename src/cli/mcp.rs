@@ -80,7 +80,7 @@ fn mcp_err(e: anyhow::Error) -> McpError {
 fn json_result<T: serde::Serialize>(value: &T) -> Result<CallToolResult, McpError> {
     let json = serde_json::to_string_pretty(value)
         .map_err(|e| McpError::internal_error(e.to_string(), None))?;
-    Ok(CallToolResult::success(vec![Content::text(json)]))
+    Ok(CallToolResult::success(vec![ContentBlock::text(json)]))
 }
 
 #[tool_router]

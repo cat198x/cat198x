@@ -122,7 +122,12 @@ pub(crate) fn compute_shared_containers(conn: &Connection) -> Result<HashSet<Str
 
 /// Count the match-rows a version's plan would materialise, bounded to
 /// `cap + 1`.
-pub(crate) fn count_match_rows_capped(conn: &Connection, version_id: i64, cap: i64) -> Result<i64> {
+pub(crate) fn count_match_rows_capped(
+    conn: &Connection,
+    version_id: i64,
+    cap: i64,
+    location_cap: Option<i64>,
+) -> Result<i64> {
     let rom_count: i64 = conn.query_row(
         "SELECT COUNT(*) FROM dat_roms r
          JOIN dat_games g ON r.game_id = g.id
@@ -132,14 +137,34 @@ pub(crate) fn count_match_rows_capped(conn: &Connection, version_id: i64, cap: i
         |row| row.get(0),
     )?;
     if rom_count < GUARD_ROM_THRESHOLD {
+        // The per-content cap only ever *reduces* the expansion, so a collection
+        // safe uncapped is safe capped; no need to run the windowed count.
         return Ok(rom_count.min(cap));
     }
-    count_expansion_capped(conn, version_id, cap)
+    count_expansion_capped(conn, version_id, cap, location_cap)
 }
 
 /// The exact match expansion, counted only up to `cap + 1`.
-pub(crate) fn count_expansion_capped(conn: &Connection, version_id: i64, cap: i64) -> Result<i64> {
-    let count: i64 = conn.query_row(
+pub(crate) fn count_expansion_capped(
+    conn: &Connection,
+    version_id: i64,
+    cap: i64,
+    location_cap: Option<i64>,
+) -> Result<i64> {
+    let fl_join = match location_cap {
+        None => "JOIN file_locations fl ON fl.sha1 = m.msha1".to_string(),
+        Some(_) => "JOIN (
+                SELECT sha1 FROM (
+                    SELECT fl.sha1,
+                           ROW_NUMBER() OVER (PARTITION BY fl.sha1
+                                              ORDER BY fl.source_id, fl.path) AS rn
+                    FROM file_locations fl
+                    WHERE fl.sha1 IN (SELECT msha1 FROM matched)
+                ) WHERE rn <= ?3
+             ) fl ON fl.sha1 = m.msha1"
+            .to_string(),
+    };
+    let sql = format!(
         "WITH vroms AS (
             SELECT r.id, r.sha1, r.crc32, r.size
             FROM dat_roms r
@@ -159,11 +184,17 @@ pub(crate) fn count_expansion_capped(conn: &Connection, version_id: i64, cap: i6
             WHERE vr.sha1 IS NULL AND vr.crc32 IS NOT NULL
          )
          SELECT COUNT(*) FROM (
-            SELECT 1 FROM matched m JOIN file_locations fl ON fl.sha1 = m.msha1 LIMIT ?2
-         )",
-        rusqlite::params![version_id, cap + 1],
-        |row| row.get(0),
-    )?;
+            SELECT 1 FROM matched m {fl_join} LIMIT ?2
+         )"
+    );
+    let count: i64 = match location_cap {
+        None => conn.query_row(&sql, rusqlite::params![version_id, cap + 1], |row| {
+            row.get(0)
+        })?,
+        Some(lc) => conn.query_row(&sql, rusqlite::params![version_id, cap + 1, lc], |row| {
+            row.get(0)
+        })?,
+    };
     Ok(count)
 }
 
@@ -173,8 +204,29 @@ pub(crate) fn find_matched_roms(
     version_id: i64,
     _collection_name: &str,
     split: bool,
+    location_cap: Option<i64>,
 ) -> Result<Vec<MatchedRom>> {
-    let mut stmt = conn.prepare(
+    // The file-locations join fans each matched ROM out across every physical
+    // holder of its content. For a normal collection that fan-out is small and
+    // we keep every location (no cap). A pathological meta-aggregate breaks that
+    // (a byte-identical default file held in thousands of places), so when
+    // `location_cap` is set we keep only the first N locations per content —
+    // dropping only *redundant* copies of massively-duplicated content. Engaged
+    // solely on the oversized fallback path (see the caller).
+    let fl_join = match location_cap {
+        None => "JOIN file_locations fl ON fl.sha1 = m.sha1".to_string(),
+        Some(_) => "JOIN (
+                SELECT path, sha1, archive_path, source_id FROM (
+                    SELECT fl.path, fl.sha1, fl.archive_path, fl.source_id,
+                           ROW_NUMBER() OVER (PARTITION BY fl.sha1
+                                              ORDER BY fl.source_id, fl.path) AS rn
+                    FROM file_locations fl
+                    WHERE fl.sha1 IN (SELECT sha1 FROM matched)
+                ) WHERE rn <= ?3
+             ) fl ON fl.sha1 = m.sha1"
+            .to_string(),
+    };
+    let sql = format!(
         "WITH vroms AS (
             SELECT r.id, r.game_id, r.name, r.sha1, r.crc32, r.size, r.is_disk
             FROM dat_roms r
@@ -200,25 +252,32 @@ pub(crate) fn find_matched_roms(
          FROM matched m
          JOIN vroms vr ON vr.id = m.rom_id
          JOIN dat_games g ON vr.game_id = g.id
-         JOIN file_locations fl ON fl.sha1 = m.sha1
+         {fl_join}
          JOIN sources s ON fl.source_id = s.id
-         ORDER BY g.name, vr.name",
-    )?;
+         ORDER BY g.name, vr.name"
+    );
 
-    let matches = stmt
-        .query_map(rusqlite::params![version_id, split], |row| {
-            Ok(MatchedRom {
-                game_name: row.get(0)?,
-                rom_name: row.get(1)?,
-                sha1: row.get(2)?,
-                size: row.get(3)?,
-                source_path: row.get(4)?,
-                source_root: row.get(5)?,
-                archive_path: row.get(6)?,
-                is_disk: row.get(7)?,
-            })
-        })?
-        .collect::<Result<Vec<_>, _>>()?;
+    let mut stmt = conn.prepare(&sql)?;
+    let map_row = |row: &rusqlite::Row| {
+        Ok(MatchedRom {
+            game_name: row.get(0)?,
+            rom_name: row.get(1)?,
+            sha1: row.get(2)?,
+            size: row.get(3)?,
+            source_path: row.get(4)?,
+            source_root: row.get(5)?,
+            archive_path: row.get(6)?,
+            is_disk: row.get(7)?,
+        })
+    };
+    let matches = match location_cap {
+        None => stmt
+            .query_map(rusqlite::params![version_id, split], map_row)?
+            .collect::<Result<Vec<_>, _>>()?,
+        Some(cap) => stmt
+            .query_map(rusqlite::params![version_id, split, cap], map_row)?
+            .collect::<Result<Vec<_>, _>>()?,
+    };
 
     Ok(matches)
 }

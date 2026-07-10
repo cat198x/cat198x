@@ -6,9 +6,8 @@ use super::collection_matches::{CollectionMatchInputs, load_collection_matches};
 use super::collection_scope::{ScopedCollectionResolution, resolve_scoped_collection};
 use super::collection_settings::resolve_collection_settings;
 use super::desired_state_recording::record_collection_desired_state;
-use super::matching::count_match_rows_capped;
 use super::options::PlanOptions;
-use super::rules::MAX_MATCH_ROWS;
+use super::rules::{OversizedDecision, oversized_decision};
 use super::scope::collection_name_matches;
 use crate::db::collections;
 
@@ -71,9 +70,13 @@ pub fn compute_desired_state(
             continue;
         };
 
-        if count_match_rows_capped(conn, scoped.version.id, MAX_MATCH_ROWS)? > MAX_MATCH_ROWS {
-            continue;
-        }
+        // Mirror the planner's oversized handling exactly (shared decision), so
+        // desired state and the plan agree: bound holders-per-content when a
+        // collection blows the row budget, and only skip if still over bounded.
+        let location_cap = match oversized_decision(conn, scoped.version.id)? {
+            OversizedDecision::Skip => continue,
+            OversizedDecision::Plan(location_cap) => location_cap,
+        };
 
         let settings =
             resolve_collection_settings(conn, opts, scoped.cfg.as_ref(), &scoped.hierarchy)?;
@@ -83,6 +86,7 @@ pub fn compute_desired_state(
             collection_name: &scoped.name,
             merge_mode: settings.merge_mode,
             cfg: scoped.cfg.as_ref(),
+            location_cap,
         })?;
         record_collection_desired_state(
             &mut state,

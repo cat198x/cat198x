@@ -2,7 +2,7 @@ use anyhow::Result;
 use rusqlite::Connection;
 use std::collections::HashMap;
 
-use super::matching::MatchedRom;
+use super::matching::{MatchedRom, count_match_rows_capped};
 use super::options::PlanOptions;
 use crate::config::{MergeMode, OutputFormat};
 use crate::db::config as db_config;
@@ -17,6 +17,50 @@ use crate::filter::{RomCandidate, parse_game_name, select_preferred};
 /// legitimate set seen, FinalBurn Neo - Arcade Games, expands to ~7.9M rows,
 /// comfortably under the cap.
 pub(crate) const MAX_MATCH_ROWS: i64 = 20_000_000;
+
+/// When a collection's uncapped expansion blows past `MAX_MATCH_ROWS`, the
+/// planner retries it keeping at most this many holder-locations per distinct
+/// content instead of giving up. It tames the one pathology that reaches the
+/// cap -- a byte-identical default file (e.g. a blank MAME icon) shipped for
+/// thousands of machines and held in thousands of places -- by dropping its
+/// redundant copies. It is deliberately far above any legitimate fan-out: across
+/// a real library only ~138 contents are held in more than this many places, so
+/// the rare, unique ROMs that drive build-from and completeness decisions are
+/// never affected. Engaged only on the oversized fallback path.
+pub(crate) const PER_CONTENT_LOCATION_CAP: i64 = 64;
+
+/// The oversized-collection decision, shared by the planner and desired-state so
+/// they treat a pathological meta-aggregate identically (their plans must
+/// agree). A collection under the row budget plans uncapped; one over it is
+/// retried with a per-content holder cap and planned bounded if that fits, or
+/// skipped only if it is still over budget even bounded.
+pub(crate) enum OversizedDecision {
+    /// Plan the collection with this per-content location cap: `None` for a
+    /// normal collection (byte-identical to the uncapped plan), `Some(cap)` on
+    /// the bounded fallback path.
+    Plan(Option<i64>),
+    /// Skip and report -- over the row budget even bounded.
+    Skip,
+}
+
+/// Decide how to treat a collection given its match expansion. Counts uncapped
+/// first (so a normal collection is unaffected), and only on an over-budget
+/// collection re-counts bounded to decide plannable-vs-skip.
+pub(crate) fn oversized_decision(conn: &Connection, version_id: i64) -> Result<OversizedDecision> {
+    if count_match_rows_capped(conn, version_id, MAX_MATCH_ROWS, None)? <= MAX_MATCH_ROWS {
+        return Ok(OversizedDecision::Plan(None));
+    }
+    let capped = count_match_rows_capped(
+        conn,
+        version_id,
+        MAX_MATCH_ROWS,
+        Some(PER_CONTENT_LOCATION_CAP),
+    )?;
+    if capped > MAX_MATCH_ROWS {
+        return Ok(OversizedDecision::Skip);
+    }
+    Ok(OversizedDecision::Plan(Some(PER_CONTENT_LOCATION_CAP)))
+}
 
 /// The effective output format: an explicit per-collection setting wins,
 /// otherwise the library-wide default. An unrecognised string falls back to the

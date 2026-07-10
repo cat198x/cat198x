@@ -7,11 +7,13 @@ use super::collection_matches::{CollectionMatchInputs, load_collection_matches};
 use super::collection_scope::{ScopedCollectionResolution, resolve_scoped_collection};
 use super::collection_settings::resolve_collection_settings;
 use super::container_drains::ContainerDrains;
-use super::matching::{MatchedRom, count_match_rows_capped};
+use super::matching::MatchedRom;
 use super::options::PlanOptions;
 use super::placement_planning::{PlacementPlanCounts, plan_disk_matches, plan_loose_matches};
 use super::reporting;
-use super::rules::{MAX_MATCH_ROWS, archive_extension, archive_format_tag};
+use super::rules::{
+    MAX_MATCH_ROWS, OversizedDecision, archive_extension, archive_format_tag, oversized_decision,
+};
 use super::{CollectionPlanStat, Plan};
 use crate::config::{MergeMode, OutputFormat};
 use crate::db::collections;
@@ -148,9 +150,12 @@ fn prepare_collection_plan(
         }
     };
 
-    if let Some(outcome) = collection_size_skip(ctx, scoped.version.id, &scoped.name)? {
-        return Ok(CollectionPlanPreparation::Skipped(outcome));
-    }
+    let location_cap = match collection_size_guard(ctx, scoped.version.id, &scoped.name)? {
+        CollectionSizeGuard::Skip(outcome) => {
+            return Ok(CollectionPlanPreparation::Skipped(outcome));
+        }
+        CollectionSizeGuard::Plan { location_cap } => location_cap,
+    };
 
     reporting::planning_collection(&scoped.name, &scoped.version.version);
 
@@ -165,6 +170,7 @@ fn prepare_collection_plan(
         collection_name: &scoped.name,
         merge_mode: settings.merge_mode,
         cfg: scoped.cfg.as_ref(),
+        location_cap,
     })?;
     if matches.matches.len() < matches.original_count {
         reporting::one_g_one_r(matches.original_count, matches.matches.len());
@@ -179,23 +185,35 @@ fn prepare_collection_plan(
     }))
 }
 
-fn collection_size_skip(
+/// The size-guard outcome: either skip (over budget even bounded) or plan with
+/// an optional per-content location cap threaded on to the match query.
+enum CollectionSizeGuard {
+    Skip(CollectionPlanningOutcome),
+    Plan { location_cap: Option<i64> },
+}
+
+fn collection_size_guard(
     ctx: &CollectionPlanningContext<'_>,
     version_id: i64,
     collection_name: &str,
-) -> Result<Option<CollectionPlanningOutcome>> {
-    // Guard against pathological collections before materialising any matches:
-    // a MAME-style meta-aggregate expands to tens of millions of match-rows and
-    // would exhaust memory. Skip-and-report instead of OOM.
-    let match_rows = count_match_rows_capped(ctx.conn, version_id, MAX_MATCH_ROWS)?;
-    if match_rows <= MAX_MATCH_ROWS {
-        return Ok(None);
+) -> Result<CollectionSizeGuard> {
+    // Guard against pathological collections before materialising any matches: a
+    // MAME-style meta-aggregate expands to tens of millions of match-rows and
+    // would exhaust memory. When the uncapped expansion blows the budget, retry
+    // with a per-content holder cap (dropping only redundant copies of
+    // massively-duplicated content); skip-and-report only if it is still over
+    // budget even bounded.
+    match oversized_decision(ctx.conn, version_id)? {
+        OversizedDecision::Plan(location_cap) => Ok(CollectionSizeGuard::Plan { location_cap }),
+        OversizedDecision::Skip => {
+            reporting::oversized_collection(collection_name);
+            Ok(CollectionSizeGuard::Skip(
+                CollectionPlanningOutcome::SkippedOversized(format!(
+                    "{collection_name} (>{MAX_MATCH_ROWS} match-rows even capped)"
+                )),
+            ))
+        }
     }
-
-    reporting::oversized_collection(collection_name);
-    Ok(Some(CollectionPlanningOutcome::SkippedOversized(format!(
-        "{collection_name} (>{MAX_MATCH_ROWS} match-rows)"
-    ))))
 }
 
 fn plan_collection_matches(
