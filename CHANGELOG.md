@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0](https://github.com/cat198x/cat198x/compare/v0.4.0...v0.5.0) - 2026-07-10
+
+### Added
+
+- plan oversized collections by bounding holders per content ([#56](https://github.com/cat198x/cat198x/pull/56))
+
+### Other
+
+- Merge main into feat/drain-consume-containers
+- *(deps)* upgrade rmcp 1.7 → 2.2
+- *(deps)* bump quick-xml from 0.40.1 to 0.41.0 ([#60](https://github.com/cat198x/cat198x/pull/60))
+- *(deps)* bump the cargo-minor-patch group with 6 updates ([#59](https://github.com/cat198x/cat198x/pull/59))
+- guard cargo-dist actions from Dependabot major bumps
+- revert release.yml action bump (cargo-dist owns it)
+- bump GitHub Actions to latest major versions
+- defer the multi-format hashes table ([#58](https://github.com/cat198x/cat198x/pull/58))
+
 ## [0.4.0](https://github.com/cat198x/cat198x/compare/v0.3.1...v0.4.0) - 2026-06-21
 
 ### Added
