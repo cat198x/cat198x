@@ -1,6 +1,10 @@
 //! CLI command implementations
 
+mod audit_log;
+mod source_selector;
+
 pub mod apply;
+pub mod args;
 pub mod catalogue;
 pub mod clean_superseded;
 pub mod config;

@@ -4,7 +4,7 @@ use anyhow::{Context, Result};
 use lava_torrent::torrent::v1::{Torrent, TorrentBuilder};
 use std::path::{Path, PathBuf};
 
-use crate::TorrentCommands;
+use crate::cli::args::TorrentCommands;
 
 /// Run the torrent command
 pub fn run(cmd: TorrentCommands) -> Result<()> {

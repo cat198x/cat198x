@@ -1,65 +1,16 @@
 //! Doctor command - health checks for Cat198x installation
 
+mod destination_collisions;
+mod report;
+
 use anyhow::Result;
 use std::path::PathBuf;
 
-use crate::config::Config;
 use crate::db::collections::{list_collections, list_versions};
-use crate::db::dats;
 use crate::db::files::list_sources;
-use crate::plan::PlanOptions;
-use crate::plan::generator::find_destination_collisions;
 
 use super::{get_data_dir, open_database};
-
-/// Health check result
-#[derive(Debug)]
-struct Check {
-    name: String,
-    status: CheckStatus,
-    details: Option<String>,
-}
-
-#[derive(Debug, PartialEq)]
-enum CheckStatus {
-    Ok,
-    Warning,
-    Error,
-}
-
-impl Check {
-    fn ok(name: &str) -> Self {
-        Self {
-            name: name.to_string(),
-            status: CheckStatus::Ok,
-            details: None,
-        }
-    }
-
-    fn warning(name: &str, details: &str) -> Self {
-        Self {
-            name: name.to_string(),
-            status: CheckStatus::Warning,
-            details: Some(details.to_string()),
-        }
-    }
-
-    fn error(name: &str, details: &str) -> Self {
-        Self {
-            name: name.to_string(),
-            status: CheckStatus::Error,
-            details: Some(details.to_string()),
-        }
-    }
-
-    fn status_icon(&self) -> &str {
-        match self.status {
-            CheckStatus::Ok => "[OK]",
-            CheckStatus::Warning => "[WARN]",
-            CheckStatus::Error => "[ERR]",
-        }
-    }
-}
+use report::{Check, print_report};
 
 /// Run doctor checks
 pub fn run(fix: bool, data_dir: Option<PathBuf>) -> Result<()> {
@@ -282,163 +233,21 @@ pub fn run(fix: bool, data_dir: Option<PathBuf>) -> Result<()> {
             }
         }
 
-        // Check 9: Collections colliding on a destination root. Sibling DATs
-        // imported from one directory share a node path, so they resolve to the
-        // same destination and a plan refuses (it would overwrite same-named
-        // games). --fix nests each non-explicit collider under its own name.
-        let config_path = get_data_dir(data_dir.clone())
-            .ok()
-            .map(|d| d.join("config.toml"));
-        let file_config = match &config_path {
-            Some(p) if p.exists() => Config::load(p).unwrap_or_default(),
-            _ => Config::default(),
-        };
-        let opts = PlanOptions {
-            dat_filter: None,
-            set_filter: None,
-            default_dest: file_config.default_dest_path,
-            default_format: file_config.default_output_format,
-            default_merge_mode: file_config.default_merge_mode,
-        };
-        let collisions = find_destination_collisions(conn, &opts, &collections)?;
-
-        if collisions.is_empty() {
-            checks.push(Check::ok("No destination-root collisions"));
-        } else {
-            let nestable = collisions
-                .iter()
-                .flat_map(|c| &c.collections)
-                .filter(|m| !m.has_explicit_dest)
-                .count();
-            // A group where every member has an explicit dest can't be nested
-            // away (the explicit dest wins) — it needs a manual config change.
-            let manual_groups = collisions
-                .iter()
-                .filter(|c| c.collections.iter().all(|m| m.has_explicit_dest))
-                .count();
-
-            let mut detail = format!(
-                "{} destination root(s) shared by multiple collections — a plan will refuse.\n",
-                collisions.len()
-            );
-            for c in collisions.iter().take(5) {
-                let names: Vec<&str> = c.collections.iter().map(|m| m.name.as_str()).collect();
-                let shown = if names.len() > 6 {
-                    format!("{}, ... (+{} more)", names[..6].join(", "), names.len() - 6)
-                } else {
-                    names.join(", ")
-                };
-                detail.push_str(&format!("         {} <- {}\n", c.root, shown));
-            }
-            if collisions.len() > 5 {
-                detail.push_str(&format!("         ... and {} more\n", collisions.len() - 5));
-            }
-            detail.push_str(&format!(
-                "         {nestable} collection(s) auto-nestable; run with --fix"
-            ));
-            if manual_groups > 0 {
-                detail.push_str(&format!(
-                    ". {manual_groups} group(s) need a manual dest_path change \
-                     (all members have explicit dests)"
-                ));
-            }
-            checks.push(Check::warning("No destination-root collisions", &detail));
-
-            if fix {
-                let mut nested = 0usize;
-                for c in &collisions {
-                    for member in &c.collections {
-                        if !member.has_explicit_dest
-                            && let Some(new_path) =
-                                dats::nest_primary_node_under_name(conn, member.version_id)?
-                        {
-                            println!("  Fixed: nested '{}' -> {}", member.name, new_path);
-                            nested += 1;
-                        }
-                    }
-                }
-                println!(
-                    "  Fixed: nested {nested} collection(s) under their own name \
-                     (re-run 'cat198x doctor' to confirm)"
-                );
-            }
-        }
+        checks.push(destination_collisions::check(
+            conn,
+            &collections,
+            fix,
+            data_dir.clone(),
+        )?);
     }
 
-    // Print results
-    println!("Cat198x Health Check");
-    println!("=====================\n");
-
-    let mut errors = 0;
-    let mut warnings = 0;
-
-    for check in &checks {
-        let status_str = check.status_icon();
-        print!("{} {}", status_str, check.name);
-
-        if let Some(details) = &check.details {
-            print!(": {}", details);
-        }
-        println!();
-
-        match check.status {
-            CheckStatus::Error => errors += 1,
-            CheckStatus::Warning => warnings += 1,
-            CheckStatus::Ok => {}
-        }
-    }
-
-    println!();
-
-    if errors > 0 {
-        println!("Found {} error(s) and {} warning(s)", errors, warnings);
-        if !fix {
-            println!("Run with --fix to attempt automatic repairs");
-        }
-    } else if warnings > 0 {
-        println!("Found {} warning(s)", warnings);
-        if !fix {
-            println!("Run with --fix to attempt automatic repairs");
-        }
-    } else {
-        println!("All checks passed!");
-    }
-
+    print_report(&checks, fix);
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use crate::db::Database;
-
-    #[test]
-    fn test_check_ok() {
-        let check = Check::ok("Test check");
-        assert_eq!(check.status, CheckStatus::Ok);
-        assert!(check.details.is_none());
-    }
-
-    #[test]
-    fn test_check_warning() {
-        let check = Check::warning("Test check", "Some warning");
-        assert_eq!(check.status, CheckStatus::Warning);
-        assert_eq!(check.details.as_deref(), Some("Some warning"));
-    }
-
-    #[test]
-    fn test_check_error() {
-        let check = Check::error("Test check", "Some error");
-        assert_eq!(check.status, CheckStatus::Error);
-        assert_eq!(check.details.as_deref(), Some("Some error"));
-    }
-
-    #[test]
-    fn test_status_icons() {
-        assert_eq!(Check::ok("").status_icon(), "[OK]");
-        assert_eq!(Check::warning("", "").status_icon(), "[WARN]");
-        assert_eq!(Check::error("", "").status_icon(), "[ERR]");
-    }
 
     #[test]
     fn test_database_integrity_check() {

@@ -96,6 +96,21 @@ impl OperationStatus {
     }
 }
 
+/// Where a copy-like operation writes its payload.
+///
+/// The default is a byte-for-byte loose file. Archive writes are explicit so a
+/// DAT ROM whose canonical filename happens to end in `.zip` is still written as
+/// that loose file, not silently wrapped inside a new ZIP archive.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum CopyPlacement {
+    #[default]
+    LooseFile,
+    ZipEntry {
+        entry_name: String,
+    },
+}
+
 /// The type of operation to perform
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
@@ -105,12 +120,16 @@ pub enum OperationKind {
         source: SourceRef,
         dest: String,
         size: u64,
+        #[serde(default)]
+        placement: CopyPlacement,
     },
     /// Move a file (copy + delete source)
     Move {
         source: SourceRef,
         dest: String,
         size: u64,
+        #[serde(default)]
+        placement: CopyPlacement,
     },
     /// Relocate a whole file unchanged — e.g. a complete archive that is already
     /// in its final form and only needs to sit at its canonical path. Unlike
@@ -241,7 +260,35 @@ impl Plan {
         self.operations.push(Operation {
             id,
             status: OperationStatus::Pending,
-            kind: OperationKind::Copy { source, dest, size },
+            kind: OperationKind::Copy {
+                source,
+                dest,
+                size,
+                placement: CopyPlacement::LooseFile,
+            },
+        });
+        self.summary.copy_count += 1;
+        self.summary.total_bytes += size;
+    }
+
+    /// Add an explicit copy-into-ZIP operation.
+    pub fn add_copy_to_zip(
+        &mut self,
+        source: SourceRef,
+        dest: String,
+        entry_name: String,
+        size: u64,
+    ) {
+        let id = self.operations.len() as u64;
+        self.operations.push(Operation {
+            id,
+            status: OperationStatus::Pending,
+            kind: OperationKind::Copy {
+                source,
+                dest,
+                size,
+                placement: CopyPlacement::ZipEntry { entry_name },
+            },
         });
         self.summary.copy_count += 1;
         self.summary.total_bytes += size;
@@ -253,7 +300,12 @@ impl Plan {
         self.operations.push(Operation {
             id,
             status: OperationStatus::Pending,
-            kind: OperationKind::Move { source, dest, size },
+            kind: OperationKind::Move {
+                source,
+                dest,
+                size,
+                placement: CopyPlacement::LooseFile,
+            },
         });
         self.summary.move_count += 1;
         self.summary.total_bytes += size;
@@ -387,138 +439,5 @@ fn chrono_lite_now() -> String {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_plan_new() {
-        let plan = Plan::new("abc123".to_string());
-        assert_eq!(plan.state_hash, "abc123");
-        assert!(plan.is_empty());
-        assert_eq!(plan.operation_count(), 0);
-    }
-
-    #[test]
-    fn test_plan_add_copy() {
-        let mut plan = Plan::new("test".to_string());
-
-        plan.add_copy(
-            SourceRef {
-                path: "/source/game.rom".to_string(),
-                archive_path: None,
-                sha1: "ABC123".to_string(),
-                entry_name: None,
-            },
-            "/dest/game.rom".to_string(),
-            1024,
-        );
-
-        assert!(!plan.is_empty());
-        assert_eq!(plan.operation_count(), 1);
-        assert_eq!(plan.summary.copy_count, 1);
-        assert_eq!(plan.summary.total_bytes, 1024);
-    }
-
-    #[test]
-    fn test_plan_serialize() {
-        let mut plan = Plan::new("hash123".to_string());
-        plan.add_copy(
-            SourceRef {
-                path: "/src/rom.nes".to_string(),
-                archive_path: None,
-                sha1: "SHA1HASH".to_string(),
-                entry_name: None,
-            },
-            "/dest/rom.nes".to_string(),
-            2048,
-        );
-
-        let json = serde_json::to_string_pretty(&plan).unwrap();
-        assert!(json.contains("\"state_hash\": \"hash123\""));
-        assert!(json.contains("\"type\": \"copy\""));
-        assert!(json.contains("\"/src/rom.nes\""));
-    }
-
-    #[test]
-    fn test_plan_deserialize() {
-        let json = r#"{
-            "state_hash": "test123",
-            "created_at": "2024-01-01 00:00:00",
-            "operations": [
-                {
-                    "id": 0,
-                    "status": "pending",
-                    "kind": {
-                        "type": "copy",
-                        "source": {
-                            "path": "/src/file.rom",
-                            "archive_path": null,
-                            "sha1": "DEADBEEF"
-                        },
-                        "dest": "/dest/file.rom",
-                        "size": 1000
-                    }
-                }
-            ],
-            "summary": {
-                "copy_count": 1,
-                "move_count": 0,
-                "repack_count": 0,
-                "delete_count": 0,
-                "already_correct": 0,
-                "missing": 0,
-                "total_bytes": 1000
-            }
-        }"#;
-
-        let plan: Plan = serde_json::from_str(json).unwrap();
-        assert_eq!(plan.state_hash, "test123");
-        assert_eq!(plan.operations.len(), 1);
-        assert_eq!(plan.summary.copy_count, 1);
-    }
-
-    #[test]
-    fn test_operation_kind_copy() {
-        let kind = OperationKind::Copy {
-            source: SourceRef {
-                path: "/src".to_string(),
-                archive_path: None,
-                sha1: "hash".to_string(),
-                entry_name: None,
-            },
-            dest: "/dest".to_string(),
-            size: 100,
-        };
-
-        let json = serde_json::to_string(&kind).unwrap();
-        assert!(json.contains("\"type\":\"copy\""));
-    }
-
-    #[test]
-    fn test_operation_kind_repack() {
-        let kind = OperationKind::Repack {
-            sources: vec![
-                SourceRef {
-                    path: "/src/a.rom".to_string(),
-                    archive_path: None,
-                    sha1: "hash1".to_string(),
-                    entry_name: None,
-                },
-                SourceRef {
-                    path: "/src/b.rom".to_string(),
-                    archive_path: None,
-                    sha1: "hash2".to_string(),
-                    entry_name: None,
-                },
-            ],
-            dest: "/dest/game.zip".to_string(),
-            format: "zip".to_string(),
-            size: 2048,
-            move_sources: false,
-        };
-
-        let json = serde_json::to_string(&kind).unwrap();
-        assert!(json.contains("\"type\":\"repack\""));
-        assert!(json.contains("\"sources\""));
-    }
-}
+#[path = "types_tests.rs"]
+mod tests;

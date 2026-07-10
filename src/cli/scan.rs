@@ -1,20 +1,14 @@
 //! File scanning command with parallel processing and resume support
 
+mod planning;
+mod processing;
+
 use anyhow::{Context, Result};
 use indicatif::{ProgressBar, ProgressStyle};
-use rayon::prelude::*;
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::time::SystemTime;
-use walkdir::WalkDir;
-
-/// When stderr is not a terminal (piped, redirected, run in the background, or
-/// in CI), the indicatif progress bar draws nothing, so the scan would appear to
-/// hang. In that case we emit a plain progress line every this many files
-/// instead, plus one for the final file.
-const PROGRESS_LOG_INTERVAL: usize = 250;
 
 /// Files are hashed and committed in batches of this size rather than hashing
 /// the whole source into memory and writing once at the end. Reading files over
@@ -26,68 +20,10 @@ const PROGRESS_LOG_INTERVAL: usize = 250;
 const BATCH_SIZE: usize = 2000;
 
 use crate::db::files::{self, Source};
-use crate::scanner::archive::{ArchiveType, hash_archive_entries};
-use crate::scanner::hasher::{FileHashes, hash_file_with_header_detection};
-use crate::util::truncate_path;
 
 use super::open_database;
-
-/// Result of hashing a single file or archive
-#[derive(Debug)]
-enum ScanResult {
-    /// A loose file with its hashes
-    LooseFile {
-        relative_path: String,
-        /// Full-file hashes (the true bytes on disk; the dedup identity).
-        hashes: FileHashes,
-        /// Headerless SHA1, set only when a header was detected and stripped.
-        sha1_no_header: Option<String>,
-        /// Header that was detected and skipped (for info only)
-        header_skipped: Option<String>,
-    },
-    /// An archive with multiple entries
-    Archive {
-        relative_path: String,
-        entries: Vec<ArchiveEntry>,
-    },
-    /// Failed to process the file
-    Error {
-        relative_path: String,
-        error: String,
-    },
-}
-
-/// A single entry from an archive
-#[derive(Debug)]
-struct ArchiveEntry {
-    name: String,
-    hashes: FileHashes,
-}
-
-/// Build a CHD's scan hashes from its header and metadata only — never reading
-/// the (multi-GB) body. The match identity is the internal header SHA1; size
-/// comes from metadata; the container's md5/crc are not meaningful for a CHD and
-/// are left empty.
-fn chd_hashes(path: &Path) -> Result<FileHashes> {
-    let sha1 = crate::scanner::chd::read_chd_sha1(path)?;
-    let size = std::fs::metadata(path)?.len();
-    Ok(FileHashes {
-        sha1,
-        md5: String::new(),
-        crc32: String::new(),
-        size,
-    })
-}
-
-/// Whether a `--source` selector picks this source: a purely numeric selector
-/// is a source id and matches exactly; anything else matches as a path
-/// substring.
-fn source_matches(source: &files::Source, selector: &str) -> bool {
-    match selector.parse::<i64>() {
-        Ok(id) => source.id == id,
-        Err(_) => source.path.contains(selector),
-    }
-}
+use planning::{plan_source_files, resolve_walk_root, select_sources};
+use processing::process_batch;
 
 /// Run the scan command
 pub fn run(
@@ -100,21 +36,7 @@ pub fn run(
     let conn = db.conn();
 
     // Get sources to scan
-    let sources = if let Some(selectors) = &source {
-        // Filter to specific sources. A purely numeric selector is a source id
-        // and matches exactly; anything else matches as a path substring. The
-        // id form exists because substring selection cannot always isolate a
-        // source — one source's path may be a prefix of another's (e.g.
-        // `ToSort/MAME` and `ToSort/MAME 0.288 …`), and digits inside a path
-        // (the `28` in `0.288`) collide with id-like selectors.
-        let all_sources = files::list_sources(conn)?;
-        all_sources
-            .into_iter()
-            .filter(|s| selectors.iter().any(|sel| source_matches(s, sel)))
-            .collect()
-    } else {
-        files::list_sources(conn)?
-    };
+    let sources = select_sources(conn, source.as_deref())?;
 
     if sources.is_empty() {
         println!("No sources to scan.");
@@ -188,23 +110,7 @@ fn scan_source(
     let source_path = Path::new(&source.path);
 
     // Resolve and validate the walk root: the source itself, or a subtree of it.
-    let walk_root = match subtree {
-        Some(sub) => {
-            // Keep the walk inside the source. `Path::starts_with` is lexical and
-            // wouldn't catch `..` (it compares components, not resolved paths), so
-            // reject any subtree that isn't a plain relative descent — no absolute
-            // path, no `..`, no leading `/`.
-            use std::path::Component;
-            let valid = Path::new(sub)
-                .components()
-                .all(|c| matches!(c, Component::Normal(_) | Component::CurDir));
-            if sub.is_empty() || !valid {
-                anyhow::bail!("--path {sub:?} escapes the source root");
-            }
-            source_path.join(sub)
-        }
-        None => source_path.to_path_buf(),
-    };
+    let walk_root = resolve_walk_root(source_path, subtree)?;
 
     match subtree {
         Some(sub) => println!("Scanning: {} (subtree {})", source.path, sub),
@@ -221,66 +127,9 @@ fn scan_source(
         return Ok((0, 0, 0));
     }
 
-    // Parse last_scanned timestamp for incremental scan
-    let last_scanned = if full {
-        None
-    } else {
-        source.last_scanned.as_ref().and_then(|ts| {
-            // Parse SQLite datetime format: "YYYY-MM-DD HH:MM:SS"
-            parse_sqlite_datetime(ts)
-        })
-    };
-
-    // Single pass: collect all files, then partition into to-scan and skipped
-    // Follow symlinks so users can symlink ROM folders from external drives
-    let all_files: Vec<PathBuf> = WalkDir::new(&walk_root)
-        .follow_links(true)
-        .into_iter()
-        .filter_map(|e| e.ok())
-        .filter(|e| e.file_type().is_file())
-        .map(|e| e.into_path())
-        .collect();
-
-    let total_files_in_source = all_files.len();
-
-    // Filter to files that need scanning (modified since last scan, or full rescan)
-    let files_to_scan: Vec<PathBuf> = if full {
-        all_files
-    } else {
-        // An incremental scan must also catch files that are on disk but absent
-        // from the catalogue — added with an older mtime, or left behind when a
-        // previous scan was interrupted before its write phase. Without this, a
-        // partial scan that still stamped `last_scanned` would strand the rest
-        // forever (their mtime predates the stamp), and a dropped scan over a
-        // flaky mount could never resume. Treating uncatalogued files as
-        // always-scan makes incremental scans self-healing and resumable.
-        let known = files::catalogued_paths(conn, source.id)?;
-        all_files
-            .into_iter()
-            .filter(|path| {
-                let relative = path
-                    .strip_prefix(source_path)
-                    .unwrap_or(path)
-                    .to_string_lossy();
-                // Never catalogued here yet — always scan.
-                if !known.contains(relative.as_ref()) {
-                    return true;
-                }
-                // Already catalogued: scan only if modified since last scan.
-                if let Some(threshold) = last_scanned
-                    && let Ok(metadata) = std::fs::metadata(path)
-                    && let Ok(modified) = metadata.modified()
-                {
-                    return modified > threshold;
-                }
-                // If we can't determine modification time, scan it
-                true
-            })
-            .collect()
-    };
-
-    let total_to_scan = files_to_scan.len();
-    let skipped = total_files_in_source - total_to_scan;
+    let file_plan = plan_source_files(conn, source, source_path, &walk_root, full)?;
+    let total_to_scan = file_plan.total_to_scan();
+    let skipped = file_plan.skipped;
 
     if total_to_scan == 0 {
         println!("  No new or modified files to scan");
@@ -331,7 +180,7 @@ fn scan_source(
 
     // Hash and commit in batches so a dropped or interrupted scan keeps every
     // completed batch instead of losing the whole run (see BATCH_SIZE).
-    for batch in files_to_scan.chunks(BATCH_SIZE) {
+    for batch in file_plan.files_to_scan.chunks(BATCH_SIZE) {
         if interrupted.load(Ordering::SeqCst) {
             break;
         }
@@ -394,222 +243,6 @@ fn scan_source(
     Ok((processed_files, processed_entries, skipped))
 }
 
-/// Tallies from processing one batch, accumulated across batches by the caller.
-#[derive(Default)]
-struct BatchStats {
-    files: usize,
-    entries: usize,
-    headers_skipped: usize,
-    /// `(relative_path, error)` for each file that failed to hash.
-    errors: Vec<(String, String)>,
-}
-
-/// Hash one batch of files in parallel, then commit them in a single
-/// transaction. One transaction per batch: a DB error rolls back just this
-/// batch, and the per-file upserts commit together rather than once each.
-#[allow(clippy::too_many_arguments)]
-fn process_batch(
-    conn: &rusqlite::Connection,
-    source: &Source,
-    source_path: &Path,
-    batch: &[PathBuf],
-    processed_count: &AtomicUsize,
-    interrupted: &AtomicBool,
-    interactive: bool,
-    pb: &ProgressBar,
-    total_to_scan: usize,
-) -> Result<BatchStats> {
-    // Parallel hashing phase for this batch
-    let results: Vec<ScanResult> = batch
-        .par_iter()
-        .map(|file_path| {
-            // Check for interruption
-            if interrupted.load(Ordering::SeqCst) {
-                return ScanResult::Error {
-                    relative_path: String::new(),
-                    error: "Interrupted".to_string(),
-                };
-            }
-
-            let relative_path = file_path
-                .strip_prefix(source_path)
-                .unwrap_or(file_path)
-                .to_string_lossy()
-                .to_string();
-
-            // Update progress
-            let done = processed_count.fetch_add(1, Ordering::SeqCst) + 1;
-            if interactive {
-                if done.is_multiple_of(10) {
-                    pb.set_position(done as u64);
-                    pb.set_message(truncate_path(&relative_path, 30));
-                }
-            } else if done.is_multiple_of(PROGRESS_LOG_INTERVAL) || done == total_to_scan {
-                println!(
-                    "  hashed {}/{} ({}%)",
-                    done,
-                    total_to_scan,
-                    done * 100 / total_to_scan
-                );
-            }
-
-            // Check if it's an archive
-            if ArchiveType::from_path(file_path).is_some() {
-                match hash_archive_entries(file_path) {
-                    Ok(entries) => {
-                        let archive_entries: Vec<ArchiveEntry> = entries
-                            .into_iter()
-                            .filter_map(|e| {
-                                e.hashes.map(|h| ArchiveEntry {
-                                    name: e.name,
-                                    hashes: h,
-                                })
-                            })
-                            .collect();
-                        ScanResult::Archive {
-                            relative_path,
-                            entries: archive_entries,
-                        }
-                    }
-                    Err(e) => ScanResult::Error {
-                        relative_path,
-                        error: e.to_string(),
-                    },
-                }
-            } else if crate::scanner::chd::is_chd_path(file_path) {
-                // A CHD's identity is its *internal* logical-data SHA1 from the
-                // header, which is what <disk> DAT entries reference — not the
-                // hash of the .chd file's bytes. Read only the 124-byte header,
-                // never the (multi-GB) body: the internal SHA1 is the match key,
-                // size comes from metadata, and the container's md5/crc aren't
-                // meaningful for a CHD. An unreadable header surfaces as a scan
-                // error rather than a silently unmatchable (file-hashed) CHD.
-                match chd_hashes(file_path) {
-                    Ok(hashes) => ScanResult::LooseFile {
-                        relative_path,
-                        hashes,
-                        sha1_no_header: None,
-                        header_skipped: None,
-                    },
-                    Err(e) => ScanResult::Error {
-                        relative_path,
-                        error: e.to_string(),
-                    },
-                }
-            } else {
-                // Hash loose file with header detection
-                match hash_file_with_header_detection(file_path) {
-                    Ok(result) => {
-                        // Identity is the full-file hash (the true bytes on
-                        // disk); the headerless SHA1 is kept alongside so the
-                        // file can also match headerless DATs (No-Intro).
-                        // Discarding the full hash, as before, made headered
-                        // files unmatchable against headered DATs.
-                        let sha1_no_header = result.headerless.as_ref().map(|h| h.sha1.clone());
-                        let header_skipped = if result.headerless.is_some() {
-                            result.header.map(|h| h.format.name().to_string())
-                        } else {
-                            None
-                        };
-                        ScanResult::LooseFile {
-                            relative_path,
-                            hashes: result.full,
-                            sha1_no_header,
-                            header_skipped,
-                        }
-                    }
-                    Err(e) => ScanResult::Error {
-                        relative_path,
-                        error: e.to_string(),
-                    },
-                }
-            }
-        })
-        .collect();
-
-    // Sequential database write phase for this batch
-    let mut stats = BatchStats::default();
-
-    let tx = conn.unchecked_transaction()?;
-
-    for result in results {
-        match result {
-            ScanResult::LooseFile {
-                relative_path,
-                hashes,
-                sha1_no_header,
-                header_skipped,
-            } => {
-                files::upsert_file(
-                    conn,
-                    &hashes.sha1,
-                    sha1_no_header.as_deref(),
-                    Some(&hashes.md5),
-                    Some(&hashes.crc32),
-                    hashes.size as i64,
-                )?;
-                files::upsert_file_location(conn, &hashes.sha1, source.id, &relative_path, None)?;
-                stats.files += 1;
-                if header_skipped.is_some() {
-                    stats.headers_skipped += 1;
-                }
-            }
-            ScanResult::Archive {
-                relative_path,
-                entries,
-            } => {
-                for entry in entries {
-                    files::upsert_file(
-                        conn,
-                        &entry.hashes.sha1,
-                        None, // archive entries aren't header-detected
-                        Some(&entry.hashes.md5),
-                        Some(&entry.hashes.crc32),
-                        entry.hashes.size as i64,
-                    )?;
-                    files::upsert_file_location(
-                        conn,
-                        &entry.hashes.sha1,
-                        source.id,
-                        &relative_path,
-                        Some(&entry.name),
-                    )?;
-                    stats.entries += 1;
-                }
-                stats.files += 1;
-            }
-            ScanResult::Error {
-                relative_path,
-                error,
-            } => {
-                if !error.is_empty() && error != "Interrupted" {
-                    stats.errors.push((relative_path, error));
-                }
-            }
-        }
-    }
-
-    tx.commit()?;
-
-    Ok(stats)
-}
-
-/// Parse SQLite datetime format to SystemTime
-fn parse_sqlite_datetime(s: &str) -> Option<SystemTime> {
-    use chrono::NaiveDateTime;
-
-    // Format: "YYYY-MM-DD HH:MM:SS"
-    NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S")
-        .ok()
-        .and_then(|dt| {
-            dt.and_utc()
-                .timestamp()
-                .try_into()
-                .ok()
-                .map(|secs| SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(secs))
-        })
-}
-
 /// Set up a Ctrl+C handler for graceful interruption
 fn ctrlc_handler<F: Fn() + Send + 'static>(handler: F) -> Result<()> {
     ctrlc::set_handler(handler).context("Failed to set Ctrl+C handler")
@@ -618,6 +251,8 @@ fn ctrlc_handler<F: Fn() + Send + 'static>(handler: F) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cli::source_selector::source_matches;
+    use planning::parse_sqlite_datetime;
 
     #[test]
     fn test_parse_sqlite_datetime() {
