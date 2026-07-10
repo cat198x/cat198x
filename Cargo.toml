@@ -20,7 +20,7 @@ clap_complete = "4"
 rusqlite = { version = "0.40", features = ["bundled"] }
 
 # XML parsing (streaming for large DAT files)
-quick-xml = "0.40"
+quick-xml = "0.41"
 
 # Hashing
 sha1 = "0.11"
