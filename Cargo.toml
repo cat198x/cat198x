@@ -5,6 +5,9 @@ edition = "2024"
 description = "A cross-platform CLI for managing retro gaming ROM collections"
 license = "MIT"
 repository = "https://github.com/cat198x/cat198x"
+# The Homebrew formula carries a homepage; without one `dist` warns and the
+# generated formula is poorer for it.
+homepage = "https://cat198x.github.io"
 keywords = ["rom", "retro", "gaming", "dat", "mame"]
 categories = ["command-line-utilities", "games"]
 
@@ -130,7 +133,15 @@ codegen-units = 1
 [workspace.metadata.dist]
 cargo-dist-version = "0.32.0"
 ci = "github"
-installers = []
+# shell/powershell need no infrastructure beyond the GitHub Release the
+# archives already ship to. homebrew publishes a formula to `tap` below, which
+# needs that repo to exist and a token with write access to it (the release
+# workflow reads `HOMEBREW_TAP_TOKEN`).
+installers = ["shell", "powershell", "homebrew"]
+tap = "cat198x/homebrew-tap"
+# Publishing the formula is a separate job from building the installer; without
+# it the tap is named and never written to.
+publish-jobs = ["homebrew"]
 targets = ["aarch64-apple-darwin", "x86_64-apple-darwin", "x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc"]
 pr-run-mode = "plan"
 # Announce each release in Discord. A custom job rather than an `on: release`
