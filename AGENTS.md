@@ -1,9 +1,11 @@
 # Cat198x
 
+> Read [`PRINCIPLES.md`](PRINCIPLES.md) first.
+
 The binary-asset cataloguing tool for the 198x family — inventory, DAT
 verification, deduplication, and safe reorganisation of ROM/disk/test-suite
-collections. See [`../../CLAUDE.md`](../../CLAUDE.md) for umbrella context and
-cross-project rules, [`../CLAUDE.md`](../CLAUDE.md) for the `cat198x`
+collections. See [`../../AGENTS.md`](../../AGENTS.md) for umbrella context and
+cross-project rules, [`../AGENTS.md`](../AGENTS.md) for the `cat198x`
 org-container layout, and
 [`../../decisions/sibling-project-coordination.md`](../../decisions/sibling-project-coordination.md)
 for sibling-project boundaries.
@@ -23,7 +25,7 @@ layout are in [`SPECIFICATION.md`](SPECIFICATION.md).
 
 ## Existing-code stance
 
-Evolve the existing `cat198x` tool; do not green-field a second cataloguer. Read
+Read
 [`../../decisions/cat198x-asset-tooling.md`](../../decisions/cat198x-asset-tooling.md)
 before proposing structural change: the binding stance is to improve correctness
 and trust as small tested commits, not reimplement the tool. Preserve the
