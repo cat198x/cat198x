@@ -173,12 +173,37 @@ Three distributions sit at the root — `TOSEC` (2,608 dats), `TOSEC-ISO` (271) 
 three grouping segments. A segment in square brackets is a **format**; every other
 segment is a **group**. That rule is syntactic and holds across all 3,982.
 
-**The tree is positional.** Nodes are `group` or `dat`, and nothing more is claimed. It is
-tempting to label the levels manufacturer, system and category, and for most paths that
-would be right — but `Acorn/Magazines/Acorn User` and `Multi-format/DVD/Games` put a
-category where a machine is expected, and 357 of 3,982 paths disagree with that reading.
-Positional addressing works for all of them. Semantic labels can be added later where they
-verify; a wrong label cannot be withdrawn from a manifest someone has already written.
+**Groups are locally scoped; formats are globally scoped.** A group named `Games` means
+something only under its parent. `[TZX]` means the same thing everywhere. So a format is a
+level *and* an indexed attribute, and those do not conflict:
+
+- No node mixes them. Across 2,645 parent nodes, the children are either all formats or all
+  bare dats — never both. The level is never ragged.
+- They recur. 140 of 224 formats appear under more than one parent: `[BIN]` under 118 dats,
+  `[DSK]` under 98, `[D64]` under 58.
+- They discriminate. 460 group nodes hold two or more dats separated by nothing else.
+
+Positional addressing gives `TOSEC/Sinclair/ZX Spectrum/Games/[TZX]`. The attribute index
+gives what a target asks for, which is cross-tree: every `[TZX]` anywhere, or
+prefer `[TZX]` over `[TAP]` where both exist.
+
+**Group levels are labelled only where TOSEC states the label twice.** The distribution
+encodes the same fact as directory structure and again in the dat filename, and agreement
+between them is the verifier:
+
+| | |
+|---|---|
+| 3,623 (91.0%) | manufacturer and system agree — labelled |
+| 356 (8.9%) | level 2 is a category, not a system — left as a bare group |
+| 3 (0.1%) | unresolved: `Basic Master Jr` against `Basic Master Jr.`, `VTech` against `Vtech` |
+
+The 8.9% are detections, not failures. `Acorn/Magazines` yields the name head `Acorn`, so
+the check identifies that level 2 is a category instead of mislabelling it as a machine.
+Addressing is positional either way, so an unlabelled node loses nothing; a wrongly labelled
+one cannot be withdrawn from manifests already written against it.
+
+Re-run the check per TOSEC release. It doubles as a data-quality report on the distribution:
+those three disagreements are typos upstream.
 
 A tree may be flat. MAME's three collections sit directly under their root, and the same
 addressing applies to a depth of one.
@@ -212,19 +237,46 @@ sanitiser later renames everything it has already written.
 
 ### Adopting an existing target
 
-An existing romset is declared, indexed and kept current in place. Whether that needs a full
-re-hash is unresolved, and deliberately unbuilt.
+There are three cases, and only one of them scans.
 
-`file_locations` stores `sha1`, `path`, `archive_path` and `last_seen` — no size, no mtime.
-There is no stat data to compare against, so nothing cheaper than hashing exists today.
+**A target Cat198x created** needs no scan. It carries state, and `plan` reads it.
 
-Before adding columns, measure. A target is local and far smaller than the store; if hashing
-one of 41,712 archives takes minutes, a staleness heuristic is complexity buying nothing.
+**A foreign romset being adopted** is hashed in full, once. There is no shortcut, and the
+reason is not performance: a directory Cat198x did not write offers no evidence about its
+contents except its contents. Filenames are a claim, not a witness.
 
-If measurement says otherwise: adopt on `(path, size, mtime)`, hash whatever fails to match,
-and **always hash in full before the first destructive operation on a target**. Cat198x may
-delete inside a target, and that freedom must not rest on mtime, which lies after a backup
-restore, a `cp -p`, or an rsync carrying times across.
+It is worse than a target's own size suggests. A third-party romset is not byte-identical
+to a deterministic export, so its archive hashes match nothing in the store and its
+*members* must be extracted and hashed — 184,373 rather than 43,220 for a split MAME set.
+That is the one-time price of admission.
+
+**Re-verifying a target for drift** is where a stat-based check earns its place.
+
+Measured on an M2 Max with an internal APFS SSD, SHA1 runs at 2,511 MiB/s and costs 199 µs
+per file. Against the three real collection shapes in the catalogue:
+
+| Target | Files | Size | Full hash |
+|---|---|---|---|
+| `Sinclair ZX Spectrum - Games - [TZX]` | 19,182 | 0.9 GiB | ~4 s |
+| `Commodore Amiga - Games - [ADF]` | 33,071 | 26.4 GiB | ~20 s |
+| `MAME ROMs (split)` | 43,220 | 170 GiB | ~95 s |
+
+Locally, hashing is cheap enough that no heuristic is worth its complexity.
+
+Over a network mount it is not. On AFP, a 45,132-entry readdir takes 7.1 s, stat costs
+10.3 ms per file, and reads run at 9.9 MiB/s — so the same MAME set takes **7 minutes to
+stat and 3.3 hours to hash**. Stat is 28 times cheaper, and drift detection on network
+storage is unusable without it.
+
+So `file_locations` gains `size` and `mtime`. **Not yet present** — the table holds `sha1`,
+`path`, `archive_path` and `last_seen`, so no cheap check exists today. The columns are
+justified by drift detection, never by adoption: Cat198x may delete inside a target, and
+that freedom rests on hashes, not on mtime, which lies after a backup restore, a `cp -p`,
+or an rsync carrying times across.
+
+These figures are one machine and one slow network mount. The shape generalises — hashing
+is throughput-bound, stat is round-trip-bound — but faster network storage sits nearer the
+local column.
 
 ### Target state
 
@@ -328,7 +380,10 @@ Under store-and-export the first two have nothing to repair: layouts are not sto
 
 ## Open questions
 
-- Does the format segment (`[D64]`, `[ADF]`) belong in the tree as its own level, or as an
-  attribute of the dat node? 2,136 of 3,982 collections have none.
-- Do the semantic level labels get added later as verified annotations, and what verifies them?
-- Is hashing a target fast enough to make the adoption heuristic unnecessary?
+None outstanding. Decisions above that are not yet built:
+
+- The collection tree is stubbed. `dat_nodes` holds 4,730 rows, all of `node_type = 'dat'`,
+  one per collection. Populating it parses `collection_versions.dat_path` and rescans nothing.
+- `dat_game_devices` holds 0 rows, so dependency resolution is unimplemented.
+- `file_locations` has no `size` or `mtime`.
+- Nothing in the code implements store-and-export.
