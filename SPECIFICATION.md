@@ -1,603 +1,215 @@
-# Cat198x Technical Specification
+# Cat198x Specification
 
-**Version 2.3 — December 2024**
+**Status: DRAFT — the store-and-export direction, 2026-08-28.** Supersedes the pipeline-and-phases specification. Not yet reflected in the code.
 
-## Executive Summary
+## What Cat198x is
 
-Cat198x is a cross-platform ROM collection manager inspired by tools like RomVault and CLRMamePro, but designed with modern sensibilities: a clean CLI interface following Terraform-style workflows, proper versioning of DAT files, and a shared core library enabling CLI, TUI, and GUI frontends.
+A package manager for ROM collections.
 
-The tool manages ROM collections against DAT files from sources including MAME, TOSEC, No-Intro, and Redump. It supports multiple archive formats, handles MAME's complex parent/clone relationships, and provides comprehensive status reporting with hierarchical rollups.
+You tell it which sets you want to be complete for. It tells you what you have and what you are missing, and it builds you a romset in whatever shape you need — split or merged, one zip per machine or one zip per romset, from the ROMs already on your disk.
 
-### Key Differentiators
+## The model
 
-- **Terraform-style workflow**: scan → plan → apply with forced two-step execution
-- **DAT versioning**: collections maintain version history, upgrade between versions cleanly
-- **TOSEC hierarchy injection**: flat DAT files automatically organised into correct tree structure
-- **Diff archives**: generate update packs between DAT versions with torrent support
-- **Content-addressed matching**: same ROM satisfies multiple DATs without duplication tracking
-- **Cross-platform**: Rust core with CLI, TUI (ratatui), and future GUI (Tauri)
+Four nouns.
 
-### Core Invariants
+**Source** — a directory Cat198x reads. Every source has a **disposition**: `consume` (staging; content may be moved out and the source freed) or `preserve` (reference; content is copied out and the source left intact). Disposition follows the directory's role and is a property of the source, never a per-command flag.
 
-The following invariants are guaranteed throughout the system:
+**Store** — every ROM Cat198x knows about, addressed by content hash, wherever it physically sits. A ROM inside a zip is in the store; so is a loose CHD. The store is not a layout.
 
-- **Path uniqueness**: No two active DAT entries can target the same destination path
-- **Content addressing**: File identity is determined by SHA1 hash, never by path or name
-- **Reversibility**: All apply operations are logged with reverse operations for rollback
-- **Literal naming**: Archive entry names and ROM filenames are never normalised or case-folded
-- **Determinism**: Same inputs always produce same outputs (plans, manifests, TorrentZIPs)
-- **Idempotency**: Running scan, plan, or apply twice with unchanged inputs produces identical results
-- **Atomicity**: Operations succeed or fail at file level; partial archives are never written
-- **Isolation**: Inactive DAT versions have no effect on planning or status
+**Collection** — a DAT at a version. It defines what *complete* means for some set. A collection is a lens over the store, not a container in it.
 
----
+**Target** — a directory Cat198x materialises a romset into and keeps current: your emulator's ROM folder, a share, a drive you hand to someone. A target is a *view* of the store in a chosen shape.
 
-## Processing Pipeline
+### The store is a superset of every manifest
 
-The system processes data through distinct phases:
+This is the load-bearing rule.
 
-| Phase | Command | Description |
-|-------|---------|-------------|
-| 1 | `dat add` | Import DAT files → populate dat_nodes, dat_games, dat_roms |
-| 2 | `source add` | Register source directories for scanning |
-| 3 | `scan` | Hash source files → populate files, file_locations |
-| 4 | `status` | Join DAT requirements with file catalog → compute completeness |
-| 5 | `plan` | Compare current vs desired state → generate operations |
-| 6 | `apply` | Execute operations → write files, update catalog |
+The manifest says what you want to be **complete for**. It never says what you are permitted to **keep**. Content that no active DAT claims — an unidentified dump, a version you no longer track, a homebrew nobody catalogued — stays in the store and is reported, never removed.
 
-Each phase is independent and repeatable. Scan can be run without plan. Status can be checked without planning. Plans can be regenerated without applying.
+**No desired state can imply a deletion.** Completeness is a report, not a boundary. An archive that deletes what it cannot identify is not an archive.
 
----
+Today the catalogue holds 58,230 hashes claimed by no DAT. That number is expected to be non-zero forever.
 
-## Data Directory Structure
+### A target is rebuildable; the store is not
 
-Cat198x stores all state in a `.cat198x` directory, conceptually similar to Git's `.git` directory:
+The store is the only copy of what it holds. A target can always be rebuilt from it.
 
-```
-.cat198x/
-├── db.sqlite              # All metadata, queries, state (authoritative)
-├── config.toml            # User-editable configuration
-├── objects/               # Content-addressed artifacts
-│   ├── plans/             # Persisted plans by state hash
-│   │   └── abc123.json
-│   └── logs/              # Apply operation logs
-│       └── def456.json
-├── quarantine/            # Quarantined ROM files
-└── cache/                 # Temporary staging data
-```
+That asymmetry is the safety model. Cat198x may delete freely inside a target — the worst case is rebuilding it. It may never delete freely from the store, because nothing backs the store up.
 
-**Design rationale**: SQLite provides ACID transactions, efficient queries, and indexing for the relational metadata. Content-addressed artifacts (plans, logs) are stored as files for inspectability and easy backup.
+**Never export into the store.** Doing so collapses the two, and then tidying a view can remove the only copy of something.
 
----
+## The manifest
 
-## Core Concepts
-
-### Three-Phase Workflow
-
-```
-┌─────────┐      ┌─────────┐      ┌─────────┐
-│  SCAN   │ ───▶ │  PLAN   │ ───▶ │  APPLY  │
-└─────────┘      └─────────┘      └─────────┘
-     │                │                │
-     ▼                ▼                ▼
-┌─────────┐      ┌─────────┐      ┌─────────┐
-│ Update  │      │ Compare │      │ Execute │
-│ file    │      │ current │      │ file    │
-│ catalog │      │ vs      │      │ ops     │
-│         │      │ desired │      │         │
-└─────────┘      └─────────┘      └─────────┘
-
-Safe &           No side         Idempotent
-repeatable       effects         & logged
-```
-
-### Terraform Analogy
-
-| Terraform | Cat198x | Description |
-|-----------|----------|-------------|
-| HCL config | DAT files + config | Desired state definition |
-| State file | SQLite database | Current state tracking |
-| Providers | Format handlers | ZIP, 7Z, TorrentZIP, loose |
-| Resources | ROMs/Games/Sets | Managed entities |
-| refresh | scan | Discover current state |
-| plan | plan | Compute diff, preview changes |
-| apply | apply | Execute changes |
-
-### Collections and Versions
-
-Cat198x groups DATs into collections (MAME, TOSEC, No-Intro) with explicit versions. Only one version is active at a time per collection, enabling:
-
-- Version comparison and diff generation
-- Clean upgrade paths between DAT versions
-- Configuration inheritance across versions
-- Storage efficiency (one complete TOSEC set is enough)
-
-### Content-Addressed Identity
-
-ROMs are identified by hash (SHA1 primary, MD5/CRC32 fallback), not filename. The same physical file can satisfy requirements in multiple DATs.
-
----
-
-## Behavioural Rules
-
-### Version Filtering and Active Versions
-
-Only one version per collection can be active at any time. The `--dat` filter operates on paths within active DATs only.
-
-```bash
-# If MAME 0.266 is active and 0.265 is inactive:
-cat198x plan --dat "MAME 0.265"    # ERROR: No matching active DATs
-cat198x plan --dat "MAME 0.266"    # OK: Matches active version
-cat198x plan --dat "MAME/**"       # OK: Matches all paths in active MAME version
-```
-
-### Source Preference Order
-
-When multiple sources contain the same hash, Cat198x uses a deterministic preference order:
-
-1. Loose file preferred over archive entry
-2. ZIP preferred over 7Z (faster extraction)
-3. Shorter filesystem path preferred
-4. Alphabetically first path as final tiebreaker
-
-Configurable via:
 ```toml
-[defaults]
-prefer_source_order = ["loose", "zip", "7z"]
+library = "/Volumes/Data/Library/ROMs"
+
+[collections.mame]
+dat     = "MAME"
+version = ["0.283", "0.288"]
+
+[collections.tosec]
+dat     = "TOSEC"
+version = "2024-01"
+
+[collections.whdload]
+dat = "WHDLoad"
+
+[sources]
+consume  = ["/Volumes/Data/ToSort/*"]
+preserve = ["/Volumes/Data/Magazines", "/Volumes/Data/WOS-Archive"]
+
+[targets.mame]
+collection = "mame"
+path       = "/Volumes/Emulation/mame/roms"
+merge      = "split"
+container  = "per-machine"
+
+[targets.snes-play]
+collection = "no-intro/snes"
+path       = "/Volumes/Emulation/snes"
+select     = "1g1r"
+regions    = ["eu", "us", "jp"]
+exclude    = ["beta", "proto", "demo"]
 ```
 
-### Destination Collisions
+Collections are one to three lines. Anything the manifest grows beyond a DAT, a version and a source list is complexity being chosen.
 
-If two different files would write to the same destination path, the plan fails:
+**Pinning several versions is cheap.** Measured across MAME 0.283 and 0.288: 154,900 of 154,957 ROMs are shared, and holding both costs **0.19 GB** of content unique to the older one. Version churn is not the expensive axis. Container shape is.
 
-```
-Error: Output conflicts detected:
+## Verbs
 
-  ~/ROMs/MAME/galaga.zip:
-    Source 1: /sources/set-a/galaga.zip (sha1: abc123)
-    Source 2: /sources/set-b/galaga.zip (sha1: def456)
+| Verb | Does | Today |
+|---|---|---|
+| `scan` | Hash a source and record what is there | built |
+| `status` | Completeness per collection, merge-mode aware | built |
+| `have` / `missing` | The lists, as txt, csv or json | built as `export --have` |
+| `import` | Bring content from a source into the store | built as `plan` + `apply` |
+| `export` | Materialise a romset into a target, or a one-off shape | **new** |
+| `verify` | Re-hash the store and report what changed | partial |
+| `remove` | Delete content, explicitly | built as `reclaim`, `clean-superseded` |
 
-    ERROR: Different files, same destination.
-    Resolve manually or use --prefer-source <path>
-```
+Six verbs and one dangerous one. If a seventh is proposed, ask which repair it is performing and whether the model should have made the damage impossible.
 
-### Case Conflict Resolution
+## Export
 
-On case-insensitive filesystems, filename conflicts are detected during planning:
-
-```
-⚠ Case conflicts detected (will cause issues on Windows/macOS):
-  Pacman.zip vs PACMAN.zip
-```
-
-The `--rename-conflicts` flag appends suffixes deterministically.
-
-### Archive Entry Case Sensitivity
-
-Archive entry names (inside ZIP/7Z) are always matched case-sensitively, regardless of host filesystem.
-
-### File Already Correct at Destination
-
-If a file already exists at the destination path AND matches the required hash, no operation is generated.
-
-### ROM Name Normalisation
-
-ROM names are used exactly as specified in DAT files, with no normalisation. Case, spelling, and all characters are literal.
-
-### REPACK Triggers
-
-A REPACK operation is generated when the content hash is correct but the container is wrong:
-
-- Wrong archive format (e.g., ZIP when TorrentZIP configured)
-- Wrong merge mode structure (e.g., non-merged when split configured)
-- Wrong internal filenames (case, extension, or spelling differs from DAT)
-- Loose files when archive format configured
-- Archive when loose format configured
-
-### Games With Zero ROMs
-
-Games with no ROM children are counted as complete by definition: 0 ROMs required = 100% complete.
-
----
-
-## State and Lifecycle
-
-### State Hash Definition
-
-Plans include a `state_hash` computed as:
+The headline capability, and the reason layouts are never stored.
 
 ```
-state_hash = SHA256(
-    active_version_ids ||
-    file_catalog_fingerprint ||
-    dest_config_hash
-)
+cat198x export mame --merge split --container per-machine --format torrentzip --to /media/out
+cat198x export tosec/spectrum-games-tzx --container per-romset --format zip
+cat198x export mame --only mslug,neogeo --to ./slice
 ```
 
-Components:
-- **active_version_ids**: Sorted list of currently active collection_version IDs
-- **file_catalog_fingerprint**: Hash of (row_count, max_last_seen) from file_locations
-- **dest_config_hash**: Hash of all destination path configurations
+Three independent axes:
 
-### Rollback Semantics
+- **merge** — `split`, `merged`, `non-merged`. How parent and clone content is distributed.
+- **container** — `per-machine`, `per-romset`, `single`, `loose`. Pleasuredome-style one-zip-per-romset is `per-romset`; it is a choice here, not a different tool.
+- **format** — `zip`, `torrentzip`, `loose`, and per-content-type exceptions below.
 
-Apply operations are logged with reverse operations:
+Properties that matter:
 
-- `cat198x apply --rollback` executes reverse operations in reverse order
-- `cat198x apply --rollback --continue` retries failed rollback operations
+**Deterministic.** The same request twice produces byte-identical output. `torrentzip` is the default for that reason: an export can be verified rather than re-transferred, and two people can compare results.
 
-### Quarantine Triggers
+**Partial by default is supported, not assumed.** `--only` takes machines, systems or a romset. A full export of a large set is a second copy of it, so exporting a slice must be a first-class request rather than a workaround.
 
-Files are moved to quarantine when:
+**Resumable.** An interrupted export continues; already-written members are verified rather than rebuilt. This falls out of determinism.
 
-- **Set removed**: A file exists in destination matching OLD DAT but not NEW DAT
-- **Content changed**: A file would be overwritten with different content
-- **Path changed**: A file is no longer needed at its current location by any active DAT
+**Reads from wherever content lives.** The store indexes ROMs inside archives, so an export re-containers from existing archives without a loose intermediate copy.
 
-**Important**: Quarantine is NOT a source for matching. It is a holding pen for potentially unwanted files.
+**Targets are maintained, not regenerated by hand.** A declared target is brought up to date by `export` with no arguments — new content added, content that left the collection removed from the view. Removing from a view is safe by definition: the store still holds it.
 
----
+An existing romset can be adopted as a target where it stands. A library that is already 41,712 split zips does not need moving; it is declared, indexed, and kept current in place.
 
-## CLI Command Structure
+### Materialising a target
 
-### Command Overview
+Updating a target is per-file, not per-directory. Determinism does most of the work: a
+deterministic export produces byte-identical output for anything that has not changed, so
+a rebuild writes only what differs. Across five MAME releases that is 57 ROMs of 155,000.
 
-```
-cat198x
-├── init                    # Create new database
-├── dat                     # DAT management
-│   ├── add <path>          # Import DAT file or directory
-│   ├── list                # List imported DATs
-│   ├── remove <path>       # Remove a DAT
-│   ├── activate <path>     # Include in plan/status
-│   ├── deactivate <path>   # Exclude from plan/status
-│   ├── diff <from> <to>    # Compare two versions
-│   ├── upgrade <old> <new> # Convenience: add new, deactivate old
-│   ├── fetch <source>      # Download DATs from known sources
-│   └── versions <n>        # List versions of a collection
-├── source                  # Source management
-│   ├── add <path>          # Add scan source
-│   ├── list                # List sources
-│   └── remove <path>       # Remove source
-├── config                  # Configuration
-│   ├── set [path] <k> <v>  # Set config (global or per-DAT)
-│   ├── get [path] <key>    # Get config
-│   ├── unset <path> <key>  # Remove per-DAT override
-│   └── list [path]         # Show config
-├── scan                    # Hash sources, update catalog
-├── status [path]           # Show completeness
-├── plan [--dat <path>]     # Generate plan
-├── apply                   # Execute pending plan
-├── export                  # Export collection/diff
-│   ├── <path>              # Export a DAT subtree
-│   └── --diff <from> <to>  # Export diff archive
-├── quarantine              # Manage quarantined files
-│   ├── status              # Show quarantine contents
-│   ├── prune [path]        # Delete quarantined files
-│   └── restore [path]      # Move back to sources
-├── torrent                 # Torrent operations
-│   ├── create <path>       # Generate .torrent for folder
-│   └── verify <torrent>    # Check collection against torrent
-├── doctor                  # Health checks
-├── update                  # Self-update
-└── completions <shell>     # Generate shell completions
-```
+Each file that does change is written to a temporary name and `rename()`d into place, so a
+target is never half-updated and never needs double its own size to refresh.
 
-### Exit Codes
+For content that must be written, prefer in this order:
 
-| Code | Name | Meaning |
-|------|------|---------|
-| 0 | Success | Operation completed successfully |
-| 1 | Error | General error |
-| 2 | UsageError | Invalid arguments |
-| 3 | DatabaseError | DB locked, corrupt, migration failed |
-| 4 | IoError | File not found, permission denied |
-| 5 | PartialSuccess | Some operations succeeded, some failed |
-| 6 | NoPlan | Apply called without plan |
-| 7 | PlanStale | Plan invalidated by state change |
-| 130 | Interrupted | SIGINT (Ctrl+C) |
+1. **Reflink** — `clonefile()` on APFS and HFS+, `FICLONE` on btrfs and XFS. No extra space,
+   and copy-on-write means a modified target file cannot write back into the store. This is
+   the only linking mode that preserves the store/target asymmetry, so it is the default
+   where the filesystem supports it.
+2. **Hardlink** — same space saving, but two paths to one inode. Deleting a target file is
+   safe; modifying one in place is not. Used only where reflink is unavailable and the
+   target is understood to be read-only.
+3. **Copy** — always correct, and what a different filesystem gets: an external drive, a
+   network share, a set being handed to someone.
 
----
+Linking only helps where the bytes already exist in the shape the target wants — a whole
+archive the store already holds in that exact form. A target in a different merge mode or
+container granularity is constructing new archives, and no linking scheme avoids that.
 
-## MAME-Specific Handling
+### Selection
 
-### Merge Modes
+Curated sets are **named policies, never a filter language**:
 
-**Non-merged** (every game self-contained):
-```
-pacman.zip
-├── pacman.5e
-├── pacman.5f
-└── prom.7f
-mspacman.zip
-├── mspacman.5e
-├── mspacman.5f
-└── prom.7f          ← duplicated
-```
+- `select = "all"` — everything the collection names. The default.
+- `select = "1g1r"` — one release per game, resolved by `regions` in preference order.
+- `exclude = [...]` — release tags: `beta`, `proto`, `demo`, `alpha`, `sample`.
 
-**Split** (clones only have unique ROMs):
-```
-pacman.zip
-├── pacman.5e
-├── pacman.5f
-└── prom.7f          ← shared ROMs live here only
-mspacman.zip
-├── mspacman.5e
-└── mspacman.5f      ← no prom.7f, inherited from parent
-```
-
-**Merged** (parent contains everything):
-```
-pacman.zip
-├── pacman.5e
-├── pacman.5f
-├── prom.7f
-├── mspacman.5e      ← clone ROMs merged in
-└── mspacman.5f
-(no mspacman.zip exists)
-```
-
-### Mechanical Sets
-
-Mechanical sets (is_mechanical flag) are arcade redemption games, slot machines, etc.
-
-Default behaviour:
-- Excluded from completeness calculations
-- Status displays mechanical count separately
-- Configurable via `[mame] include_mechanicals = false`
-
-### Completion Scoring Formula
+When a request cannot be expressed that way — and eventually one will not be — the answer is not a bigger vocabulary:
 
 ```
-completion = have / (total - nodumps)
+cat198x export snes --from-list my-picks.txt
 ```
 
-Where:
-- **have** = ROMs with status 'good' or 'baddump' that we possess
-- **total** = all ROMs in DAT (including baddump and nodump)
-- **nodumps** = ROMs with 'nodump' status (excluded from denominator)
+A list of game or ROM names, produced however the user likes. This escape hatch exists so the selection vocabulary can stay small: every unusual request has somewhere to go that is not the manifest.
 
----
+### Dependencies
 
-## TOSEC-Specific Handling
+A split export of a machine is incomplete without its BIOS and device sets. The DATs carry 178 BIOS and 2,314 device entries; `dat_game_devices` exists in the schema and holds **0 rows**, so this is unimplemented rather than designed away.
 
-### Filename Parsing
+Export resolves dependencies and includes them by default. `--no-deps` is available and warns. An export that silently produces a set which cannot run is the worst failure this tool has.
 
-TOSEC DAT filenames encode hierarchy:
+### Content that does not containerise
 
-```
-Commodore Amiga - Games - [ADF] (TOSEC-v2024-01-15).dat
-│         │       │       │     └── Version
-│         │       │       └── Format specifier
-│         │       └── Category
-│         └── System
-└── Manufacturer
-```
+CHDs are stored and exported loose, matched on internal-header SHA1. This is a property of the content type, not a flag: `--format zip` on a CHD-bearing machine produces a zip of its ROMs beside the loose CHD, and needs no flag.
 
----
+Any future type with the same shape is added here, not as another option.
 
-## Header-Aware Matching (Future Phase)
+## Sources without a DAT
 
-### The Problem
+WHDLoad, magazine archives, reference PDFs and similar are `preserve` sources with no DAT and no completeness question. They are stored, hashed, deduplicated and searchable. They are not collections and no `status` is reported for them.
 
-Some ROM formats include metadata headers:
-- NES/Famicom: 16-byte iNES header
-- Famicom Disk System: 16-byte FDS header
-- Atari 7800: 128-byte A78 header
-- Atari Lynx: 64-byte LNX header
+Forcing them into the collection shape is how a fourth noun gets in.
 
-No-Intro DATs list hashes of the payload only (without header), but emulators require headers.
+## Removal
 
-### The Solution
+The only operation that can lose data, and the only one that is never a consequence of anything else.
 
-Header-aware matching computes multiple hashes without modifying files:
+- Never implied by desired state, a version change, or an export.
+- Always explicit, always dry-run unless `--execute`, always journalled with a reverse operation.
+- A file is removable only when **something else still references its content and that something is wanted** — not that the hash exists somewhere. Proving a SHA1 survives does not prove the survivor is wanted; that distinction is the difference between a safe delete and a data-loss path.
+- Content in the store claimed by no collection is reported, never removed.
 
-1. During scan: Detect header magic bytes
-2. If header detected: Compute `raw_sha1` AND `payload_sha1`
-3. Store both hashes in the files table
-4. During matching: Use appropriate hash based on DAT source
+## What this replaces
 
----
+Four current commands exist to repair damage the storage model causes:
 
-## Implementation Phases
+- `catalogue-placements` — placements are derived, never stored
+- `clean-superseded` — a layout change duplicates content
+- `prune-empty` — moves leave empty directories
+- `reclaim` — staging duplicates the library
 
-### Phase 1: Foundation ✅
-- Workspace setup
-- Database schema and migrations
-- Configuration loading (TOML parsing, platform paths)
-- CLI structure with clap
-- `cat198x init` command
-- `cat198x config get/set/list` commands
+Under store-and-export the first two have nothing to repair: layouts are not stored, so they cannot be superseded, and the store is content-addressed, so there are no placements to record. `prune-empty` shrinks with the number of moves. `reclaim` survives, as draining a `consume` source.
 
-**Deliverable**: Installable CLI that initialises database and manages config
+## Not specified here
 
-### Phase 2: DAT Import ✅
-- Logiqx XML parser
-- ClrMamePro parser
-- Format auto-detection
-- TOSEC filename parsing and hierarchy injection
-- MAME parent/clone/BIOS/device extraction
-- Collection versioning logic
-- `cat198x dat add/list/remove/activate/deactivate` commands
+**Database schema.** The code is the schema; duplicating DDL into prose guarantees drift.
 
-**Deliverable**: Can import MAME and TOSEC DATs, view hierarchy
+**Header-aware matching.** `sha1_no_header` exists in the schema and is populated on 0 files. Needed when NES-family content arrives; not designed here.
 
-### Phase 3: Scanning ✅
-- Filesystem walker with symlink following (traverses into symlinked directories)
-- Hash computation (CRC32, MD5, SHA1)
-- ZIP and 7Z archive reading
-- Case sensitivity detection per source
-- Parallel scanning with rayon
-- Incremental scanning (skip unchanged files based on modification time)
-- Scan interruption with graceful progress saving
-- `cat198x source add/list/remove` and `scan` commands
+**Concurrency.** Export is latency-bound and will want parallel placement with serial safety steps. See `decisions/concurrent-apply.md`, which specifies it and is unbuilt.
 
-**Fully implemented**
+## Open questions
 
-**Deliverable**: Can scan directories and archives, catalog files by hash
-
-### Phase 4: Status and Matching ✅
-- Hash-based matching (SHA1 primary)
-- Hierarchical rollup calculations
-- `cat198x status` command with drill-down
-- MAME merge-mode aware completeness (non-merged, split, merged)
-- BIOS/device set tracking and exclusion options
-- Mechanical set exclusion
-- Nodump ROM handling (excluded from completeness calculations)
-
-**Fully implemented**
-
-**Deliverable**: Can see collection completeness with hierarchical display and MAME-aware statistics
-
-### Phase 5: Planning and Applying ✅
-- Plan generation with state hash
-- Plan persistence (JSON format)
-- Plan validation (state hash checking)
-- ZIP writing
-- File copy/move operations with verification
-- Operation logging for rollback
-- Rollback implementation with `--continue` option
-- Disk space pre-check
-- `cat198x plan` and `apply` commands
-
-**Fully implemented**: All Phase 5 items complete
-
-**Deliverable**: Full end-to-end workflow functioning
-
-### Phase 6: Polish and Extras ❌
-- DAT diff command
-- Export command with partial torrent handling
-- Deterministic manifest generation
-- Torrent generation with auto piece size
-- Doctor command with health checks and `--fix`
-- Self-update mechanism
-- Shell completions generation
-- DAT fetching with env var credential fallback
-
-**Deliverable**: Feature-complete CLI (v1.0.0)
-
----
-
-## Database Schema
-
-### Collections and Versions
-
-```sql
-CREATE TABLE collections (
-    id INTEGER PRIMARY KEY,
-    name TEXT NOT NULL UNIQUE,
-    collection_type TEXT NOT NULL
-);
-
-CREATE TABLE collection_versions (
-    id INTEGER PRIMARY KEY,
-    collection_id INTEGER NOT NULL REFERENCES collections(id),
-    version TEXT NOT NULL,
-    imported_at TIMESTAMP NOT NULL,
-    active BOOLEAN DEFAULT FALSE,
-    UNIQUE(collection_id, version)
-);
-
-CREATE TABLE dat_nodes (
-    id INTEGER PRIMARY KEY,
-    version_id INTEGER NOT NULL REFERENCES collection_versions(id) ON DELETE CASCADE,
-    parent_id INTEGER REFERENCES dat_nodes(id),
-    name TEXT NOT NULL,
-    path TEXT NOT NULL,
-    depth INTEGER NOT NULL,
-    dat_file_path TEXT,
-    UNIQUE(version_id, path)
-);
-```
-
-### Games and ROMs
-
-```sql
-CREATE TABLE dat_games (
-    id INTEGER PRIMARY KEY,
-    node_id INTEGER NOT NULL REFERENCES dat_nodes(id) ON DELETE CASCADE,
-    name TEXT NOT NULL,
-    description TEXT,
-    clone_of TEXT,
-    rom_of TEXT,
-    is_bios BOOLEAN DEFAULT FALSE,
-    is_device BOOLEAN DEFAULT FALSE,
-    is_mechanical BOOLEAN DEFAULT FALSE,
-    UNIQUE(node_id, name)
-);
-
-CREATE TABLE dat_roms (
-    id INTEGER PRIMARY KEY,
-    game_id INTEGER NOT NULL REFERENCES dat_games(id) ON DELETE CASCADE,
-    name TEXT NOT NULL,
-    size INTEGER NOT NULL,
-    crc32 TEXT,
-    md5 TEXT,
-    sha1 TEXT,
-    merge TEXT,
-    status TEXT DEFAULT 'good',
-    UNIQUE(game_id, name)
-);
-```
-
-### File Catalog
-
-```sql
-CREATE TABLE files (
-    sha1 TEXT PRIMARY KEY,
-    md5 TEXT,
-    crc32 TEXT,
-    size INTEGER NOT NULL,
-    payload_sha1 TEXT,
-    header_type TEXT
-);
-
-CREATE TABLE file_locations (
-    id INTEGER PRIMARY KEY,
-    sha1 TEXT NOT NULL REFERENCES files(sha1),
-    path TEXT NOT NULL,
-    archive_path TEXT,
-    source_id INTEGER REFERENCES sources(id),
-    last_seen TIMESTAMP NOT NULL,
-    UNIQUE(path, archive_path)
-);
-
-CREATE TABLE sources (
-    id INTEGER PRIMARY KEY,
-    path TEXT NOT NULL UNIQUE,
-    last_scanned TIMESTAMP,
-    scan_cursor TEXT,
-    scan_state TEXT,
-    case_sensitive BOOLEAN
-);
-```
-
----
-
-## Key Dependencies
-
-| Crate | Purpose |
-|-------|---------|
-| clap | CLI parsing with derive macros |
-| rusqlite | SQLite with bundled feature |
-| serde | Serialisation for config, plans, JSON |
-| toml | Config file format |
-| quick-xml | Logiqx DAT format parsing |
-| zip | ZIP read and write |
-| sevenz-rust | 7Z reading (read only, pure Rust) |
-| sha1/md5/crc32fast | Hashing |
-| indicatif | Progress bars |
-| tracing | Structured logging |
-| tempfile | Tests, atomic writes |
-
----
-
-## Future Roadmap
-
-Items deferred from MVP:
-
-- **TUI Application**: Interactive terminal interface using ratatui
-- **GUI Application**: Cross-platform GUI using Tauri
-- **Content-Addressed Torrent Seeding**: Seed torrents by matching file hashes
-- **Metadata Scraping**: Fetch game metadata from ScreenScraper, TheGamesDB, etc.
-- **Emulator Launching**: Configuration-driven emulator integration
+- What identifies a romset for `--container per-romset` — the DAT's own grouping, or a user-supplied name?
+- Does the curated CHD subset fit `--from-list`, or does it want a named policy of its own?
+- Can a target be adopted without a full re-hash, given its content is already indexed as a source?
+- Does a target record which store content it links to, or re-derive it on each update?
