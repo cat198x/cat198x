@@ -51,6 +51,16 @@ commit_parsers = [
   { message = "^fix", group = "Fixed" },
   { message = "^perf", group = "Performance" },
   { message = "^revert", group = "Reverted" },
+  # Before the skip below, which would otherwise claim these: `^chore` matches
+  # `chore(deps):` perfectly well. Dependency bumps change Cargo.lock, which is
+  # packaged, so they cut a release — and a release that moves the version must
+  # say something, or the changelog falls behind the version again.
+  { message = '^(chore|build)\(deps\)', group = "Dependencies" },
   { message = "^(docs|test|chore|ci|build|refactor|style)", skip = true },
   { message = "^Merge", skip = true },
+  # Last, and a catch-all rather than nothing: a commit matching no parser is
+  # dropped, not filed. `pr-title.yml` should stop an unprefixed subject ever
+  # reaching main, so anything landing here escaped that gate — which is exactly
+  # when it needs to be visible rather than silently absent.
+  { message = ".*", group = "Other" },
 ]
