@@ -4,7 +4,7 @@ A desktop UI for Cat198x, built with [Tauri](https://tauri.app). It is a **thin
 client over the shared operation surface** (`cat198x::ops`) — the same operations
 the CLI formats and the `cat198x mcp` server exposes. Any action here is, by
 construction, an operation an agent can invoke too. See
-[`../../decisions/agent-native-surface-and-ui.md`](../../decisions/agent-native-surface-and-ui.md).
+[`../decisions/agent-native-surface-and-ui.md`](../decisions/agent-native-surface-and-ui.md).
 
 ## This slice
 
