@@ -8,6 +8,13 @@ A package manager for ROM collections.
 
 You tell it which sets you want to be complete for. It tells you what you have and what you are missing, and it builds you a romset in whatever shape you need — split or merged, one zip per machine or one zip per romset, from the ROMs already on your disk.
 
+The shape is pnpm's, not Terraform's, and the difference decides the safety model. Terraform
+converges: desired state implies destruction of whatever is absent from it. A package manager
+does not. Its store is an additive cache shared by every installed tree; removing a dependency
+prunes the tree and never the store, and the store is emptied only by an explicit, separate
+command. That is precisely the asymmetry below, which is why the analogy is load-bearing
+rather than decorative.
+
 ## The model
 
 Five nouns.
@@ -15,6 +22,18 @@ Five nouns.
 **Source** — a directory Cat198x reads. Every source has a **disposition**: `consume` (staging; content may be moved out and the source freed) or `preserve` (reference; content is copied out and the source left intact). Disposition follows the directory's role and is a property of the source, never a per-command flag.
 
 **Store** — every ROM Cat198x knows about, addressed by content hash, wherever it physically sits. A ROM inside a zip is in the store; so is a loose CHD. The store is not a layout.
+
+The store is an **index over registered sources**, not a directory Cat198x owns. There is no
+object pool: content stays where it already is, and `~/.cat198x/` holds the catalogue and its
+journals. So "never export into the store" means *never export into a registered source*, and
+"the store is the only copy" means *the sources are*.
+
+This has a consequence worth stating plainly, because the current library trips over it:
+`/Volumes/Data/Library/ROMs/TOSEC` is registered as a `preserve` source **and** is already a
+romset layout. A directory cannot be both a source and a target. Where an existing romset is
+to be kept current, it is registered as a target and its source registration is withdrawn;
+where it is to be preserved as it stands, it stays a source and targets are built elsewhere.
+Cat198x refuses to register a path that is already the other thing.
 
 **Collection** — a DAT at a version. It defines what *complete* means for some set. A collection is a lens over the store, not a container in it.
 
@@ -101,6 +120,12 @@ Collections are one to three lines. Anything the manifest grows beyond a DAT, a 
 | `remove` | Delete content, explicitly | built as `reclaim`, `clean-superseded` |
 
 Six verbs and one dangerous one. If a seventh is proposed, ask which repair it is performing and whether the model should have made the damage impossible.
+
+**`export` against a declared target is the install verb.** It is incremental and idempotent:
+it resolves the manifest, writes only what differs, and updates the lockfile. `--dry-run`
+prints the resolution and the file-level diff without touching anything, which is the whole
+of what a separate planning verb would have provided. Against a path rather than a declared
+target it is a one-off build and writes no lockfile.
 
 ## Export
 
@@ -278,27 +303,28 @@ These figures are one machine and one slow network mount. The shape generalises 
 is throughput-bound, stat is round-trip-bound — but faster network storage sits nearer the
 local column.
 
-### Target state
+### The lockfile
 
-A target records what it contains, in a file inside the target, so a drive handed to
-someone carries its own provenance.
+A target's resolution is recorded in a lockfile beside the manifest, and a small marker
+inside the target identifies which lockfile built it.
 
 Re-deriving instead would be safe only if an export were a pure function of collection
 version, policy and store. It is not: `1g1r` resolves against *what the store holds*, so
 acquiring a better regional dump silently changes which ROM the same policy picks. Without
 a record, the file in the target changes and nothing says a decision changed.
 
-The file holds two things of different standing:
+The lockfile holds two things of different standing:
 
 - **Resolved selection** — which hash satisfied which entry, under which policy. Not
-  re-derivable once the store moves on. This is the reason state exists, and what lets
-  `plan` report *a different dump now wins* rather than silently swapping a file.
+  re-derivable once the store moves on. This is the reason the lockfile exists, and what
+  lets `sync --dry-run` report *a different dump now wins* rather than swapping a file in
+  silence.
 - **Placement map** — what sits at which path, by link or copy. A cache.
 
-Unlike Terraform, whose state is authoritative because cloud resource identifiers are
-opaque, a Cat198x target is self-describing: every file in it is content-addressed, so the
-placement map can always be rebuilt by hashing the directory. Losing state costs a rescan
-and a warning that prior resolutions were lost, never the target.
+It is a lockfile in the ordinary sense: committed beside the manifest, regenerable, and
+there so that the same manifest reproduces the same tree on another machine. Losing it
+costs a rescan and a warning that prior resolutions were lost, never the target — every
+file in a target is content-addressed, so placement rebuilds by hashing the directory.
 
 ### Selection
 
@@ -359,6 +385,38 @@ The only operation that can lose data, and the only one that is never a conseque
 - A file is removable only when **something else still references its content and that something is wanted** — not that the hash exists somewhere. Proving a SHA1 survives does not prove the survivor is wanted; that distinction is the difference between a safe delete and a data-loss path.
 - Content in the store claimed by no collection is reported, never removed.
 
+## Migrating the existing catalogue
+
+**The catalogue survives intact.** Hashes are layout-independent, so every `files` row,
+all 1.16M games and all 4,729 collections stay valid regardless of how content was arranged
+under the old model. Migration re-interprets what is already recorded; it does not rescan.
+That distinction matters at this scale — rehashing the MAME set alone measured 3.3 hours
+over AFP.
+
+What does not carry across:
+
+- **`config.toml`** — `default_output_format`, `default_merge_mode` and `default_dest_path`
+  assume one global destination and one merge mode. Both are per-target now, and the file
+  is superseded rather than converted.
+- **Source registrations that describe targets.** Existing romset directories under
+  `Library/ROMs` are registered as `preserve` sources. Each is either withdrawn and
+  re-registered as a target, or kept as a source with targets built elsewhere. This is a
+  decision per directory and is not inferred.
+- **Stored placements.** Derived from the manifest and lockfile from here on.
+
+## Sources that are not mounted
+
+Most sources live on network storage, so an ordinary state of the world is *half the store
+is unreadable*.
+
+Absence is reported, never inferred as loss. A source that cannot be read is `unavailable`,
+which is distinct from a source that is readable and empty, and no unavailable source
+contributes to a completeness figure or licenses a removal.
+
+**An export naming content from an unavailable source fails rather than producing a short
+set.** Silently omitting the ROMs that happened to be on a mount that was down is the same
+failure as omitting a BIOS, and it is the worst failure this tool has.
+
 ## What this replaces
 
 Four current commands exist to repair damage the storage model causes:
@@ -387,3 +445,6 @@ None outstanding. Decisions above that are not yet built:
 - `dat_game_devices` holds 0 rows, so dependency resolution is unimplemented.
 - `file_locations` has no `size` or `mtime`.
 - Nothing in the code implements store-and-export.
+- No source/target exclusivity check exists; the library is currently registered as sources.
+- Sources have no `unavailable` state; an unreachable mount is indistinguishable from an
+  empty directory.
