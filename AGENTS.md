@@ -1,6 +1,6 @@
 # Cat198x
 
-> Read [`PRINCIPLES.md`](PRINCIPLES.md) first.
+> Read [`PRINCIPLES.md`](PRINCIPLES.md) first. [`MANIFESTO.md`](MANIFESTO.md) is why the project exists.
 
 The binary-asset cataloguing tool for the 198x family — inventory, DAT
 verification, deduplication, and safe reorganisation of ROM/disk/test-suite
