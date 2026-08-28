@@ -10,13 +10,16 @@ You tell it which sets you want to be complete for. It tells you what you have a
 
 ## The model
 
-Four nouns.
+Five nouns.
 
 **Source** — a directory Cat198x reads. Every source has a **disposition**: `consume` (staging; content may be moved out and the source freed) or `preserve` (reference; content is copied out and the source left intact). Disposition follows the directory's role and is a property of the source, never a per-command flag.
 
 **Store** — every ROM Cat198x knows about, addressed by content hash, wherever it physically sits. A ROM inside a zip is in the store; so is a loose CHD. The store is not a layout.
 
 **Collection** — a DAT at a version. It defines what *complete* means for some set. A collection is a lens over the store, not a container in it.
+
+**Tree** — collections are addressable by path, not only by name. TOSEC ships its own
+hierarchy as directory structure, and Cat198x adopts it rather than inventing one.
 
 **Target** — a directory Cat198x materialises a romset into and keeps current: your emulator's ROM folder, a share, a drive you hand to someone. A target is a *view* of the store in a chosen shape.
 
@@ -44,12 +47,12 @@ That asymmetry is the safety model. Cat198x may delete freely inside a target �
 library = "/Volumes/Data/Library/ROMs"
 
 [collections.mame]
-dat     = "MAME"
+dat     = "MAME/MAME ROMs (split)"
 version = ["0.283", "0.288"]
 
-[collections.tosec]
-dat     = "TOSEC"
-version = "2024-01"
+[collections.spectrum]
+dat     = "TOSEC/Sinclair/ZX Spectrum/Games"
+version = "2023-06-14"
 
 [collections.whdload]
 dat = "WHDLoad"
@@ -62,15 +65,24 @@ preserve = ["/Volumes/Data/Magazines", "/Volumes/Data/WOS-Archive"]
 collection = "mame"
 path       = "/Volumes/Emulation/mame/roms"
 merge      = "split"
-container  = "per-machine"
+container  = "game"
 
 [targets.snes-play]
 collection = "no-intro/snes"
 path       = "/Volumes/Emulation/snes"
+container  = "game"
 select     = "1g1r"
 regions    = ["eu", "us", "jp"]
 exclude    = ["beta", "proto", "demo"]
+
+[targets.spectrum-archive]
+collection = "spectrum"
+path       = "/Volumes/Data/Sets"
+container  = "dat"          # one zip per collection, Pleasuredome-style
 ```
+
+A collection is named by its **tree path**, and naming a group node selects everything
+beneath it: `dat = "TOSEC/Commodore/C64"` takes every C64 collection.
 
 Collections are one to three lines. Anything the manifest grows beyond a DAT, a version and a source list is complexity being chosen.
 
@@ -145,6 +157,97 @@ Linking only helps where the bytes already exist in the shape the target wants �
 archive the store already holds in that exact form. A target in a different merge mode or
 container granularity is constructing new archives, and no linking scheme avoids that.
 
+### The collection tree
+
+A flat list of 3,982 TOSEC collection names is not addressable. The distribution already
+carries a hierarchy in its own directory layout, and the tree is derived from it:
+
+```
+TOSEC / Commodore / C64 / Games / Arcade / [D64] / <dat>
+TOSEC / Acorn / Archimedes / Compilations / Games / [ADF] / <dat>
+TOSEC / ACT / Apricot PC-Xi / Demos / <dat>
+```
+
+Three distributions sit at the root — `TOSEC` (2,608 dats), `TOSEC-ISO` (271) and
+`TOSEC-PIX` (1,103, scans rather than ROMs). Between the root and the dat run zero to
+three grouping segments. A segment in square brackets is a **format**; every other
+segment is a **group**. That rule is syntactic and holds across all 3,982.
+
+**The tree is positional.** Nodes are `group` or `dat`, and nothing more is claimed. It is
+tempting to label the levels manufacturer, system and category, and for most paths that
+would be right — but `Acorn/Magazines/Acorn User` and `Multi-format/DVD/Games` put a
+category where a machine is expected, and 357 of 3,982 paths disagree with that reading.
+Positional addressing works for all of them. Semantic labels can be added later where they
+verify; a wrong label cannot be withdrawn from a manifest someone has already written.
+
+A tree may be flat. MAME's three collections sit directly under their root, and the same
+addressing applies to a depth of one.
+
+The tree derives from `collection_versions.dat_path`, which is already stored, so
+populating it parses strings rather than rescanning content.
+
+Addressing any node selects everything beneath it:
+
+```toml
+[collections]
+"TOSEC/Commodore/C64"                    = "2023-06-14"   # every C64 dat
+"TOSEC/Sinclair/ZX Spectrum/Games"       = "2023-06-14"   # games only
+"TOSEC/Acorn/Archimedes/Compilations/Games/[ADF]" = "2021-12-11"
+```
+
+### Containers
+
+Container granularity is a **level in the tree**, not a pair of modes:
+
+- `container = "game"` — one archive per game. The layout an emulator expects.
+- `container = "dat"` — one archive per collection. The Pleasuredome convention, and the
+  reason `Sinclair ZX Spectrum - Games - [TZX]` is a single zip of 19,182 entries.
+- `container = "group"` — one archive per named group node, for coarser sets.
+
+A romset needs no user-supplied name: its identity is its tree path, and the archive name
+is the collection's own name, mapped to a filename by a documented and frozen rule.
+Collection names contain apostrophes and brackets that are legal in the name and awkward in
+a filename, and a target's filenames are its identity across updates — changing the
+sanitiser later renames everything it has already written.
+
+### Adopting an existing target
+
+An existing romset is declared, indexed and kept current in place. Whether that needs a full
+re-hash is unresolved, and deliberately unbuilt.
+
+`file_locations` stores `sha1`, `path`, `archive_path` and `last_seen` — no size, no mtime.
+There is no stat data to compare against, so nothing cheaper than hashing exists today.
+
+Before adding columns, measure. A target is local and far smaller than the store; if hashing
+one of 41,712 archives takes minutes, a staleness heuristic is complexity buying nothing.
+
+If measurement says otherwise: adopt on `(path, size, mtime)`, hash whatever fails to match,
+and **always hash in full before the first destructive operation on a target**. Cat198x may
+delete inside a target, and that freedom must not rest on mtime, which lies after a backup
+restore, a `cp -p`, or an rsync carrying times across.
+
+### Target state
+
+A target records what it contains, in a file inside the target, so a drive handed to
+someone carries its own provenance.
+
+Re-deriving instead would be safe only if an export were a pure function of collection
+version, policy and store. It is not: `1g1r` resolves against *what the store holds*, so
+acquiring a better regional dump silently changes which ROM the same policy picks. Without
+a record, the file in the target changes and nothing says a decision changed.
+
+The file holds two things of different standing:
+
+- **Resolved selection** — which hash satisfied which entry, under which policy. Not
+  re-derivable once the store moves on. This is the reason state exists, and what lets
+  `plan` report *a different dump now wins* rather than silently swapping a file.
+- **Placement map** — what sits at which path, by link or copy. A cache.
+
+Unlike Terraform, whose state is authoritative because cloud resource identifiers are
+opaque, a Cat198x target is self-describing: every file in it is content-addressed, so the
+placement map can always be rebuilt by hashing the directory. Losing state costs a rescan
+and a warning that prior resolutions were lost, never the target.
+
 ### Selection
 
 Curated sets are **named policies, never a filter language**:
@@ -159,7 +262,23 @@ When a request cannot be expressed that way — and eventually one will not be �
 cat198x export snes --from-list my-picks.txt
 ```
 
-A list of game or ROM names, produced however the user likes. This escape hatch exists so the selection vocabulary can stay small: every unusual request has somewhere to go that is not the manifest.
+A list of game or ROM names, produced however the user likes. This escape hatch exists so
+the selection vocabulary can stay small: every unusual request has somewhere to go that is
+not the manifest.
+
+**A selection you want to reproduce next year is a collection, not a list.** A flat list of
+names fails silently: when the DAT version bumps and entries are renamed or split, the
+unmatched ones simply do not export, and the set quietly shrinks. A curated set with a name,
+a version and a membership is what a collection already is — `source_type = 'custom'`, of
+which 743 exist holding 114,352 games.
+
+Generate a custom collection as a **filtered subset of its parent DAT**, keeping the parent's
+entries rather than only the names. A list can only describe content you already hold; a
+subset keeps the hash entries for content you do not, so HAVE and MISSING keep working, and a
+parent version bump shows up as a diff instead of a shrink.
+
+`--from-list` is therefore how a custom collection is *created*, not a way of living in one.
+The curated CHD subset is a custom collection.
 
 ### Dependencies
 
@@ -209,7 +328,7 @@ Under store-and-export the first two have nothing to repair: layouts are not sto
 
 ## Open questions
 
-- What identifies a romset for `--container per-romset` — the DAT's own grouping, or a user-supplied name?
-- Does the curated CHD subset fit `--from-list`, or does it want a named policy of its own?
-- Can a target be adopted without a full re-hash, given its content is already indexed as a source?
-- Does a target record which store content it links to, or re-derive it on each update?
+- Does the format segment (`[D64]`, `[ADF]`) belong in the tree as its own level, or as an
+  attribute of the dat node? 2,136 of 3,982 collections have none.
+- Do the semantic level labels get added later as verified annotations, and what verifies them?
+- Is hashing a target fast enough to make the adoption heuristic unnecessary?
