@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.2](https://github.com/cat198x/cat198x/compare/v0.5.1...v0.5.2) - 2026-08-28
+
+Housekeeping. Nothing in cataloguing, planning or apply behaviour has moved
+since 0.5.1.
+
+`cat198x` is now on crates.io, so `cargo install cat198x` joins the Homebrew tap
+and the installers as a way to get it. 0.5.1 was published by hand to create the
+crate; this is the first version CI published on its own.
+
 ## [0.5.1](https://github.com/cat198x/cat198x/compare/v0.5.0...v0.5.1) - 2026-08-28
 
 Installation. Until now a release was four platform archives and nothing to
