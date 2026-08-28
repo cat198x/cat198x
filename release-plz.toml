@@ -22,6 +22,9 @@ publish = true
 git_release_enable = false
 git_tag_enable = true
 changelog_update = true
+# Only reader-facing changes earn a release. Release-process work uses `ci:` or
+# `chore(release):`; changelog filtering alone does not prevent a version bump.
+release_commits = "^(feat|fix|perf|revert)[(:]"
 
 # git_only is deliberately absent, and must stay that way while publish = true:
 # release-plz rejects the pair outright ("Config options 'git_only' and 'publish'
