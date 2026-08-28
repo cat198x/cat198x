@@ -90,6 +90,30 @@ and are binding:
   Production code uses `expect` with a documented invariant, never bare
   `unwrap`.
 
+## Commit and PR titles
+
+Commit subjects and **pull request titles** carry a
+[Conventional Commits](https://www.conventionalcommits.org) prefix, because
+release-plz computes the version bump and drafts the CHANGELOG from them:
+
+- `feat:` — new user-facing capability, filed under *Added*.
+- `fix:` — bug fix, filed under *Fixed*.
+- `perf:` / `revert:` — filed under *Performance* / *Reverted*.
+- `docs:`, `test:`, `chore:`, `ci:`, `build:`, `refactor:`, `style:` — kept out
+  of the CHANGELOG entirely (`release-plz.toml`). They are most of the commits
+  here and would bury the few a reader is deciding an upgrade on.
+
+The **title** is the part that matters. A squash takes its subject from the pull
+request title once a branch has more than one commit, so it is the only prefix
+release-plz ever sees; `.github/workflows/pr-title.yml` fails a pull request
+without one.
+
+The generated entry is a draft, not the release notes. Rewrite it on the release
+branch immediately before merging — release-plz regenerates it on every push to
+`main`, so an early edit is discarded. See
+[`../../decisions/releasing-published-crates.md`](../../decisions/releasing-published-crates.md)
+for the family rule and the below-1.0 version-bump trap.
+
 ## Where things live
 
 - [`decisions/`](decisions) — Cat198x-only decisions (rescue scope nuances,
