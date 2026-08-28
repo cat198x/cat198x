@@ -107,15 +107,15 @@ Six verbs and one dangerous one. If a seventh is proposed, ask which repair it i
 The headline capability, and the reason layouts are never stored.
 
 ```
-cat198x export mame --merge split --container per-machine --format torrentzip --to /media/out
-cat198x export tosec/spectrum-games-tzx --container per-romset --format zip
+cat198x export mame --merge split --container game --format torrentzip --to /media/out
+cat198x export "TOSEC/Sinclair/ZX Spectrum/Games/[TZX]" --container dat --format zip
 cat198x export mame --only mslug,neogeo --to ./slice
 ```
 
 Three independent axes:
 
 - **merge** — `split`, `merged`, `non-merged`. How parent and clone content is distributed.
-- **container** — `per-machine`, `per-romset`, `single`, `loose`. Pleasuredome-style one-zip-per-romset is `per-romset`; it is a choice here, not a different tool.
+- **container** — a level in the tree: `game`, `dat`, `group`, or `loose` for no archive at all. Pleasuredome-style one-zip-per-romset is `dat`; it is a choice here, not a different tool.
 - **format** — `zip`, `torrentzip`, `loose`, and per-content-type exceptions below.
 
 Properties that matter:
