@@ -268,7 +268,7 @@ not the manifest.
 
 **A selection you want to reproduce next year is a collection, not a list.** A flat list of
 names fails silently: when the DAT version bumps and entries are renamed or split, the
-unmatched ones simply do not export, and the set quietly shrinks. A curated set with a name,
+unmatched ones do not export, and the set quietly shrinks. A curated set with a name,
 a version and a membership is what a collection already is — `source_type = 'custom'`, of
 which 743 exist holding 114,352 games.
 
