@@ -7,21 +7,28 @@
 # (cargo-dist) to build the `cat198x` CLI and attach the archives to a GitHub
 # Release.
 #
-# publish = false: we do NOT publish to crates.io (the binary ships via the
-# GitHub Release instead). git_release_enable = false: cargo-dist owns the
-# GitHub Release, not release-plz — release-plz only bumps, changelogs, and tags.
+# publish = true: cat198x goes to crates.io, so `cargo install cat198x` works
+# alongside the Homebrew tap and the cargo-dist installers. release-plz runs the
+# publish itself and authenticates over crates.io Trusted Publishing — the
+# workflow grants `id-token: write` and no registry token is stored anywhere.
+# The family default is publish = false; see the recorded exception in
+# 198x/decisions/project-skeleton-standard.md, and the rules that publishing
+# brings with it in 198x/decisions/releasing-published-crates.md.
+#
+# git_release_enable = false: cargo-dist owns the GitHub Release, not
+# release-plz — release-plz bumps, changelogs, tags, and publishes.
 [workspace]
-publish = false
+publish = true
 git_release_enable = false
 git_tag_enable = true
 changelog_update = true
 
-# git_only = true: take the previous version from the git tag, not the
-# crates.io registry. Required whenever publish = false — with no registry
-# baseline, release-plz can't see the last release and never bumps the version
-# (it reports "already up-to-date" and opens no release PR). See the umbrella
-# project-skeleton-standard decision for the full story.
-git_only = true
+# git_only is deliberately absent, and must stay that way while publish = true:
+# release-plz rejects the pair outright ("Config options 'git_only' and 'publish'
+# are mutually exclusive"). It existed to give a never-published crate a version
+# baseline from its git tag; with the crate on crates.io the registry is that
+# baseline. Re-adding it is the reflex to resist if release-plz ever stops
+# opening release PRs — check the registry first.
 
 # What reaches the CHANGELOG. Without this every commit lands under a single
 # "### Other" heading in commit-subject order, so the one change a reader is
