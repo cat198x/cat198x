@@ -46,6 +46,7 @@ changelog_update = true
 [changelog]
 protect_breaking_commits = true
 commit_parsers = [
+  { message = '^chore(\([^)]*\))?: release\b', skip = true },
   { message = '^(feat|fix|perf|revert)\((ci|release)\)', skip = true },
   { message = "^feat", group = "Added" },
   { message = "^fix", group = "Fixed" },
