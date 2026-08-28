@@ -9,15 +9,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.5.1](https://github.com/cat198x/cat198x/compare/v0.5.0...v0.5.1) - 2026-08-28
 
-### Other
+Installation. Until now a release was four platform archives and nothing to
+install them with: find the right `.tar.xz`, check its hash, unpack it, put the
+binary on `PATH` yourself. The cataloguing behaviour is unchanged from 0.5.0.
 
-- *(deps)* bump the cargo-minor-patch group with 10 updates ([#74](https://github.com/cat198x/cat198x/pull/74))
-- Ship installers and a Homebrew tap, like Asm198x has ([#73](https://github.com/cat198x/cat198x/pull/73))
-- announce releases in Discord ([#72](https://github.com/cat198x/cat198x/pull/72))
-- clear the house-style suggestions in PRINCIPLES.md
-- inherit PRINCIPLES.md as the first thing agents read
-- make AGENTS.md the canonical agent context
-- track Rust 1.98.0 ([#69](https://github.com/cat198x/cat198x/pull/69))
+### Added
+
+- Homebrew tap — `brew install cat198x/homebrew-tap/cat198x`
+  ([#73](https://github.com/cat198x/cat198x/pull/73)).
+- Shell and PowerShell installers, attached to every release. They pick the
+  right archive for the platform and put `cat198x` on `PATH`
+  ([#73](https://github.com/cat198x/cat198x/pull/73)):
+
+  ```sh
+  curl --proto '=https' --tlsv1.2 -LsSf \
+    https://github.com/cat198x/cat198x/releases/latest/download/cat198x-installer.sh | sh
+  ```
+
+### Changed
+
+- Builds on Rust 1.98.0 ([#69](https://github.com/cat198x/cat198x/pull/69)).
+- Dependencies moved to current minor/patch releases: clap, clap_complete,
+  rusqlite, crc32fast, thiserror, anyhow, serde, serde_json, toml and tokio
+  ([#74](https://github.com/cat198x/cat198x/pull/74)).
 
 ## [0.5.0](https://github.com/cat198x/cat198x/compare/v0.4.0...v0.5.0) - 2026-07-10
 
