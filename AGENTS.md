@@ -121,6 +121,23 @@ for the family rule and the below-1.0 version-bump trap.
   [`../../decisions/`](../../decisions/); read those in scope before changes that
   touch more than this crate.
 - `scripts/` — coverage runner + gate. `.github/workflows/` — CI + release.
+- Catalogue database at `~/.cat198x/db.sqlite`. Paths are stored **relative to the
+  source root** — SQL written against absolute paths silently matches nothing.
+- Binaries: `target/release/cat198x`, and the UI at `ui/target/debug/cat198x-ui`.
+
+## Working gotchas
+
+- **The UI crate is outside the workspace.** Build, clippy and test it separately in
+  `ui/`. It loads `frontend/` assets at compile time, so a frontend-only change needs a
+  rebuild before it shows up.
+- **The Time Capsule is a flaky AFP mount.** Long operations — a real apply above all —
+  drop partway. Rely on apply's resume and run it again rather than expecting one clean
+  pass.
+- **"Same tree" in the delete rule means the same registered source.** The library is one
+  `preserve` source, so consolidation and `clean-superseded` survivors resolve in-tree;
+  nested sources under the library would read as separate trees.
+- When refactoring `apply`, verify CLI output is unchanged by diffing
+  `apply --dry-run --skip-space-check` old against new.
 - It catalogues the umbrella [`../../assets/`](../../assets/) binary library;
   hardware-fact prose is in [`../../reference/`](../../reference/) and
   [`../../syntheses/`](../../syntheses/), per
