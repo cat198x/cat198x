@@ -10,6 +10,22 @@ repository = "https://github.com/cat198x/cat198x"
 homepage = "https://cat198x.github.io"
 keywords = ["rom", "retro", "gaming", "dat", "mame"]
 categories = ["command-line-utilities", "games"]
+# Kept out of the published crate. release-plz decides whether a release is
+# needed by diffing the *packaged* files, so anything shipped here bumps the
+# version whenever it changes — and internal docs and CI config change far more
+# often than the tool does, cutting releases with nothing to describe. The crate
+# ships what a consumer builds, runs and reads; the repository keeps the rest.
+exclude = [
+  ".github/",
+  "decisions/",
+  "scripts/",
+  ".vale.ini",
+  "AGENTS.md",
+  "CLAUDE.md",
+  "MANIFESTO.md",
+  "PRINCIPLES.md",
+  "release-plz.toml",
+]
 
 [lints]
 workspace = true
