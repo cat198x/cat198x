@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.3](https://github.com/cat198x/cat198x/compare/v0.5.2...v0.5.3) - 2026-08-28
+
+The published crate stops shipping files you cannot use: agent and contributor
+docs, decision records, CI workflows, and the release and lint configuration.
+185 files down to 166.
+
+Everything that builds, runs or explains the tool stays — `README.md`,
+`SPECIFICATION.md`, `CHANGELOG.md`, the Cargo files, and the full source and
+test suite. Cataloguing, planning and apply behaviour are unchanged from 0.5.2.
+
+### Changed
+
+- The crate no longer ships `AGENTS.md`, `PRINCIPLES.md`, `MANIFESTO.md`,
+  `CLAUDE.md`, `decisions/`, `.github/`, `scripts/`, `.vale.ini` or
+  `release-plz.toml` ([#81](https://github.com/cat198x/cat198x/pull/81)).
+
 ## [0.5.2](https://github.com/cat198x/cat198x/compare/v0.5.1...v0.5.2) - 2026-08-28
 
 Housekeeping. Nothing in cataloguing, planning or apply behaviour has moved
