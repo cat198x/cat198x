@@ -11,7 +11,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- distribute native ARM Linux packages through Homebrew
+- Install native ARM64 Linux archives and Homebrew packages, alongside the
+  existing x86-64 Linux and macOS packages. Before updating the tap, native
+  Linux checks install the generated formula and verify a catalogue scan's
+  stored paths, sizes and hashes.
+  ([#92](https://github.com/cat198x/cat198x/pull/92))
 
 ## [0.5.3](https://github.com/cat198x/cat198x/compare/v0.5.2...v0.5.3) - 2026-08-28
 
