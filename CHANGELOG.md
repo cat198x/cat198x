@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.4](https://github.com/cat198x/cat198x/compare/v0.5.3...v0.5.4) - 2026-10-07
+
+### Added
+
+- distribute native ARM Linux packages through Homebrew
+
 ## [0.5.3](https://github.com/cat198x/cat198x/compare/v0.5.2...v0.5.3) - 2026-08-28
 
 The published crate stops shipping files you cannot use: agent and contributor
