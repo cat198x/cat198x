@@ -40,6 +40,14 @@ Cat198x separates **knowing** from **changing**:
   a reviewable plan, and only touches disk on `apply` — transactionally, with a
   rollback log.
 
+## Homebrew
+
+On macOS (Apple Silicon or Intel) and Linux (ARM64 or x86-64):
+
+```sh
+brew install cat198x/tap/cat198x
+```
+
 ## Install
 
 Cat198x is a single self-contained binary with no runtime dependencies.
