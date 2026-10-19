@@ -1,73 +1,21 @@
 name: Release-plz
 
+# Tags merged releases, then opens or updates the next release PR, using the
+# workflow every 198x Rust repo shares (stevehill1981/198x-workflows).
 on:
   push:
     branches:
       - main
 
 permissions:
-  pull-requests: write
   contents: write
-  # OIDC for crates.io Trusted Publishing. release-plz does the token exchange
-  # itself when it publishes, so no CARGO_REGISTRY_TOKEN is stored here.
+  pull-requests: write
+  # crates.io Trusted Publishing: cat198x publishes, and crates.io matches this
+  # file's name, so keep it.
   id-token: write
 
 jobs:
-  release:
-    name: Release merged versions
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    steps:
-      - name: Check out repository
-        uses: actions/checkout@v7
-        with:
-          # release-plz needs full history to diff the changelog from the
-          # last tag.
-          fetch-depth: 0
-          # The `release` step below pushes the version tag with this token. A
-          # tag pushed by GITHUB_TOKEN does NOT trigger other workflows, so the
-          # per-org RELEASE_PLZ_TOKEN (a fine-grained PAT) is required for the
-          # tag to fire cargo-dist's release.yml.
-          token: ${{ secrets.RELEASE_PLZ_TOKEN || secrets.GITHUB_TOKEN }}
-
-      - name: Read pinned toolchain
-        id: toolchain
-        run: |
-          channel=$(awk -F'"' '/^channel/{print $2}' rust-toolchain.toml)
-          echo "channel=${channel}" >> "$GITHUB_OUTPUT"
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: ${{ steps.toolchain.outputs.channel }}
-
-      - name: Run release-plz (tag merged releases)
-        uses: release-plz/action@v0.5
-        with:
-          command: release
-        env:
-          GITHUB_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN || secrets.GITHUB_TOKEN }}
-
-  release-pr:
-    name: Prepare the next release
-    needs: release
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    concurrency:
-      group: release-plz-pr-${{ github.ref }}
-      cancel-in-progress: false
-    steps:
-      - uses: actions/checkout@v7
-        with:
-          fetch-depth: 0
-          token: ${{ secrets.RELEASE_PLZ_TOKEN || secrets.GITHUB_TOKEN }}
-      - id: toolchain
-        run: echo "channel=$(awk -F'\"' '/^channel/{print $2}' rust-toolchain.toml)" >> "$GITHUB_OUTPUT"
-      - uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: ${{ steps.toolchain.outputs.channel }}
-      - uses: release-plz/action@v0.5
-        with:
-          command: release-pr
-        env:
-          GITHUB_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN || secrets.GITHUB_TOKEN }}
+  release-plz:
+    name: Release-plz
+    uses: stevehill1981/198x-workflows/.github/workflows/release-plz.yml@v1.3.0
+    secrets: inherit
