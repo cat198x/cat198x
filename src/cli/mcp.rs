@@ -147,14 +147,14 @@ impl Cat198xServer {
 
 #[tool_handler]
 impl ServerHandler for Cat198xServer {
-    fn get_info(&self) -> ServerInfo {
+    fn get_info(&self) -> ServerConfig {
         // Identify as cat198x, not the rmcp crate `from_build_env` would pick up.
         // `Implementation` is non-exhaustive, so set the public fields on a base.
         let mut implementation = Implementation::from_build_env();
         implementation.name = "cat198x".to_string();
         implementation.version = env!("CARGO_PKG_VERSION").to_string();
 
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+        ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(implementation)
             .with_protocol_version(ProtocolVersion::V_2024_11_05)
             .with_instructions(
