@@ -34,10 +34,10 @@ pub fn parse_dat(xml: &str) -> Result<(DatHeader, Vec<DatGameEntry>)> {
     loop {
         match reader.read_event_into(&mut buf) {
             Ok(Event::Start(e)) => match e.name().as_ref() {
-                b"header" => {
+                "header" => {
                     header = parse_header(&mut reader)?;
                 }
-                b"game" | b"machine" => {
+                "game" | "machine" => {
                     let game = parse_game(&mut reader, &e)?;
                     games.push(game);
                 }
@@ -70,20 +70,20 @@ fn parse_header(reader: &mut Reader<&[u8]>) -> Result<DatHeader> {
                 // Read the child element's full text content in one go, so a
                 // value split across entity references (e.g. "Shoot&apos;em
                 // Up") is reassembled rather than truncated to its last chunk.
-                let tag = e.name().as_ref().to_vec();
+                let tag = e.name().as_ref().to_owned();
                 let text = read_element_text(reader, &tag)?;
-                match tag.as_slice() {
-                    b"name" => header.name = text,
-                    b"description" => header.description = Some(text),
-                    b"version" => header.version = Some(text),
-                    b"author" => header.author = Some(text),
-                    b"homepage" => header.homepage = Some(text),
-                    b"url" => header.url = Some(text),
-                    b"category" => header.category = Some(text),
+                match tag.as_str() {
+                    "name" => header.name = text,
+                    "description" => header.description = Some(text),
+                    "version" => header.version = Some(text),
+                    "author" => header.author = Some(text),
+                    "homepage" => header.homepage = Some(text),
+                    "url" => header.url = Some(text),
+                    "category" => header.category = Some(text),
                     _ => {}
                 }
             }
-            Ok(Event::End(e)) if e.name().as_ref() == b"header" => break,
+            Ok(Event::End(e)) if e.name().as_ref() == "header" => break,
             Ok(Event::Eof) => break,
             Err(e) => return Err(e.into()),
             _ => {}
@@ -114,12 +114,12 @@ fn parse_game(
     // Parse attributes
     for attr in start.attributes().flatten() {
         match attr.key.as_ref() {
-            b"name" => game.name = attr_value(&attr)?.to_string(),
-            b"cloneof" => game.clone_of = Some(attr_value(&attr)?.to_string()),
-            b"romof" => game.rom_of = Some(attr_value(&attr)?.to_string()),
-            b"isbios" => game.is_bios = attr.value.as_ref() == b"yes",
-            b"isdevice" => game.is_device = attr.value.as_ref() == b"yes",
-            b"ismechanical" => game.is_mechanical = attr.value.as_ref() == b"yes",
+            "name" => game.name = attr_value(&attr)?.to_string(),
+            "cloneof" => game.clone_of = Some(attr_value(&attr)?.to_string()),
+            "romof" => game.rom_of = Some(attr_value(&attr)?.to_string()),
+            "isbios" => game.is_bios = attr.value == "yes",
+            "isdevice" => game.is_device = attr.value == "yes",
+            "ismechanical" => game.is_mechanical = attr.value == "yes",
             _ => {}
         }
     }
@@ -137,9 +137,9 @@ fn parse_game(
                 // and consumed up to its end tag.
                 let consumed = handle_game_child(&e, &mut game)?;
                 if !consumed {
-                    let tag = e.name().as_ref().to_vec();
+                    let tag = e.name().as_ref().to_owned();
                     let text = read_element_text(reader, &tag)?;
-                    if tag == b"description" {
+                    if tag == "description" {
                         game.description = Some(text);
                     }
                 }
@@ -147,7 +147,7 @@ fn parse_game(
             Ok(Event::Empty(e)) => {
                 handle_game_child(&e, &mut game)?;
             }
-            Ok(Event::End(e)) if matches!(e.name().as_ref(), b"game" | b"machine") => break,
+            Ok(Event::End(e)) if matches!(e.name().as_ref(), "game" | "machine") => break,
             Ok(Event::Eof) => break,
             Err(e) => return Err(e.into()),
             _ => {}
@@ -164,17 +164,17 @@ fn parse_game(
 /// if the element was a recognised child and has been consumed.
 fn handle_game_child(e: &quick_xml::events::BytesStart, game: &mut DatGameEntry) -> Result<bool> {
     match e.name().as_ref() {
-        b"rom" => {
+        "rom" => {
             game.roms.push(parse_rom_attrs(e)?);
             Ok(true)
         }
-        b"disk" => {
+        "disk" => {
             game.roms.push(parse_disk_attrs(e)?);
             Ok(true)
         }
-        b"device_ref" => {
+        "device_ref" => {
             for attr in e.attributes().flatten() {
-                if attr.key.as_ref() == b"name" {
+                if attr.key.as_ref() == "name" {
                     game.devices.push(attr_value(&attr)?.to_string());
                 }
             }
@@ -199,13 +199,13 @@ fn parse_rom_attrs(e: &quick_xml::events::BytesStart) -> Result<DatRomEntry> {
 
     for attr in e.attributes().flatten() {
         match attr.key.as_ref() {
-            b"name" => rom.name = attr_value(&attr)?.to_string(),
-            b"size" => rom.size = attr_value(&attr)?.parse().unwrap_or(0),
-            b"crc" => rom.crc32 = Some(attr_value(&attr)?.to_uppercase()),
-            b"md5" => rom.md5 = Some(attr_value(&attr)?.to_uppercase()),
-            b"sha1" => rom.sha1 = Some(attr_value(&attr)?.to_uppercase()),
-            b"status" => rom.status = RomStatus::parse(&attr_value(&attr)?),
-            b"merge" => rom.merge = Some(attr_value(&attr)?.to_string()),
+            "name" => rom.name = attr_value(&attr)?.to_string(),
+            "size" => rom.size = attr_value(&attr)?.parse().unwrap_or(0),
+            "crc" => rom.crc32 = Some(attr_value(&attr)?.to_uppercase()),
+            "md5" => rom.md5 = Some(attr_value(&attr)?.to_uppercase()),
+            "sha1" => rom.sha1 = Some(attr_value(&attr)?.to_uppercase()),
+            "status" => rom.status = RomStatus::parse(&attr_value(&attr)?),
+            "merge" => rom.merge = Some(attr_value(&attr)?.to_string()),
             _ => {}
         }
     }
@@ -232,11 +232,11 @@ fn parse_disk_attrs(e: &quick_xml::events::BytesStart) -> Result<DatRomEntry> {
 
     for attr in e.attributes().flatten() {
         match attr.key.as_ref() {
-            b"name" => disk.name = attr_value(&attr)?.to_string(),
-            b"md5" => disk.md5 = Some(attr_value(&attr)?.to_uppercase()),
-            b"sha1" => disk.sha1 = Some(attr_value(&attr)?.to_uppercase()),
-            b"status" => disk.status = RomStatus::parse(&attr_value(&attr)?),
-            b"merge" => disk.merge = Some(attr_value(&attr)?.to_string()),
+            "name" => disk.name = attr_value(&attr)?.to_string(),
+            "md5" => disk.md5 = Some(attr_value(&attr)?.to_uppercase()),
+            "sha1" => disk.sha1 = Some(attr_value(&attr)?.to_uppercase()),
+            "status" => disk.status = RomStatus::parse(&attr_value(&attr)?),
+            "merge" => disk.merge = Some(attr_value(&attr)?.to_string()),
             _ => {}
         }
     }
@@ -244,22 +244,24 @@ fn parse_disk_attrs(e: &quick_xml::events::BytesStart) -> Result<DatRomEntry> {
     Ok(disk)
 }
 
-/// Decode and unescape an attribute value.
+/// Unescape an attribute value.
 ///
-/// DAT files are UTF-8, so we decode the raw bytes directly and resolve the
-/// predefined XML entities — matching the behaviour of quick-xml's former
-/// `Attribute::unescape_value`, without the whitespace normalisation that
-/// `normalized_value` would now introduce.
+/// Since quick-xml 0.42 the value is already text (the reader validates UTF-8),
+/// so only the predefined XML entities need resolving. This matches quick-xml's
+/// former `Attribute::unescape_value`, without the whitespace normalisation
+/// that `normalized_value` would introduce.
 fn attr_value(attr: &quick_xml::events::attributes::Attribute) -> Result<String> {
-    let raw = std::str::from_utf8(&attr.value).context("attribute value is not valid UTF-8")?;
-    Ok(quick_xml::escape::unescape(raw)?.to_string())
+    Ok(quick_xml::escape::unescape(&attr.value)?.to_string())
 }
 
-/// Decode and unescape the text content of an element, matching quick-xml's
-/// former `BytesText::unescape`.
+/// Unescape the text content of an element, matching quick-xml's former
+/// `BytesText::unescape`.
+///
+/// The event dereferences to its raw text. That is what quick-xml 0.41's
+/// `decode()` returned: no line-ending normalisation, which `xml10_content()`
+/// would add.
 fn text_value(e: &quick_xml::events::BytesText) -> Result<String> {
-    let decoded = e.decode()?;
-    Ok(quick_xml::escape::unescape(&decoded)?.to_string())
+    Ok(quick_xml::escape::unescape(e)?.to_string())
 }
 
 /// Read an element's full text content, concatenating every chunk until the
@@ -270,13 +272,13 @@ fn text_value(e: &quick_xml::events::BytesText) -> Result<String> {
 /// several events. Assigning on each event keeps only the final chunk — the bug
 /// that stored "Shoot&apos;em Up" as "em Up". Accumulating across `Text`,
 /// `CData`, and `GeneralRef` events reassembles the value faithfully.
-fn read_element_text(reader: &mut Reader<&[u8]>, end: &[u8]) -> Result<String> {
+fn read_element_text(reader: &mut Reader<&[u8]>, end: &str) -> Result<String> {
     let mut buf = Vec::new();
     let mut out = String::new();
     loop {
         match reader.read_event_into(&mut buf) {
             Ok(Event::Text(e)) => out.push_str(&text_value(&e)?),
-            Ok(Event::CData(e)) => out.push_str(&e.decode()?),
+            Ok(Event::CData(e)) => out.push_str(&e),
             Ok(Event::GeneralRef(e)) => out.push_str(&resolve_entity(&e)?),
             Ok(Event::End(e)) if e.name().as_ref() == end => break,
             Ok(Event::Eof) => break,
@@ -296,7 +298,7 @@ fn resolve_entity(e: &quick_xml::events::BytesRef) -> Result<String> {
     if let Some(ch) = e.resolve_char_ref()? {
         return Ok(ch.to_string());
     }
-    let name = e.decode()?;
+    let name: &str = e;
     Ok(quick_xml::escape::unescape(&format!("&{};", name))?.to_string())
 }
 
