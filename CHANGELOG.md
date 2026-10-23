@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.5](https://github.com/cat198x/cat198x/compare/v0.5.4...v0.5.5) - 2026-10-23
+
+### Dependencies
+
+- *(deps)* use rmcp 3's ServerConfig name for the server's info
+- *(deps)* bump rmcp from 2.2.0 to 3.5.1
+- *(deps)* bump quick-xml from 0.41.0 to 0.42.0
+- *(deps)* bump sevenz-rust2 from 0.21.3 to 0.24.0
+- *(deps)* bump the cargo-minor-patch group across 1 directory with 9 updates
+
+### Fixed
+
+- Read DAT files through quick-xml 0.42's text-based API
+
 ## [0.5.4](https://github.com/cat198x/cat198x/compare/v0.5.3...v0.5.4) - 2026-10-07
 
 ### Added
