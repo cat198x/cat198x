@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.6](https://github.com/cat198x/cat198x/compare/v0.5.5...v0.5.6) - 2026-10-27
+
+### Dependencies
+
+- *(deps)* bump zip from 8.6.0 to 9.0.5
+- *(deps)* bump sevenz-rust2
+
+### Fixed
+
+- preserve catalogued ZIP names when upgrading to zip 9
+
 ## [0.5.5](https://github.com/cat198x/cat198x/compare/v0.5.4...v0.5.5) - 2026-10-23
 
 ### Dependencies
