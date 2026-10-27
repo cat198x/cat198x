@@ -46,28 +46,14 @@ jobs:
         uses: actions/checkout@v7
 
       - name: Install Tauri system dependencies
-        # The webkit apt install periodically stalls on a slow/unreachable
-        # GitHub runner mirror. Retry up to three times, each attempt bounded by
-        # `timeout` so a stall fails fast and the next attempt gets a fresh shot
-        # (often a different mirror) rather than hanging the whole job.
+        # A slow Azure mirror exhausted all three bounded retries in #104.
+        # Reuse Emu198x's installer, which prefers another mirror on each retry.
         run: |
-          set -e
-          for attempt in 1 2 3; do
-            if timeout 300 bash -c '
-              sudo apt-get update -o Acquire::Retries=3
-              sudo apt-get install -y -o Acquire::Retries=3 \
-                libwebkit2gtk-4.1-dev \
-                libgtk-3-dev \
-                libayatana-appindicator3-dev \
-                librsvg2-dev
-            '; then
-              exit 0
-            fi
-            echo "::warning::apt attempt ${attempt} failed or timed out; retrying"
-            sleep 15
-          done
-          echo "::error::apt install failed after 3 attempts"
-          exit 1
+          bash scripts/ci/apt-install.sh \
+            libwebkit2gtk-4.1-dev \
+            libgtk-3-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev
 
       - name: Read pinned toolchain
         id: toolchain
