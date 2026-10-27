@@ -72,7 +72,7 @@ fn list_zip_entries(path: &Path) -> Result<Vec<ArchiveEntry>> {
         }
 
         entries.push(ArchiveEntry {
-            name: entry.name().to_string(),
+            name: crate::archive::zip_entry_name(&entry).into_owned(),
             size: entry.size(),
             hashes: None,
         });
@@ -97,7 +97,7 @@ fn hash_zip_entries(path: &Path) -> Result<Vec<ArchiveEntry>> {
         }
 
         let size = entry.size();
-        let name = entry.name().to_string();
+        let name = crate::archive::zip_entry_name(&entry).into_owned();
 
         // Read and hash the entry
         let mut data = Vec::new();

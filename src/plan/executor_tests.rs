@@ -424,8 +424,8 @@ fn test_execute_repack_torrentzip_format() {
     assert_eq!(archive.len(), 2);
 
     // Entries should be sorted alphabetically (a_first before z_last)
-    let first_name = archive.by_index(0).unwrap().name().to_string();
-    let second_name = archive.by_index(1).unwrap().name().to_string();
+    let first_name = archive.by_index(0).unwrap().name().unwrap().to_string();
+    let second_name = archive.by_index(1).unwrap().name().unwrap().to_string();
     assert_eq!(first_name, "a_first.rom");
     assert_eq!(second_name, "z_last.rom");
 
