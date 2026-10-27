@@ -251,9 +251,10 @@ fn unzip_first_sql(zip_path: &Path) -> Result<PathBuf> {
 
     for i in 0..archive.len() {
         let mut entry = archive.by_index(i)?;
-        if entry.name().to_ascii_lowercase().ends_with(".sql") {
+        let entry_name = crate::archive::zip_entry_name(&entry).into_owned();
+        if entry_name.to_ascii_lowercase().ends_with(".sql") {
             // Basename only, to avoid zip-slip into a parent directory.
-            let name = Path::new(entry.name())
+            let name = Path::new(&entry_name)
                 .file_name()
                 .map(|n| n.to_string_lossy().into_owned())
                 .unwrap_or_else(|| "zxdb.sql".to_string());

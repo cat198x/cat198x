@@ -283,19 +283,19 @@ pub(crate) fn extract_archive_entry(archive_path: &Path, entry_path: &str) -> Re
 /// We deliberately avoid `ZipArchive::by_name` here. For filenames stored
 /// without the UTF-8 flag (CP437-encoded — e.g. `å` as the single byte 0x86),
 /// the `zip` crate's internal name map is keyed inconsistently with what
-/// `ZipFile::name()` returns, so an exact `by_name` lookup misses an entry that
-/// is plainly present (and that the catalogue recorded by the same `name()`
-/// decoding at scan time). A linear scan comparing `name()` matches reliably.
+/// our flag-aware decoder returns, so an exact `by_name` lookup can miss an entry
+/// that the catalogue recorded. Scan with the same decoder used by the catalogue.
 pub(crate) fn resolve_zip_entry_index<R: std::io::Read + std::io::Seek>(
     archive: &mut zip::ZipArchive<R>,
     entry_path: &str,
-) -> Option<usize> {
-    (0..archive.len()).find(|&i| {
-        archive
-            .by_index(i)
-            .map(|e| e.name() == entry_path)
-            .unwrap_or(false)
-    })
+) -> Result<Option<usize>> {
+    for i in 0..archive.len() {
+        let entry = archive.by_index(i)?;
+        if super::zip_entry_name(&entry) == entry_path {
+            return Ok(Some(i));
+        }
+    }
+    Ok(None)
 }
 
 /// Extract a file from a ZIP archive to memory
@@ -303,7 +303,7 @@ fn extract_from_zip(archive_path: &Path, entry_path: &str) -> Result<Vec<u8>> {
     let file = File::open(archive_path).context("Failed to open ZIP archive")?;
     let mut archive = zip::ZipArchive::new(file).context("Failed to read ZIP archive")?;
 
-    let idx = resolve_zip_entry_index(&mut archive, entry_path)
+    let idx = resolve_zip_entry_index(&mut archive, entry_path)?
         .with_context(|| format!("Entry not found in archive: {}", entry_path))?;
     let mut entry = archive
         .by_index(idx)
@@ -410,6 +410,22 @@ mod tests {
         0x33, 0x00, 0x00, 0x00, 0x2a, 0x00, 0x00, 0x00, 0x00, 0x00,
     ];
 
+    #[test]
+    fn cp437_names_that_are_valid_utf8_keep_their_identity() {
+        let mut data = CP437_NAMED_ZIP.to_vec();
+        let central = data
+            .windows(4)
+            .position(|bytes| bytes == b"PK\x01\x02")
+            .unwrap();
+        data[30..32].copy_from_slice(&[0xc3, 0xa9]);
+        data[central + 46..central + 48].copy_from_slice(&[0xc3, 0xa9]);
+        let mut archive = zip::ZipArchive::new(std::io::Cursor::new(data)).unwrap();
+        assert_eq!(
+            super::super::zip_entry_name(&archive.by_index(0).unwrap()),
+            "├⌐bin"
+        );
+    }
+
     /// Regression: extracting a CP437-named entry must succeed even though the
     /// `zip` crate's `by_name` map disagrees with `ZipFile::name()` for such
     /// names. Guards the `resolve_zip_entry_index` linear-scan fallback that
@@ -423,13 +439,13 @@ mod tests {
         // The entry decodes to "å.bin" (U+00E5), and `by_name` cannot find it...
         let file = File::open(&zip_path).unwrap();
         let mut archive = zip::ZipArchive::new(file).unwrap();
-        assert_eq!(archive.by_index(0).unwrap().name(), "\u{00e5}.bin");
+        assert_eq!(archive.by_index(0).unwrap().name().unwrap(), "\u{00e5}.bin");
         assert!(
             archive.by_name("\u{00e5}.bin").is_err(),
             "fixture should reproduce the by_name miss this fix works around"
         );
         assert_eq!(
-            resolve_zip_entry_index(&mut archive, "\u{00e5}.bin"),
+            resolve_zip_entry_index(&mut archive, "\u{00e5}.bin").unwrap(),
             Some(0)
         );
 
@@ -678,7 +694,7 @@ mod tests {
             .map(|i| {
                 let file = File::open(&dest_path).unwrap();
                 let mut archive = zip::ZipArchive::new(file).unwrap();
-                archive.by_index(i).unwrap().name().to_string()
+                archive.by_index(i).unwrap().name().unwrap().to_string()
             })
             .collect();
 
