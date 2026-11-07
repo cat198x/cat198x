@@ -99,11 +99,9 @@ pub(super) fn process_batch(
                 };
             }
 
-            let relative_path = file_path
-                .strip_prefix(source_path)
-                .unwrap_or(file_path)
-                .to_string_lossy()
-                .to_string();
+            let relative_path = crate::paths::catalogue_path(
+                file_path.strip_prefix(source_path).unwrap_or(file_path),
+            );
 
             // Update progress
             let done = processed_count.fetch_add(1, Ordering::SeqCst) + 1;

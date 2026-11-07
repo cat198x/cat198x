@@ -1,7 +1,7 @@
 //! Destination path construction and validation for planned outputs.
 
 use anyhow::Result;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Component, Path};
 
 /// Resolve a collection's destination root, in order of precedence:
 /// 1. an explicit per-collection `dest_path`, used as-is;
@@ -85,13 +85,16 @@ pub(crate) fn validate_relative_path(label: &str, value: &str) -> Result<()> {
     Ok(())
 }
 
+/// Join validated relative parts under `root` with `/`, the catalogue separator
+/// on every OS, so planned paths compare equal to catalogued ones.
 fn join_under_root(root: &str, parts: &[(&str, &str)]) -> Result<String> {
-    let mut out = PathBuf::from(root.trim_end_matches('/'));
+    let mut out = root.trim_end_matches('/').to_string();
     for (label, value) in parts {
         validate_relative_path(label, value)?;
-        out.push(value);
+        out.push('/');
+        out.push_str(value);
     }
-    Ok(out.to_string_lossy().into_owned())
+    Ok(out)
 }
 
 #[cfg(test)]

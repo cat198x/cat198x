@@ -72,7 +72,7 @@ pub(super) fn set(key: &str, value: &str, data_dir: Option<PathBuf>) -> Result<(
 /// and value. Pure (no I/O) so the key/value mapping is unit-testable.
 fn set_default_field(config: &mut Config, key: &str, value: &str) -> Result<()> {
     match key {
-        "dest_path" => config.default_dest_path = Some(value.to_string()),
+        "dest_path" => config.default_dest_path = Some(crate::paths::catalogue_str(value)),
         "quarantine_dir" => config.quarantine_dir = Some(value.to_string()),
         "output_format" => {
             config.default_output_format = match value.to_lowercase().as_str() {

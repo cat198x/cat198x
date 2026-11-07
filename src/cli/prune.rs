@@ -135,13 +135,18 @@ pub fn run(
     let all = list_sources(db.conn())?;
 
     // Resolve which source roots to walk: all registered, or only those whose id
-    // or path matches a `--source` selector.
+    // or path matches a `--source` selector. Path selectors compare in catalogue
+    // form, the form source roots are stored in.
     let roots: Vec<PathBuf> = if sources.is_empty() {
         all.iter().map(|s| PathBuf::from(&s.path)).collect()
     } else {
+        let selectors: Vec<String> = sources
+            .iter()
+            .map(|sel| crate::paths::catalogue_str(sel))
+            .collect();
         all.iter()
             .filter(|s| {
-                sources
+                selectors
                     .iter()
                     .any(|sel| sel == &s.id.to_string() || s.path.contains(sel.as_str()))
             })

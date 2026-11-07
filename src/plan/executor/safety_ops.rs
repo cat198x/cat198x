@@ -137,7 +137,7 @@ pub fn execute_quarantine(
         collection_name,
     )?;
 
-    Ok(quarantine_path.to_string_lossy().into_owned())
+    Ok(crate::paths::catalogue_path(&quarantine_path))
 }
 
 /// Execute a rollback move operation

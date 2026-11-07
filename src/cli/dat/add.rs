@@ -133,7 +133,7 @@ pub(super) fn import_dat_file(
     };
 
     // Add version (activating it)
-    let path_str = abs_path.to_string_lossy();
+    let path_str = crate::paths::catalogue_path(&abs_path);
     let version_id = collections::add_version(conn, collection.id, &version, &path_str, true)?;
 
     // Create the DAT node. Its `path` carries the collection's place in the

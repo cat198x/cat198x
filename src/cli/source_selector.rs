@@ -2,11 +2,13 @@ use crate::db::files;
 
 /// Whether a `--source` selector picks this source: a purely numeric selector
 /// is a source id and matches exactly; anything else matches as a path
-/// substring.
+/// substring, compared in catalogue form so `ToSort\NES` selects on Windows.
 pub(crate) fn source_matches(source: &files::Source, selector: &str) -> bool {
     match selector.parse::<i64>() {
         Ok(id) => source.id == id,
-        Err(_) => source.path.contains(selector),
+        Err(_) => source
+            .path
+            .contains(crate::paths::catalogue_str(selector).as_str()),
     }
 }
 

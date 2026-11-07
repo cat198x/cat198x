@@ -47,7 +47,7 @@ pub(super) fn relink_dats(search_dir: &Path, data_dir: Option<PathBuf>) -> Resul
 
             match basename.and_then(|n| by_name.get(n)).map(Vec::as_slice) {
                 Some([found]) => {
-                    let new_path = found.to_string_lossy();
+                    let new_path = crate::paths::catalogue_path(found);
                     collections::update_dat_path(conn, version.id, &new_path)?;
                     println!(
                         "  relinked  {} v{}  ->  {}",

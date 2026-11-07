@@ -132,7 +132,7 @@ mod tests {
     }
 
     fn path_string(path: &Path) -> String {
-        path.to_string_lossy().into_owned()
+        crate::paths::catalogue_path(path)
     }
 
     fn sha1_of(content: &[u8]) -> String {

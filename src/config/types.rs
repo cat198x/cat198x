@@ -61,10 +61,15 @@ pub enum MergeMode {
 }
 
 impl Config {
-    /// Load configuration from a TOML file
+    /// Load configuration from a TOML file. `default_dest_path` is returned in
+    /// catalogue form, since planned destinations are built from it and compared
+    /// with catalogued paths.
     pub fn load(path: &PathBuf) -> anyhow::Result<Self> {
         let contents = std::fs::read_to_string(path)?;
-        let config: Config = toml::from_str(&contents)?;
+        let mut config: Config = toml::from_str(&contents)?;
+        config.default_dest_path = config
+            .default_dest_path
+            .map(|dest| crate::paths::catalogue_str(&dest));
         Ok(config)
     }
 
