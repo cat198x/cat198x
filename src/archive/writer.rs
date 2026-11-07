@@ -426,24 +426,21 @@ mod tests {
         );
     }
 
-    /// Regression: extracting a CP437-named entry must succeed even though the
-    /// `zip` crate's `by_name` map disagrees with `ZipFile::name()` for such
-    /// names. Guards the `resolve_zip_entry_index` linear-scan fallback that
-    /// rescued the `å`-named WHDLoad archive.
+    /// Regression: extracting a CP437-named entry must succeed by its decoded
+    /// name. `zip` releases before 9.2 keyed `by_name` on the raw bytes only,
+    /// so it disagreed with `ZipFile::name()` for such names. Guards the
+    /// `resolve_zip_entry_index` fallback that rescued the `å`-named WHDLoad
+    /// archive, whichever `zip` release resolves the lookup.
     #[test]
     fn extract_cp437_named_entry_by_decoded_name() {
         let temp = TempDir::new().unwrap();
         let zip_path = temp.path().join("cp437.zip");
         fs::write(&zip_path, CP437_NAMED_ZIP).unwrap();
 
-        // The entry decodes to "å.bin" (U+00E5), and `by_name` cannot find it...
+        // The entry decodes to "å.bin" (U+00E5)...
         let file = File::open(&zip_path).unwrap();
         let mut archive = zip::ZipArchive::new(file).unwrap();
         assert_eq!(archive.by_index(0).unwrap().name().unwrap(), "\u{00e5}.bin");
-        assert!(
-            archive.by_name("\u{00e5}.bin").is_err(),
-            "fixture should reproduce the by_name miss this fix works around"
-        );
         assert_eq!(
             resolve_zip_entry_index(&mut archive, "\u{00e5}.bin").unwrap(),
             Some(0)
