@@ -9,16 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.5.7](https://github.com/cat198x/cat198x/compare/v0.5.6...v0.5.7) - 2026-11-07
 
-### Dependencies
-
-- *(deps)* bump the cargo-minor-patch group across 1 directory with 5 updates
-- *(deps)* bump rusqlite from 0.40.2 to 0.41.0
-
 ### Fixed
 
-- leave archive entry names alone in the v6 path migration
-- convert Windows catalogues' stored paths to `/` form
-- match catalogued and planned paths on Windows
+- Match catalogued and planned paths consistently on Windows, so files already at their destination are not scheduled for unnecessary moves.
+- Migrate existing Windows catalogue paths transactionally, refusing collisions without changing data.
+- Preserve archive entry names during migration, including literal backslashes.
+
+### Dependencies
+
+- Update rusqlite to 0.41.0 and refresh crc32fast, zip, sevenz-rust2, rmcp and tokio.
 
 ## [0.5.6](https://github.com/cat198x/cat198x/compare/v0.5.5...v0.5.6) - 2026-10-27
 
