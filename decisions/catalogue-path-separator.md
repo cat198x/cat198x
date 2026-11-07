@@ -29,7 +29,7 @@ The result was 20 failing tests on Windows, and a planner that proposed operatio
 
 ## Migration
 
-Schema v6 rewrites the stored path columns of an existing catalogue to catalogue form, on Windows only, in one transaction: `sources.path`, `file_locations.path`, `file_locations.archive_path`, `collection_versions.dat_path`, `dat_config.dest_path`, `quarantine.original_path`, `quarantine.quarantine_path`, `operation_log.source_path` and `operation_log.dest_path`. On other platforms v6 only records the version, because a `\` there is part of a filename.
+Schema v6 rewrites the stored path columns of an existing catalogue to catalogue form, on Windows only, in one transaction: `sources.path`, `file_locations.path`, `collection_versions.dat_path`, `dat_config.dest_path`, `quarantine.original_path`, `quarantine.quarantine_path`, `operation_log.source_path` and `operation_log.dest_path`. On other platforms v6 only records the version, because a `\` there is part of a filename. `file_locations.archive_path` is left alone: it holds names from inside archives, which are the same on every OS and were never written with Windows separators.
 
 If two rows would end up with the same unique key, the upgrade stops with an error naming the path and changes nothing. Loose `file_locations` rows are checked explicitly, because their NULL `archive_path` puts them outside the UNIQUE constraint.
 
