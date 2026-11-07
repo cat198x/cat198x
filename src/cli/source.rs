@@ -44,7 +44,7 @@ fn add_source(
     let conn = db.conn();
 
     // Check if already registered
-    let path_str = abs_path.to_string_lossy().into_owned();
+    let path_str = crate::paths::catalogue_path(&abs_path);
     if let Some(existing) = files::get_source_by_path(conn, &path_str)? {
         println!("Source already registered:");
         println!("  Path: {}", existing.path);
@@ -106,7 +106,7 @@ fn set_disposition(path: &PathBuf, disposition: &str, data_dir: Option<PathBuf>)
 
     let db = open_database(data_dir.clone())?;
     let conn = db.conn();
-    let path_str = abs_path.to_string_lossy().into_owned();
+    let path_str = crate::paths::catalogue_path(&abs_path);
 
     if files::get_source_by_path(conn, &path_str)?.is_none() {
         anyhow::bail!(
@@ -176,7 +176,7 @@ fn remove_source(path: &PathBuf, data_dir: Option<PathBuf>) -> Result<()> {
     let db = open_database(data_dir)?;
     let conn = db.conn();
 
-    let path_str = abs_path.to_string_lossy();
+    let path_str = crate::paths::catalogue_path(&abs_path);
     let removed = files::remove_source(conn, &path_str)?;
 
     if removed {

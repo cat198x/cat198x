@@ -103,12 +103,10 @@ pub(super) fn plan_source_files(
         all_files
             .into_iter()
             .filter(|path| {
-                let relative = path
-                    .strip_prefix(source_path)
-                    .unwrap_or(path)
-                    .to_string_lossy();
+                let relative =
+                    crate::paths::catalogue_path(path.strip_prefix(source_path).unwrap_or(path));
                 // Never catalogued here yet - always scan.
-                if !known.contains(relative.as_ref()) {
+                if !known.contains(relative.as_str()) {
                     return true;
                 }
                 // Already catalogued: scan only if modified since last scan.

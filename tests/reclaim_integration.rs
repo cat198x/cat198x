@@ -16,10 +16,9 @@ fn reclaim_execute_removes_redundant_consume_source_file() {
     let library_dir = env.temp_dir.path().join("library");
     let staging_file = create_test_rom(&staging_dir, "redundant.rom", b"same bytes");
     let library_file = create_test_rom(&library_dir, "copy.rom", b"same bytes");
-    let staging_file_canonical = fs::canonicalize(&staging_file)
-        .expect("staging file should canonicalize")
-        .to_string_lossy()
-        .into_owned();
+    let staging_file_canonical = cat198x::paths::catalogue_path(
+        &fs::canonicalize(&staging_file).expect("staging file should canonicalize"),
+    );
     let sha1 = cat198x::scanner::hasher::hash_file(&library_file)
         .expect("library file should hash")
         .sha1;
@@ -101,10 +100,9 @@ fn reclaim_execute_removes_redundant_archive_container() {
     let entries: &[(&str, &[u8])] = &[("a.rom", b"alpha"), ("b.rom", b"beta")];
     let staging_archive = create_test_zip_entries(&staging_dir, "redundant.zip", entries);
     let library_archive = create_test_zip_entries(&library_dir, "canonical.zip", entries);
-    let staging_archive_canonical = fs::canonicalize(&staging_archive)
-        .expect("staging archive should canonicalize")
-        .to_string_lossy()
-        .into_owned();
+    let staging_archive_canonical = cat198x::paths::catalogue_path(
+        &fs::canonicalize(&staging_archive).expect("staging archive should canonicalize"),
+    );
     let sha1s = entries
         .iter()
         .map(|(_, content)| cat198x::util::hex_upper(sha1::Sha1::digest(content)))

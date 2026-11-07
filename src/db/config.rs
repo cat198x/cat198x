@@ -104,11 +104,13 @@ pub fn get_collection_config(
 
 /// Set destination path for a collection
 pub fn set_dest_path(conn: &Connection, collection: &str, dest_path: &str) -> Result<()> {
+    // Stored in catalogue form: planned destinations are built from it.
+    let dest_path = crate::paths::catalogue_str(dest_path);
     conn.execute(
         "INSERT INTO dat_config (path_pattern, dest_path)
          VALUES (?, ?)
          ON CONFLICT(path_pattern) DO UPDATE SET dest_path = excluded.dest_path",
-        [collection, dest_path],
+        [collection, dest_path.as_str()],
     )?;
     Ok(())
 }

@@ -60,10 +60,9 @@ impl TestEnv {
     pub fn source_id(&self, path: &Path, message: &str) -> i64 {
         let db = self.db();
         let conn = db.conn();
-        let root = fs::canonicalize(path)
-            .expect("source path should canonicalize")
-            .to_string_lossy()
-            .into_owned();
+        let root = cat198x::paths::catalogue_path(
+            &fs::canonicalize(path).expect("source path should canonicalize"),
+        );
         cat198x::db::files::list_sources(conn)
             .expect("sources should list")
             .into_iter()

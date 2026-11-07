@@ -11,6 +11,7 @@ pub mod db;
 pub mod error;
 pub mod filter;
 pub mod ops;
+pub mod paths;
 pub mod plan;
 pub mod scanner;
 pub mod util;

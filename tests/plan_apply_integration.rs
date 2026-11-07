@@ -516,7 +516,7 @@ fn recursive_add_plans_into_hierarchical_destination() {
 
     let expected = format!(
         "{}/Acorn/BBC/Magazines/Laserbug/test.rom",
-        dest_root.to_string_lossy()
+        cat198x::paths::catalogue_path(&dest_root)
     );
     assert!(
         plan_json.contains(&expected),
@@ -603,7 +603,7 @@ fn zip_output_format_plans_applies_and_converges() {
 
     let expected_archive = dest_root.join("Zip Test").join("Test Game.zip");
     assert!(
-        plan_json.contains(&expected_archive.to_string_lossy().into_owned()),
+        plan_json.contains(&cat198x::paths::catalogue_path(&expected_archive)),
         "archive should be named after the game; plan was:\n{plan_json}"
     );
 
@@ -618,7 +618,7 @@ fn zip_output_format_plans_applies_and_converges() {
     let plan = generate_plan_filtered(
         db.conn(),
         &cat198x::plan::PlanOptions {
-            default_dest: Some(dest_root.to_string_lossy().into_owned()),
+            default_dest: Some(cat198x::paths::catalogue_path(&dest_root)),
             default_format: OutputFormat::Zip,
             ..Default::default()
         },

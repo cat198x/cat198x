@@ -91,7 +91,7 @@ pub(super) fn upgrade_dat(
     let tx = conn.unchecked_transaction()?;
 
     // Add the new version (this automatically activates it and deactivates the old one)
-    let path_str = abs_path.to_string_lossy();
+    let path_str = crate::paths::catalogue_path(&abs_path);
     let version_id = collections::add_version(conn, collection.id, &new_version, &path_str, true)?;
 
     // Create root DAT node
