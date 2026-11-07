@@ -11,7 +11,6 @@ const SCHEMA_VERSION: i32 = 6;
 const PATH_COLUMNS: &[(&str, &str)] = &[
     ("sources", "path"),
     ("file_locations", "path"),
-    ("file_locations", "archive_path"),
     ("collection_versions", "dat_path"),
     ("dat_config", "dest_path"),
     ("quarantine", "original_path"),
@@ -290,7 +289,7 @@ mod tests {
             ),
             (
                 "SELECT archive_path FROM file_locations WHERE id = 2",
-                Some("inner/a.rom"),
+                Some(r"inner\a.rom"),
             ),
             (
                 "SELECT dat_path FROM collection_versions WHERE id = 1",
