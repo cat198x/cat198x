@@ -39,6 +39,10 @@ def main() -> None:
         if Path(name).name != name or not (dist / name).is_file():
             raise SystemExit(f"Missing generated formula: {name}")
     run("brew", "tap-new", "--no-git", "198x/package-test")
+    # Homebrew refuses to load formulae from an untrusted tap, and `brew fetch`
+    # does not grant trust the way a fully qualified `brew install` does. This
+    # tap holds only this build's generated formulae.
+    run("brew", "trust", "--tap", "198x/package-test")
     tap = (
         Path(
             run(
